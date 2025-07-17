@@ -1,3 +1,4 @@
 data/*.csv
 report/new/*.csv
 report/*.csv
+__pycache__/
