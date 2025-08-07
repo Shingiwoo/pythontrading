@@ -1,6 +1,9 @@
 pandas
 numpy
 ta
-scikit-learn
 streamlit
 matplotlib
+plotly
+scikit-learn
+python-binance
+python-dotenv
