@@ -1,15 +1,4 @@
-# >>> PATCH (2025-08-10): Exchange Filters, Position Sizing Binance-Accurate, Telegram, Persistence
-# - Memperbaiki `place_order` menjadi `async def` (bug: sebelumnya `def` tapi memakai await).
-# - Menambahkan pemanggilan dan cache `exchangeInfo` (stepSize, minQty, quantityPrecision, minNotional, tickSize).
-# - Normalisasi qty: floor ke stepSize, enforce minQty & minNotional, apply quantityPrecision.
-# - Position sizing: margin = balance * risk_per_trade, qty = (margin * leverage) / price (sesuai Binance).
-# - PnL/ROI: mark price (futures_mark_price), fee Taker/Maker configurable via .env (TAKER_FEE/MAKER_FEE).
-# - Larangan double-position: tidak membuka posisi baru jika masih ada posisi berjalan, termasuk setelah restart.
-# - Persistence: simpan & muat state posisi aktif ke file JSON agar bisa recovery saat restart.
-# - Telegram: notifikasi open/close/skip/error bila TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID tersedia.
-# - Logging ke file trading.log.
-
-
+# >>> PATCH (2025-08-10): 
 import os
 import json
 import asyncio
