@@ -25,8 +25,15 @@ logger = logging.getLogger('binance_future_scalping')
 
 # ===== Konfigurasi =====
 CONFIG_FILE = "coin_config.json"
-SYMBOLS = ['XRPUSDT', 'DOGEUSDT', 'TURBOUSDT']
+DEFAULT_SYMBOLS = ['XRPUSDT', 'DOGEUSDT', 'TURBOUSDT']
 TIMEFRAME = '15m'
+
+# DEFAULT fallback kalau ENV kosong
+env_syms = os.getenv("SYMBOLS", "")
+if env_syms.strip():
+    SYMBOLS = [s.strip().upper() for s in env_syms.split(",") if s.strip()]
+else:
+    SYMBOLS = DEFAULT_SYMBOLS
 
 # WS guards
 USE_MULTIPLEX = bool(int(os.getenv("USE_MULTIPLEX", "1")))
