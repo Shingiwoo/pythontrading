@@ -1,0 +1,14 @@
+symbols:
+  - symbol: BTCUSDT
+    enabled: true
+    sma_period: 22
+    ema_period: 22
+    rsi_period: 14
+    bb_std: 1.4
+    score_threshold: 2.0
+    use_trailing: true
+    trailing_trigger_pct: 0.5
+    trailing_step_pct: 0.3
+    leverage: 14
+    risk_per_trade: 0.08
+    timeframe: "1m"
