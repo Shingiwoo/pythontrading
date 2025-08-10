@@ -1,9 +1,12 @@
+fastapi
+uvicorn[standard]
+python-binance>=1.0.20
 pandas
-numpy
 ta
-streamlit
-matplotlib
-plotly
+numpy
 scikit-learn
-python-binance
+SQLAlchemy
+pydantic
 python-dotenv
+websockets
+aiofiles
