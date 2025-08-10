@@ -1,11 +1,23 @@
-# >>> PATCH (2025-08-10): 
+"""
+newrealtrading.py
+
+Perbaikan besar:
+- SYMBOLS dibaca dari ENV (fallback default 3 coin).
+- Logging ramah read-only FS (LOG_DIR fallback ke /tmp).
+- SELURUH pemanggilan Binance pakai client = await self.require_client(); await client.xxx(...)
+- WS loop pakai await stream.recv() (bukan async for) → cocok untuk ReconnectingWebsocket.
+- Hot-reload config aman + apply leverage live.
+- Exchange filters (stepSize/minQty/minNotional/tickSize) + sizing sesuai Binance.
+- Residual close fix: overshoot reduceOnly + verifikasi sisa + retry 1x; PnL pakai filled_qty.
+"""
+
 import os
 import json
 import asyncio
 import time
 import math
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import pandas as pd
 import numpy as np
@@ -15,44 +27,49 @@ from binance.enums import ORDER_TYPE_MARKET
 
 load_dotenv()
 
-# Logger setup
+# ===== Logging (ramah read-only) =====
+LOG_DIR = os.getenv("LOG_DIR", "/app/logs")
+LOG_FILE = os.getenv("LOG_FILE", "trading_bot.log")
+handlers = []
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, LOG_FILE)
+    handlers.append(logging.FileHandler(log_path))
+except Exception:
+    # fallback ke tmpfs
+    handlers.append(logging.FileHandler("/tmp/trading_bot.log"))
+handlers.append(logging.StreamHandler())
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler("trading_bot.log"), logging.StreamHandler()]
+    handlers=handlers
 )
 logger = logging.getLogger('binance_future_scalping')
 
-# ===== Konfigurasi =====
+# ===== Konfigurasi umum =====
 CONFIG_FILE = "coin_config.json"
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+
 DEFAULT_SYMBOLS = ['XRPUSDT', 'DOGEUSDT', 'TURBOUSDT']
-TIMEFRAME = '15m'
-
-# DEFAULT fallback kalau ENV kosong
 env_syms = os.getenv("SYMBOLS", "")
-if env_syms.strip():
-    SYMBOLS = [s.strip().upper() for s in env_syms.split(",") if s.strip()]
-else:
-    SYMBOLS = DEFAULT_SYMBOLS
+SYMBOLS = [s.strip().upper() for s in env_syms.split(",") if s.strip()] or DEFAULT_SYMBOLS
 
-# WS guards
 USE_MULTIPLEX = bool(int(os.getenv("USE_MULTIPLEX", "1")))
-WS_MAX_RETRY = int(os.getenv("WS_MAX_RETRY", "0"))
+WS_MAX_RETRY = int(os.getenv("WS_MAX_RETRY", "0"))  # 0=tak terbatas
 
-# Fees & ROI/Time Guards (defaults, bisa di-override via config per coin)
 TAKER_FEE_DEFAULT = float(os.getenv('TAKER_FEE', '0.0005'))
 MAKER_FEE_DEFAULT = float(os.getenv('MAKER_FEE', '0.0002'))
 MIN_ROI_TO_CLOSE_BY_TIME_DEFAULT = float(os.getenv('MIN_ROI_TO_CLOSE_BY_TIME', '0.05'))
 MAX_HOLD_SECONDS_DEFAULT = int(os.getenv('MAX_HOLD_SECONDS', '3600'))
 
-# State & exchange info cache
-STATE_FILE = os.getenv('STATE_FILE', 'active_position_state.json')
-EXCHANGEINFO_CACHE = os.getenv('EXCHANGEINFO_CACHE', 'exchange_info_cache.json')
+STATE_FILE = os.getenv('STATE_FILE', '/data/active_position_state.json')
+EXCHANGEINFO_CACHE = os.getenv('EXCHANGEINFO_CACHE', '/data/exchange_info_cache.json')
 EXCHANGEINFO_TTL_SECONDS = int(os.getenv('EXCHANGEINFO_TTL_SECONDS', '21600'))  # 6 jam
 
 # ===== Utilities =====
 
-def _extract_filled_qty(order: dict) -> float:
+def _extract_filled_qty(order: Dict[str, Any]) -> float:
     """Ambil qty terisi dari berbagai format respons order Futures Binance."""
     try:
         for k in ("executedQty", "cumQty"):
@@ -75,7 +92,7 @@ def _extract_filled_qty(order: dict) -> float:
         pass
     return 0.0
 
-def floor_to_step(x, step):
+def floor_to_step(x: float, step: float) -> float:
     if not step or step <= 0:
         return float(x)
     return math.floor(float(x)/float(step))*float(step)
@@ -89,8 +106,9 @@ async def _send_telegram(text: str):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=payload, timeout=10) as resp:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=payload) as resp:
                 await resp.text()
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
@@ -106,14 +124,15 @@ async def _load_cached_exchange_info():
         logger.warning(f"Read exchangeInfo cache failed: {e}")
     return None
 
-async def _save_cached_exchange_info(info):
+async def _save_cached_exchange_info(info: Dict[str, Any]):
     try:
+        os.makedirs(os.path.dirname(EXCHANGEINFO_CACHE), exist_ok=True)
         with open(EXCHANGEINFO_CACHE, 'w') as f:
             json.dump({'ts': time.time(), 'info': info}, f)
     except Exception as e:
         logger.warning(f"Write exchangeInfo cache failed: {e}")
 
-async def _get_exchange_filters(client, symbol: str):
+async def _get_exchange_filters(client: AsyncClient, symbol: str) -> Dict[str, Any]:
     info = await _load_cached_exchange_info()
     if not info:
         info = await client.futures_exchange_info()
@@ -148,7 +167,7 @@ async def _get_exchange_filters(client, symbol: str):
         'tick_size': tick_size
     }
 
-def _normalize_qty(qty: float, price: float, f) -> float:
+def _normalize_qty(qty: float, price: float, f: Dict[str, Any]) -> float:
     if qty is None or qty <= 0 or price is None or price <= 0:
         return 0.0
     step = float(f.get('step', 0.0))
@@ -164,7 +183,7 @@ def _normalize_qty(qty: float, price: float, f) -> float:
     except Exception:
         pass
     if min_qty and q < min_qty:
-        return 0.0
+        q = min_qty
     if min_notional and (q * price) < min_notional:
         needed = min_notional / price
         if step and step > 0:
@@ -173,12 +192,31 @@ def _normalize_qty(qty: float, price: float, f) -> float:
             needed = float(f"{needed:.{qprec}f}")
         except Exception:
             pass
-        if needed < min_qty:
+        if min_qty and needed < min_qty:
             needed = min_qty
         q = needed
     return q
 
-# ===== Kelas Trader =====
+# ===== Persistence =====
+
+def _save_state(state: dict):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, default=str)
+    except Exception as e:
+        logger.warning(f"save state failed: {e}")
+
+def _load_state() -> dict:
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"load state failed: {e}")
+    return {}
+
+# ===== Trader =====
 class CoinTrader:
     def __init__(self, symbol: str, api_key: str, api_secret: str, capital_allocated: float, config: dict):
         self.symbol = symbol
@@ -207,15 +245,17 @@ class CoinTrader:
 
     async def _get_mark_price(self) -> Optional[float]:
         try:
-            mp = await self.require_client().futures_mark_price(symbol=self.symbol)
+            client = await self.require_client()
+            mp = await client.futures_mark_price(symbol=self.symbol)
             return float(mp['markPrice'])
         except Exception as e:
             logger.error(f"{self.symbol} get mark price failed: {e}")
             return None
-    
+
     async def _get_position_amt(self) -> float:
         try:
-            info = await self.require_client().futures_position_information(symbol=self.symbol)
+            client = await self.require_client()
+            info = await client.futures_position_information(symbol=self.symbol)
             for pos in info:
                 if pos.get('symbol') == self.symbol:
                     return abs(float(pos.get('positionAmt', 0) or 0))
@@ -226,6 +266,7 @@ class CoinTrader:
     async def initialize(self):
         if self.client is None:
             self.client = await AsyncClient.create(self.api_key, self.api_secret)
+
         # Recovery posisi aktif
         st = _load_state()
         if st.get('symbol') == self.symbol and st.get('in_position'):
@@ -244,11 +285,16 @@ class CoinTrader:
                 pass
 
         # set leverage (sesuai config)
-        await self.require_client().futures_change_leverage(symbol=self.symbol, leverage=int(self.config['leverage']))
+        try:
+            client = await self.require_client()
+            await client.futures_change_leverage(symbol=self.symbol, leverage=int(self.config['leverage']))
+        except Exception as e:
+            logger.error(f"{self.symbol} change leverage failed on init: {e}")
 
         # load data awal buat indikator internal jika perlu
         try:
-            klines = await self.require_client().futures_klines(symbol=self.symbol, interval=TIMEFRAME, limit=1000)
+            client = await self.require_client()
+            klines = await client.futures_klines(symbol=self.symbol, interval=TIMEFRAME, limit=1000)
             rows = []
             for k in klines:
                 rows.append({'timestamp':k[0],'open':float(k[1]),'high':float(k[2]),'low':float(k[3]),'close':float(k[4]),'volume':float(k[5])})
@@ -263,7 +309,8 @@ class CoinTrader:
         # Terapkan perubahan leverage segera
         if 'leverage' in changed:
             try:
-                await self.require_client().futures_change_leverage(symbol=self.symbol, leverage=int(self.config['leverage']))
+                client = await self.require_client()
+                await client.futures_change_leverage(symbol=self.symbol, leverage=int(self.config['leverage']))
                 try:
                     asyncio.create_task(_send_telegram(f"⚙️ <b>{self.symbol}</b> leverage diubah -> {self.config['leverage']}"))
                 except Exception:
@@ -280,9 +327,6 @@ class CoinTrader:
             except Exception:
                 pass
         return True
-
-    async def _get_exchange_filters(self):
-        return await _get_exchange_filters(await self.require_client(), self.symbol)
 
     async def place_order(self, side: str, quantity: float, reduce_only: bool = False):
         client = await self.require_client()
@@ -319,7 +363,8 @@ class CoinTrader:
             return
 
         side = 'SELL' if self.position_type == 'LONG' else 'BUY'
-        f = await _get_exchange_filters(await self.require_client(), self.symbol)
+        client = await self.require_client()
+        f = await _get_exchange_filters(client, self.symbol)
 
         price = current_price
         if price is None:
@@ -333,10 +378,9 @@ class CoinTrader:
         def ceil_to_step(x, step):
             if not step or step <= 0:
                 return float(x)
-            import math
             return math.ceil(float(x)/float(step))*float(step)
 
-        # Overshoot agar lolos minQty/minNotional (reduceOnly mencegah flip posisi)
+        # Overshoot agar lolos minQty/minNotional, reduceOnly mencegah flip posisi
         qty_req = ceil_to_step(pos_amt, step)
         if min_qty and qty_req < min_qty:
             qty_req = ceil_to_step(min_qty, step)
@@ -377,7 +421,6 @@ class CoinTrader:
             pnl = 0.0
             logger.warning(f"{self.symbol} Close attempt had 0 filled qty. remain={remain}")
 
-        # Finalize state jika benar2 nol; jika tidak, simpan sisa utk dicoba lagi nanti
         if remain <= epsilon:
             self.in_position = False
             self.position_type = None
@@ -398,7 +441,7 @@ class CoinTrader:
         df = self.data.copy()
         if df.empty:
             return df
-        # indikator minimal untuk trigger; bisa diganti sesuai app_swing.py
+        # indikator sederhana; sesuaikan sesuai strategi asli
         df['ema'] = df['close'].ewm(span=22, adjust=False).mean()
         df['ma'] = df['close'].rolling(20, min_periods=20).mean()
         macd_line = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
@@ -436,8 +479,8 @@ class CoinTrader:
             return
         last = df.iloc[-1]
         price = float(last['close'])
-        lev = float(self.config['leverage'])
-        risk = float(self.config['risk_per_trade'])
+        lev = float(self.config.get('leverage', 10))
+        risk = float(self.config.get('risk_per_trade', 0.05))
 
         long_sig = bool(last.get('long_signal', False))
         short_sig = bool(last.get('short_signal', False))
@@ -455,14 +498,14 @@ class CoinTrader:
             trailing_trigger = float(self.config.get('trailing_trigger', 0.5))
             trailing_step = float(self.config.get('trailing_step', 0.3))
             if self.position_type == 'LONG':
-                profit_pct = (mp - self.entry_price)/self.entry_price*100
+                profit_pct = (mp - (self.entry_price or mp))/ (self.entry_price or mp) * 100.0
                 if profit_pct >= trailing_trigger:
                     new_ts = mp * (1 - trailing_step/100)
                     self.trailing_stop = max(self.trailing_stop or self.stop_loss or 0, new_ts)
                 if self.trailing_stop and mp <= self.trailing_stop:
                     await self._close_position_reduce_only(mp)
             else:
-                profit_pct = (self.entry_price - mp)/self.entry_price*100
+                profit_pct = ((self.entry_price or mp) - mp)/ (self.entry_price or mp) * 100.0
                 if profit_pct >= trailing_trigger:
                     new_ts = mp * (1 + trailing_step/100)
                     self.trailing_stop = min(self.trailing_stop or self.stop_loss or 1e18, new_ts)
@@ -479,7 +522,8 @@ class CoinTrader:
         if max_cost <= 0 or price <= 0:
             return
         raw_qty = (max_cost * lev) / price
-        f = await _get_exchange_filters(await self.require_client(), self.symbol)
+        client = await self.require_client()
+        f = await _get_exchange_filters(client, self.symbol)
         qty = _normalize_qty(raw_qty, price, f)
         if qty <= 0:
             logger.info(f"Skip open: qty invalid/raw {raw_qty} @ {price}")
@@ -501,27 +545,27 @@ class CoinTrader:
 
     async def _get_available_balance(self) -> float:
         try:
-            # ambil balance futures USDT
-            balances = await self.require_client().futures_account_balance()
+            client = await self.require_client()
+            balances = await client.futures_account_balance()
             for a in balances:
                 if a.get('asset') == 'USDT':
-                    return float(a['availableBalance'])
+                    return float(a.get('availableBalance', 0))
         except Exception as e:
             logger.error(f"{self.symbol} get balance failed: {e}")
         return 0.0
 
     async def start_websocket(self):
-        bsm = BinanceSocketManager(await self.require_client())
-        if USE_MULTIPLEX:
-            return  # ditangani di manager
+        client = await self.require_client()
+        bsm = BinanceSocketManager(client)
         conn = bsm.kline_socket(symbol=self.symbol, interval=TIMEFRAME)
         retry = 0
         while True:
             try:
                 async with conn as stream:
-                    async for msg in stream:
-                        k = msg.get('k', {})
-                        if not k.get('x'):
+                    while True:
+                        msg = await stream.recv()
+                        k = msg.get('k', {}) if msg else {}
+                        if not k or not k.get('x'):
                             continue
                         await self.on_kline({
                             'T': k.get('T'),
@@ -545,28 +589,34 @@ class CoinTrader:
         except Exception:
             pass
 
-# ===== Persistence =====
-def _save_state(state: dict):
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, default=str)
-    except Exception as e:
-        logger.warning(f"save state failed: {e}")
-
-def _load_state() -> dict:
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning(f"load state failed: {e}")
-    return {}
-
 # ===== Manager =====
 class TradingManager:
+    def __init__(self, api_key: str, api_secret: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.traders: Dict[str, CoinTrader] = {}
+        self.configs = self.load_configs()
+        self.shared_client: Optional[AsyncClient] = None
+        self._cfg_mtime = None
+        self._watch_task: Optional[asyncio.Task] = None
+
+    def load_configs(self):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                configs = json.load(f)
+            for s in SYMBOLS:
+                if s not in configs:
+                    raise ValueError(f"Configuration missing for {s}")
+            logger.info("Configuration loaded successfully")
+            return configs
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            raise
+
     async def _watch_config(self):
-        """Hot-reload CONFIG_FILE setiap 5 detik. Hanya update parameter yang aman."""
         interval = int(os.getenv("CONFIG_WATCH_INTERVAL", "5"))
+        if interval <= 0:
+            return
         safe_keys = {"risk_per_trade","leverage","trailing_trigger","trailing_step","max_hold_seconds","min_roi_to_close_by_time","taker_fee","maker_fee"}
         while True:
             try:
@@ -590,28 +640,6 @@ class TradingManager:
                 logger.warning(f"config watch error: {e}")
                 await asyncio.sleep(interval)
 
-    def __init__(self, api_key: str, api_secret: str):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.traders: dict[str, CoinTrader] = {}
-        self.configs = self.load_configs()
-        self.shared_client: Optional[AsyncClient] = None
-        self._cfg_mtime = None
-        self._watch_task = None
-
-    def load_configs(self):
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                configs = json.load(f)
-            for s in SYMBOLS:
-                if s not in configs:
-                    raise ValueError(f"Configuration missing for {s}")
-            logger.info("Configuration loaded successfully")
-            return configs
-        except Exception as e:
-            logger.error(f"Failed to load config: {e}")
-            raise
-
     async def get_futures_balance(self) -> float:
         try:
             client = self.shared_client
@@ -621,7 +649,7 @@ class TradingManager:
             balances = await client.futures_account_balance()
             for a in balances:
                 if a.get('asset') == 'USDT':
-                    return float(a['availableBalance'])
+                    return float(a.get('availableBalance', 0))
         except Exception as e:
             logger.error(f"get_futures_balance failed: {e}")
         return 0.0
@@ -632,31 +660,41 @@ class TradingManager:
         total_balance = await self.get_futures_balance()
         risk_pct = float(os.getenv("RISK_PERCENTAGE", "1.0"))  # alokasi dari total balance, 1.0 = 100%
         trading_balance = total_balance * risk_pct
-        capital_per_coin = trading_balance / len(SYMBOLS)
+        capital_per_coin = trading_balance / max(len(SYMBOLS), 1)
         logger.info(f"Total balance: {total_balance:.2f} USDT")
         logger.info(f"Allocated trading balance: {trading_balance:.2f} USDT")
         logger.info(f"Capital per coin: {capital_per_coin:.2f} USDT")
 
         for s in SYMBOLS:
             t = CoinTrader(s, self.api_key, self.api_secret, capital_per_coin, self.configs[s])
-            t.client = self.shared_client
+            t.client = self.shared_client  # reuse 1 klien
             self.traders[s] = t
             await t.initialize()
 
     async def _start_multiplex(self):
-        bsm = BinanceSocketManager(self.shared_client)
+        # Pastikan shared_client sudah ada (hindari Optional untuk Pylance & runtime)
+        client = self.shared_client
+        if client is None:
+            client = await AsyncClient.create(self.api_key, self.api_secret)
+            self.shared_client = client
+        bsm = BinanceSocketManager(client)
         streams = [f"{s.lower()}@kline_{TIMEFRAME}" for s in SYMBOLS]
         ms = bsm.multiplex_socket(streams)
         retry = 0
+        logger.info(f"Starting with multiplex WebSocket (single connection).")
         while True:
             try:
                 async with ms as stream:
-                    async for msg in stream:
-                        data = msg.get('data', {})
+                    logger.info(f"Multiplex WS started for {len(streams)} streams")
+                    while True:
+                        msg = await stream.recv()
+                        data = msg.get('data', {}) if msg else {}
                         k = data.get('k', {})
-                        if not k.get('x'):
+                        if not k or not k.get('x'):
                             continue
                         sym = data.get('s')
+                        if not isinstance(sym, str) or not sym:
+                            continue
                         trader = self.traders.get(sym)
                         if trader:
                             await trader.on_kline({
@@ -673,13 +711,12 @@ class TradingManager:
                     logger.error(f"Multiplex WS stopped after {retry} retries: {e}")
                     break
                 await asyncio.sleep(min(2**retry, 30))
-
+                
     async def start_trading(self):
         # start watcher
         self._cfg_mtime = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None
         self._watch_task = asyncio.create_task(self._watch_config())
         if USE_MULTIPLEX:
-            logger.info("Starting with multiplex WebSocket (single connection).")
             await self._start_multiplex()
         else:
             logger.info("Starting with per-symbol WebSocket (one connection per symbol).")
@@ -687,6 +724,7 @@ class TradingManager:
             await asyncio.gather(*tasks)
         while True:
             await asyncio.sleep(3600)
+
 
     async def stop(self):
         if self._watch_task:
