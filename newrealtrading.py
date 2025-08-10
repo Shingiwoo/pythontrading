@@ -1,14 +1,10 @@
 """
-newrealtrading.py
+newrealtrading.py — presisi entri v2
 
-Perbaikan besar:
-- SYMBOLS dibaca dari ENV (fallback default 3 coin).
-- Logging ramah read-only FS (LOG_DIR fallback ke /tmp).
-- SELURUH pemanggilan Binance pakai client = await self.require_client(); await client.xxx(...)
-- WS loop pakai await stream.recv() (bukan async for) → cocok untuk ReconnectingWebsocket.
-- Hot-reload config aman + apply leverage live.
-- Exchange filters (stepSize/minQty/minNotional/tickSize) + sizing sesuai Binance.
-- Residual close fix: overshoot reduceOnly + verifikasi sisa + retry 1x; PnL pakai filled_qty.
+Tambahan utama:
+- FILTER PRESISI ENTRI: ATR regime (min/max), hindari candle kepanjangan (body/ATR), konfirmasi tren HTF (1H), cooldown setelah exit.
+- Perbaikan ReduceOnly -2022 (abaikan aman jika posisi sudah 0).
+- Fitur sebelumnya tetap: SYMBOLS via ENV, logging ramah read-only, WS loop recv(), leverage await, residual-close fix.
 """
 
 import os
@@ -36,7 +32,6 @@ try:
     log_path = os.path.join(LOG_DIR, LOG_FILE)
     handlers.append(logging.FileHandler(log_path))
 except Exception:
-    # fallback ke tmpfs
     handlers.append(logging.FileHandler("/tmp/trading_bot.log"))
 handlers.append(logging.StreamHandler())
 
@@ -75,7 +70,7 @@ def _extract_filled_qty(order: Dict[str, Any]) -> float:
         for k in ("executedQty", "cumQty"):
             if k in order and order[k] is not None:
                 return float(order[k])
-        if "origQty" in order and order["origQty"] is not None:  # fallback
+        if "origQty" in order and order["origQty"] is not None:
             return float(order["origQty"])
         fills = order.get("fills") or []
         if fills:
@@ -222,7 +217,7 @@ class CoinTrader:
         self.symbol = symbol
         self.api_key = api_key
         self.api_secret = api_secret
-        self.capital = capital_allocated  # tracking lokal
+        self.capital = capital_allocated
         self.config = config
 
         self.data = pd.DataFrame(columns=['timestamp','open','high','low','close','volume'])
@@ -237,6 +232,11 @@ class CoinTrader:
         self.position_size: float = 0.0
         self.hold_start_ts: Optional[float] = None
         self.client: Optional[AsyncClient] = None
+
+        # presisi entri
+        self.cooldown_until: float = 0.0
+        self._htf_cache = None
+        self._htf_cache_ts = 0.0
 
     async def require_client(self) -> AsyncClient:
         if self.client is None:
@@ -291,7 +291,7 @@ class CoinTrader:
         except Exception as e:
             logger.error(f"{self.symbol} change leverage failed on init: {e}")
 
-        # load data awal buat indikator internal jika perlu
+        # load data awal
         try:
             client = await self.require_client()
             klines = await client.futures_klines(symbol=self.symbol, interval=TIMEFRAME, limit=1000)
@@ -304,9 +304,7 @@ class CoinTrader:
             logger.warning(f"{self.symbol} init klines failed: {e}")
 
     async def apply_config_update(self, new_cfg: dict, changed: dict):
-        # Update config internal
         self.config.update({k:new_cfg.get(k, self.config.get(k)) for k in new_cfg.keys()})
-        # Terapkan perubahan leverage segera
         if 'leverage' in changed:
             try:
                 client = await self.require_client()
@@ -318,7 +316,6 @@ class CoinTrader:
                 logger.info(f"{self.symbol} leverage updated to {self.config['leverage']} via hot-reload")
             except Exception as e:
                 logger.error(f"{self.symbol} change leverage failed: {e}")
-        # Notif perubahan lain
         other = {k:v for k,v in changed.items() if k!='leverage'}
         if other:
             try:
@@ -327,6 +324,53 @@ class CoinTrader:
             except Exception:
                 pass
         return True
+
+    def calculate_indicators(self) -> pd.DataFrame:
+        df = self.data.copy()
+        if df.empty:
+            return df
+        # indikator dasar
+        df['ema'] = df['close'].ewm(span=22, adjust=False).mean()
+        df['ma'] = df['close'].rolling(20, min_periods=20).mean()
+        macd_line = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        df['macd'] = macd_line
+        df['macd_signal'] = signal_line
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        rs = gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / (loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean() + 1e-12)
+        df['rsi'] = 100 - (100/(1+rs))
+        # ATR & rasio body
+        prev_close = df['close'].shift(1)
+        tr = (df['high'] - df['low']).to_frame('a')
+        tr['b'] = (df['high'] - prev_close).abs()
+        tr['c'] = (df['low'] - prev_close).abs()
+        df['tr'] = tr.max(axis=1)
+        df['atr'] = df['tr'].ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        df['body'] = (df['close'] - df['open']).abs()
+        df['atr_pct'] = df['atr'] / df['close']
+        df['body_to_atr'] = df['body'] / df['atr']
+        # sinyal dasar
+        df['long_signal'] = (df['ema']>df['ma']) & (df['macd']>df['macd_signal']) & (df['rsi'].between(40,70))
+        df['short_signal'] = (df['ema']<df['ma']) & (df['macd']<df['macd_signal']) & (df['rsi'].between(30,60))
+        return df
+
+    async def _htf_trend_ok(self, side: str) -> bool:
+        # cache 30 menit
+        if time.time() - (self._htf_cache_ts or 0) > 1800 or self._htf_cache is None:
+            client = await self.require_client()
+            h1 = await client.futures_klines(symbol=self.symbol, interval='1h', limit=300)
+            close = pd.Series([float(k[4]) for k in h1])
+            ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+            ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
+            self._htf_cache = {'ema50': float(ema50), 'ema200': float(ema200)}
+            self._htf_cache_ts = time.time()
+        ema50 = self._htf_cache['ema50']; ema200 = self._htf_cache['ema200']
+        if side == 'LONG':
+            return ema50 >= ema200
+        else:
+            return ema50 <= ema200
 
     async def place_order(self, side: str, quantity: float, reduce_only: bool = False):
         client = await self.require_client()
@@ -352,12 +396,15 @@ class CoinTrader:
             await _send_telegram(f"✅ <b>{self.symbol}</b> {side} sent={qty} filled={filled} @MARKET")
             return order, qty, filled
         except Exception as e:
+            msg = str(e)
+            if "-2022" in msg and reduce_only:
+                logger.info(f"{self.symbol} reduceOnly rejected (no position) → ignore")
+                return None, None, 0.0
             logger.error(f"Create order failed: {e}")
             await _send_telegram(f"❌ <b>{self.symbol}</b> order gagal: {e}")
             return None, None, 0.0
 
     async def _close_position_reduce_only(self, current_price: Optional[float] = None):
-        # Ambil size posisi aktual di exchange
         pos_amt = await self._get_position_amt()
         if not self.in_position or pos_amt <= 0 or self.entry_price is None:
             return
@@ -380,7 +427,6 @@ class CoinTrader:
                 return float(x)
             return math.ceil(float(x)/float(step))*float(step)
 
-        # Overshoot agar lolos minQty/minNotional, reduceOnly mencegah flip posisi
         qty_req = ceil_to_step(pos_amt, step)
         if min_qty and qty_req < min_qty:
             qty_req = ceil_to_step(min_qty, step)
@@ -391,19 +437,16 @@ class CoinTrader:
         order, sent, filled = await self.place_order(side, qty_req, reduce_only=True)
         used_qty = filled if filled and filled > 0 else 0.0
 
-        # Cek sisa posisi
         remain = await self._get_position_amt()
         epsilon = max(step/2 if step else 0.0, 1e-8)
 
         if remain > epsilon:
-            # Coba sekali lagi dengan overshoot sedikit lebih besar
             qty_req2 = qty_req + (step or 0.0)
             order2, sent2, filled2 = await self.place_order(side, qty_req2, reduce_only=True)
             if filled2 and filled2 > 0:
                 used_qty += filled2
             remain = await self._get_position_amt()
 
-        # Harga final untuk PnL
         if current_price is None:
             mp2 = await self._get_mark_price()
             current_price = mp2 if mp2 is not None else self.entry_price
@@ -431,35 +474,19 @@ class CoinTrader:
             self.position_size = 0.0
             self.hold_start_ts = None
             _save_state({'symbol': self.symbol, 'in_position': False})
+            # cooldown setelah exit
+            try:
+                cd = int(self.config.get('cooldown_seconds', 1200))
+                self.cooldown_until = time.time() + max(cd, 0)
+            except Exception:
+                self.cooldown_until = time.time() + 1200
             asyncio.create_task(_send_telegram(f"🏁 <b>{self.symbol}</b> CLOSE done | PnL ${pnl:.4f}"))
         else:
             self.position_size = remain
             _save_state({'symbol': self.symbol, 'in_position': True, 'position_type': self.position_type, 'entry_price': self.entry_price, 'position_size': self.position_size, 'stop_loss': self.stop_loss, 'take_profit': self.take_profit, 'trailing_stop': self.trailing_stop, 'hold_start_ts': self.hold_start_ts})
             asyncio.create_task(_send_telegram(f"⚠️ <b>{self.symbol}</b> residual remain: {remain} (akan dicoba close lagi)"))
 
-    def calculate_indicators(self) -> pd.DataFrame:
-        df = self.data.copy()
-        if df.empty:
-            return df
-        # indikator sederhana; sesuaikan sesuai strategi asli
-        df['ema'] = df['close'].ewm(span=22, adjust=False).mean()
-        df['ma'] = df['close'].rolling(20, min_periods=20).mean()
-        macd_line = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-        signal_line = macd_line.ewm(span=9, adjust=False).mean()
-        df['macd'] = macd_line
-        df['macd_signal'] = signal_line
-        delta = df['close'].diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        rs = gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / (loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean() + 1e-12)
-        df['rsi'] = 100 - (100/(1+rs))
-
-        df['long_signal'] = (df['ema']>df['ma']) & (df['macd']>df['macd_signal']) & (df['rsi'].between(40,70))
-        df['short_signal'] = (df['ema']<df['ma']) & (df['macd']<df['macd_signal']) & (df['rsi'].between(30,60))
-        return df
-
     async def on_kline(self, kline: dict):
-        # update data realtime
         try:
             self.data.loc[len(self.data)] = {
                 'timestamp': kline['T'],
@@ -491,21 +518,22 @@ class CoinTrader:
             self.in_position = False
 
         if self.in_position:
-            # update trailing berdasarkan config terkini
             mp = await self._get_mark_price()
             if mp is None:
                 return
             trailing_trigger = float(self.config.get('trailing_trigger', 0.5))
             trailing_step = float(self.config.get('trailing_step', 0.3))
             if self.position_type == 'LONG':
-                profit_pct = (mp - (self.entry_price or mp))/ (self.entry_price or mp) * 100.0
+                ep = self.entry_price or mp
+                profit_pct = (mp - ep)/ep * 100.0
                 if profit_pct >= trailing_trigger:
                     new_ts = mp * (1 - trailing_step/100)
                     self.trailing_stop = max(self.trailing_stop or self.stop_loss or 0, new_ts)
                 if self.trailing_stop and mp <= self.trailing_stop:
                     await self._close_position_reduce_only(mp)
             else:
-                profit_pct = ((self.entry_price or mp) - mp)/ (self.entry_price or mp) * 100.0
+                ep = self.entry_price or mp
+                profit_pct = (ep - mp)/ep * 100.0
                 if profit_pct >= trailing_trigger:
                     new_ts = mp * (1 + trailing_step/100)
                     self.trailing_stop = min(self.trailing_stop or self.stop_loss or 1e18, new_ts)
@@ -516,7 +544,28 @@ class CoinTrader:
         if not (long_sig or short_sig):
             return
 
-        # Hitung margin dari available balance (per coin)
+        # --- Filter Presisi Entry ---
+        atr_pct = float(last.get('atr_pct', 0) or 0)
+        body_to_atr = float(last.get('body_to_atr', 0) or 0)
+        min_atr_pct = float(self.config.get('min_atr_pct', 0.003))
+        max_atr_pct = float(self.config.get('max_atr_pct', 0.03))
+        max_body_atr = float(self.config.get('max_body_atr', 1.0))
+        use_htf_filter = bool(int(self.config.get('use_htf_filter', 1)))
+        cooldown_seconds = int(self.config.get('cooldown_seconds', 1200))
+
+        if not (min_atr_pct <= atr_pct <= max_atr_pct):
+            return
+        if body_to_atr > max_body_atr:
+            return
+        if self.cooldown_until and time.time() < self.cooldown_until:
+            return
+        if use_htf_filter:
+            want = 'LONG' if long_sig else 'SHORT'
+            ok = await self._htf_trend_ok(want)
+            if not ok:
+                return
+
+        # Hitung sizing
         avail = await self._get_available_balance()
         max_cost = avail * risk
         if max_cost <= 0 or price <= 0:
@@ -539,7 +588,6 @@ class CoinTrader:
         _save_state({'symbol': self.symbol, 'in_position': True, 'position_type': self.position_type, 'entry_price': self.entry_price, 'position_size': self.position_size, 'stop_loss': self.stop_loss, 'take_profit': self.take_profit, 'trailing_stop': self.trailing_stop, 'hold_start_ts': self.hold_start_ts})
         asyncio.create_task(_send_telegram(f"🚀 <b>{self.symbol}</b> OPEN {self.position_type} {self.position_size} @ {self.entry_price}"))
 
-        # eksekusi market
         side = 'BUY' if self.position_type == 'LONG' else 'SELL'
         await self.place_order(side, self.position_size, reduce_only=False)
 
@@ -617,7 +665,7 @@ class TradingManager:
         interval = int(os.getenv("CONFIG_WATCH_INTERVAL", "5"))
         if interval <= 0:
             return
-        safe_keys = {"risk_per_trade","leverage","trailing_trigger","trailing_step","max_hold_seconds","min_roi_to_close_by_time","taker_fee","maker_fee"}
+        safe_keys = {"risk_per_trade","leverage","trailing_trigger","trailing_step","max_hold_seconds","min_roi_to_close_by_time","taker_fee","maker_fee","min_atr_pct","max_atr_pct","max_body_atr","use_htf_filter","cooldown_seconds"}
         while True:
             try:
                 mtime = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None
@@ -658,7 +706,7 @@ class TradingManager:
         if self.shared_client is None:
             self.shared_client = await AsyncClient.create(self.api_key, self.api_secret)
         total_balance = await self.get_futures_balance()
-        risk_pct = float(os.getenv("RISK_PERCENTAGE", "1.0"))  # alokasi dari total balance, 1.0 = 100%
+        risk_pct = float(os.getenv("RISK_PERCENTAGE", "1.0"))
         trading_balance = total_balance * risk_pct
         capital_per_coin = trading_balance / max(len(SYMBOLS), 1)
         logger.info(f"Total balance: {total_balance:.2f} USDT")
@@ -667,12 +715,11 @@ class TradingManager:
 
         for s in SYMBOLS:
             t = CoinTrader(s, self.api_key, self.api_secret, capital_per_coin, self.configs[s])
-            t.client = self.shared_client  # reuse 1 klien
+            t.client = self.shared_client
             self.traders[s] = t
             await t.initialize()
 
     async def _start_multiplex(self):
-        # Pastikan shared_client sudah ada (hindari Optional untuk Pylance & runtime)
         client = self.shared_client
         if client is None:
             client = await AsyncClient.create(self.api_key, self.api_secret)
@@ -711,9 +758,8 @@ class TradingManager:
                     logger.error(f"Multiplex WS stopped after {retry} retries: {e}")
                     break
                 await asyncio.sleep(min(2**retry, 30))
-                
+
     async def start_trading(self):
-        # start watcher
         self._cfg_mtime = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None
         self._watch_task = asyncio.create_task(self._watch_config())
         if USE_MULTIPLEX:
@@ -724,7 +770,6 @@ class TradingManager:
             await asyncio.gather(*tasks)
         while True:
             await asyncio.sleep(3600)
-
 
     async def stop(self):
         if self._watch_task:
