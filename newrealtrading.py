@@ -56,6 +56,29 @@ EXCHANGEINFO_TTL_SECONDS = int(os.getenv('EXCHANGEINFO_TTL_SECONDS', '21600'))  
 
 # ===== Utilities =====
 
+def _extract_filled_qty(order: dict) -> float:
+    """Ambil qty terisi dari berbagai format respons order Futures Binance."""
+    try:
+        for k in ("executedQty", "cumQty"):
+            if k in order and order[k] is not None:
+                return float(order[k])
+        if "origQty" in order and order["origQty"] is not None:  # fallback
+            return float(order["origQty"])
+        fills = order.get("fills") or []
+        if fills:
+            total = 0.0
+            for f in fills:
+                v = f.get("qty") or f.get("executionQty") or 0
+                try:
+                    total += float(v)
+                except Exception:
+                    pass
+            if total > 0:
+                return total
+    except Exception:
+        pass
+    return 0.0
+
 def floor_to_step(x, step):
     if not step or step <= 0:
         return float(x)
@@ -193,6 +216,16 @@ class CoinTrader:
         except Exception as e:
             logger.error(f"{self.symbol} get mark price failed: {e}")
             return None
+    
+    async def _get_position_amt(self) -> float:
+        try:
+            info = await self.require_client().futures_position_information(symbol=self.symbol)
+            for pos in info:
+                if pos.get('symbol') == self.symbol:
+                    return abs(float(pos.get('positionAmt', 0) or 0))
+        except Exception as e:
+            logger.error(f"{self.symbol} get position info failed: {e}")
+        return 0.0
 
     async def initialize(self):
         if self.client is None:
@@ -267,52 +300,103 @@ class CoinTrader:
         if qty <= 0:
             logger.error(f"{self.symbol} qty invalid after normalize (qty={qty})")
             await _send_telegram(f"❌ <b>{self.symbol}</b> order gagal: qty invalid setelah normalize")
-            return None, None
+            return None, None, 0.0
 
         try:
             order = await client.futures_create_order(
                 symbol=self.symbol, side=side, type=ORDER_TYPE_MARKET,
                 quantity=qty, reduceOnly=reduce_only, newOrderRespType='RESULT'
             )
-            logger.info(f"Order executed: {order}")
-            await _send_telegram(f"✅ <b>{self.symbol}</b> {side} {qty} @MARKET")
-            return order, qty
+            filled = _extract_filled_qty(order)
+            logger.info(f"Order executed: sent={qty}, filled={filled}, resp={order}")
+            await _send_telegram(f"✅ <b>{self.symbol}</b> {side} sent={qty} filled={filled} @MARKET")
+            return order, qty, filled
         except Exception as e:
             logger.error(f"Create order failed: {e}")
             await _send_telegram(f"❌ <b>{self.symbol}</b> order gagal: {e}")
-            return None, None
+            return None, None, 0.0
 
     async def _close_position_reduce_only(self, current_price: Optional[float] = None):
-        if not self.in_position or self.position_size <= 0 or self.entry_price is None:
+        # Ambil size posisi aktual di exchange
+        pos_amt = await self._get_position_amt()
+        if not self.in_position or pos_amt <= 0 or self.entry_price is None:
             return
+
         side = 'SELL' if self.position_type == 'LONG' else 'BUY'
-        _, sent_qty = await self.place_order(side, self.position_size, reduce_only=True)
-        used_qty = sent_qty or self.position_size
+        f = await _get_exchange_filters(await self.require_client(), self.symbol)
 
-        if current_price is None:
+        price = current_price
+        if price is None:
             mp = await self._get_mark_price()
-            current_price = mp if mp is not None else self.entry_price
+            price = mp if mp is not None else self.entry_price
 
-        if self.position_type == 'LONG':
-            raw_pnl = (current_price - self.entry_price) * used_qty
-        else:
-            raw_pnl = (self.entry_price - current_price) * used_qty
-        # pakai TAKER_FEE dari config jika ada, else default
+        step = float(f.get('step', 0.0)) or 0.0
+        min_qty = float(f.get('min_qty', 0.0)) or 0.0
+        min_notional = float(f.get('min_notional', 0.0)) or 0.0
+
+        def ceil_to_step(x, step):
+            if not step or step <= 0:
+                return float(x)
+            import math
+            return math.ceil(float(x)/float(step))*float(step)
+
+        # Overshoot agar lolos minQty/minNotional (reduceOnly mencegah flip posisi)
+        qty_req = ceil_to_step(pos_amt, step)
+        if min_qty and qty_req < min_qty:
+            qty_req = ceil_to_step(min_qty, step)
+        if min_notional and price and (qty_req * price) < min_notional:
+            need = min_notional / price
+            qty_req = max(qty_req, ceil_to_step(need, step))
+
+        order, sent, filled = await self.place_order(side, qty_req, reduce_only=True)
+        used_qty = filled if filled and filled > 0 else 0.0
+
+        # Cek sisa posisi
+        remain = await self._get_position_amt()
+        epsilon = max(step/2 if step else 0.0, 1e-8)
+
+        if remain > epsilon:
+            # Coba sekali lagi dengan overshoot sedikit lebih besar
+            qty_req2 = qty_req + (step or 0.0)
+            order2, sent2, filled2 = await self.place_order(side, qty_req2, reduce_only=True)
+            if filled2 and filled2 > 0:
+                used_qty += filled2
+            remain = await self._get_position_amt()
+
+        # Harga final untuk PnL
+        if current_price is None:
+            mp2 = await self._get_mark_price()
+            current_price = mp2 if mp2 is not None else self.entry_price
         taker_fee = float(self.config.get('taker_fee', TAKER_FEE_DEFAULT))
-        fee = (self.entry_price + current_price) * taker_fee * used_qty
-        pnl = raw_pnl - fee
-        logger.info(f"{self.symbol} Position closed | Entry: {self.entry_price:.4f} Exit: {current_price:.4f} | PnL: ${pnl:.4f}")
 
-        self.in_position = False
-        self.position_type = None
-        self.entry_price = None
-        self.stop_loss = None
-        self.take_profit = None
-        self.trailing_stop = None
-        self.position_size = 0.0
-        self.hold_start_ts = None
-        _save_state({'symbol': self.symbol, 'in_position': False})
-        asyncio.create_task(_send_telegram(f"🏁 <b>{self.symbol}</b> CLOSE | PnL ${pnl:.4f}"))
+        if used_qty > 0:
+            if self.position_type == 'LONG':
+                raw_pnl = (current_price - self.entry_price) * used_qty
+            else:
+                raw_pnl = (self.entry_price - current_price) * used_qty
+            fee = (self.entry_price + current_price) * taker_fee * used_qty
+            pnl = raw_pnl - fee
+            logger.info(f"{self.symbol} Close partial | used={used_qty} remain={remain} | PnL: ${pnl:.6f}")
+        else:
+            pnl = 0.0
+            logger.warning(f"{self.symbol} Close attempt had 0 filled qty. remain={remain}")
+
+        # Finalize state jika benar2 nol; jika tidak, simpan sisa utk dicoba lagi nanti
+        if remain <= epsilon:
+            self.in_position = False
+            self.position_type = None
+            self.entry_price = None
+            self.stop_loss = None
+            self.take_profit = None
+            self.trailing_stop = None
+            self.position_size = 0.0
+            self.hold_start_ts = None
+            _save_state({'symbol': self.symbol, 'in_position': False})
+            asyncio.create_task(_send_telegram(f"🏁 <b>{self.symbol}</b> CLOSE done | PnL ${pnl:.4f}"))
+        else:
+            self.position_size = remain
+            _save_state({'symbol': self.symbol, 'in_position': True, 'position_type': self.position_type, 'entry_price': self.entry_price, 'position_size': self.position_size, 'stop_loss': self.stop_loss, 'take_profit': self.take_profit, 'trailing_stop': self.trailing_stop, 'hold_start_ts': self.hold_start_ts})
+            asyncio.create_task(_send_telegram(f"⚠️ <b>{self.symbol}</b> residual remain: {remain} (akan dicoba close lagi)"))
 
     def calculate_indicators(self) -> pd.DataFrame:
         df = self.data.copy()
