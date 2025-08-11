@@ -6,7 +6,7 @@
     "trailing_step": 0.3,
     "taker_fee": 0.0005,
 
-    "min_atr_pct": 0.003,
+    "min_atr_pct": 0.005,
     "max_atr_pct": 0.03,
     "max_body_atr": 1.0,
     "use_htf_filter": 1,
@@ -30,7 +30,7 @@
     "trailing_step": 0.3,
     "taker_fee": 0.0005,
 
-    "min_atr_pct": 0.003,
+    "min_atr_pct": 0.005,
     "max_atr_pct": 0.03,
     "max_body_atr": 1.0,
     "use_htf_filter": 1,
@@ -54,7 +54,7 @@
     "trailing_step": 0.3,
     "taker_fee": 0.0005,
 
-    "min_atr_pct": 0.003,
+    "min_atr_pct": 0.005,
     "max_atr_pct": 0.03,
     "max_body_atr": 1.0,
     "use_htf_filter": 1,
@@ -78,7 +78,7 @@
     "trailing_step": 0.3,
     "taker_fee": 0.0005,
 
-    "min_atr_pct": 0.003,
+    "min_atr_pct": 0.005,
     "max_atr_pct": 0.03,
     "max_body_atr": 1.0,
     "use_htf_filter": 1,

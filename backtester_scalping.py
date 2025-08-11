@@ -1,28 +1,28 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import os, math, json
 import matplotlib.pyplot as plt
+from typing import Any
 from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.volatility import BollingerBands
 from ta.momentum import RSIIndicator
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
-from typing import Any
 
 """
 ============================================================
 APP: Backtester — SCALPING (Selaras Real Trading)
 FILE: backtester_scalping.py
-UPDATE: 2025-08-11
+UPDATE: 2025-08-11 (patch: HTF default OFF + Mode Debug)
 ============================================================
 Fitur:
 - Loader coin_config.json (per simbol) → prefill leverage, risk_per_trade, taker_fee, filter presisi, SL/BE/Trailing.
-- Presisi Entri v2: ATR regime, rasio body/ATR, HTF filter (EMA50 vs EMA200 1H), cooldown.
+- Presisi Entri v2: ATR regime, rasio body/ATR, HTF filter (EMA50 vs EMA200 1h), cooldown.
 - Hard Stop Loss (ATR/PCT + clamp), Breakeven, Trailing, opsi TP bertingkat.
 - Money management identik Binance Futures:
   qty = ((balance * risk_per_trade) * leverage) / price → normalisasi LOT_SIZE.
+- NEW: use_htf_filter default = OFF, dan Mode Debug untuk melonggarkan filter + tampilkan alasan blokir.
 ============================================================
 """
 
@@ -48,18 +48,18 @@ st.set_page_config(page_title="Backtester Scalping (RealLogic)", layout="wide")
 st.title("⚡ Backtester — Scalping (Selaras Real Trading)")
 
 st.sidebar.header("📂 Data & Config")
-data_dir = st.sidebar.text_input("Folder Data CSV", value="/mnt/data")
+data_dir = st.sidebar.text_input("Folder Data CSV", value="./data")
 try:
     csv_files = sorted([f for f in os.listdir(data_dir) if f.lower().endswith(".csv")])
 except Exception:
     csv_files = []
 selected_file = st.selectbox("Pilih data file (1 simbol per backtest)", options=csv_files)
 
-cfg_default_path = st.sidebar.text_input("Path coin_config.json", value="/mnt/data/coin_config.json")
+cfg_default_path = st.sidebar.text_input("Path coin_config.json", value="./coin_config.json")
 load_cfg = st.sidebar.checkbox("Muat konfigurasi dari coin_config.json", True)
 
 st.sidebar.header("🕒 Timeframe")
-timeframe = st.sidebar.selectbox("Resample", ["as-is","15T","1H","4H","1D"], index=0)
+timeframe = st.sidebar.selectbox("Resample", ["as-is","15m","1h","4h","1d"], index=0)
 
 st.sidebar.header("💰 Money Management")
 initial_capital = st.sidebar.number_input("Available Balance (USDT)", value=20.0, min_value=0.0, step=1.0)
@@ -74,42 +74,72 @@ with st.sidebar.expander("⚙️ LOT_SIZE & Precision"):
     qty_precision = st.number_input("quantityPrecision", value=0, min_value=0, max_value=8, step=1)
 
 # simbol → prefill dari coin_config
-symbol = None
-if selected_file:
-    symbol = os.path.splitext(selected_file)[0].upper()
+symbol = os.path.splitext(selected_file)[0].upper() if selected_file else None
 
-coin_cfg = {}
-if load_cfg and os.path.exists(cfg_default_path):
-    coin_cfg = load_coin_config(cfg_default_path)
-    if symbol and symbol in coin_cfg:
-        cfg = coin_cfg[symbol]
-        leverage = int(cfg.get("leverage", leverage))
-        risk_per_trade = float(cfg.get("risk_per_trade", risk_per_trade))
-        taker_fee = float(cfg.get("taker_fee", taker_fee))
+# --- SAFE loader coin_config (tanpa bikin Pylance bingung) ---
+raw_cfg: dict[str, Any] = load_coin_config(cfg_default_path) if (load_cfg and os.path.exists(cfg_default_path)) else {}
+sym_cfg: dict[str, Any] = raw_cfg.get(symbol, {}) if isinstance(symbol, str) else {}
+
+# helper casting aman
+def cfgf(key: str, fallback: float) -> float:
+    try:
+        v = sym_cfg.get(key, fallback)
+        return float(v)
+    except Exception:
+        return float(fallback)
+
+def cfgi(key: str, fallback: int) -> int:
+    try:
+        v = sym_cfg.get(key, fallback)
+        return int(v)
+    except Exception:
+        return int(fallback)
+
+def cfgb(key: str, fallback: bool) -> bool:
+    try:
+        v = sym_cfg.get(key, fallback)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(int(v))
+        if isinstance(v, str):
+            return bool(int(v)) if v.isdigit() else (v.lower() in {"true","on","yes","y"})
+        return bool(v)
+    except Exception:
+        return bool(fallback)
+
+# prefill mm bila tersedia di config (tanpa wajib)
+leverage = cfgi("leverage", leverage)
+risk_per_trade = cfgf("risk_per_trade", risk_per_trade)
+taker_fee = cfgf("taker_fee", taker_fee)
 
 st.sidebar.header("📏 Param SCALPING (Presisi Entri v2)")
-min_atr_pct = st.sidebar.number_input("min_atr_pct", value=float(coin_cfg.get(symbol, {}).get("min_atr_pct", 0.003 if symbol else 0.003)))
-max_atr_pct = st.sidebar.number_input("max_atr_pct", value=float(coin_cfg.get(symbol, {}).get("max_atr_pct", 0.03 if symbol else 0.03)))
-max_body_atr = st.sidebar.number_input("max_body_atr", value=float(coin_cfg.get(symbol, {}).get("max_body_atr", 1.0 if symbol else 1.0)))
-use_htf_filter = st.sidebar.checkbox("use_htf_filter (EMA50 vs EMA200, 1H)", bool(int(coin_cfg.get(symbol, {}).get("use_htf_filter", 1 if symbol else 1))))
-cooldown_seconds = st.sidebar.number_input("cooldown_seconds", value=int(coin_cfg.get(symbol, {}).get("cooldown_seconds", 1200 if symbol else 1200)))
+min_atr_pct = st.sidebar.number_input("min_atr_pct", value=cfgf("min_atr_pct", 0.003))
+max_atr_pct = st.sidebar.number_input("max_atr_pct", value=cfgf("max_atr_pct", 0.03))
+max_body_atr = st.sidebar.number_input("max_body_atr", value=cfgf("max_body_atr", 1.0))
+# DEFAULT OFF SELALU (abaikan nilai config; tampilkan rekomendasi di caption)
+use_htf_filter = st.sidebar.checkbox("use_htf_filter (EMA50 vs EMA200, 1h)", value=False, help="Default OFF untuk test awal. Aktifkan manual bila ingin sinkron tren HTF.")
+if sym_cfg:
+    st.caption(f"Rekomendasi dari config: {'ON' if cfgb('use_htf_filter', False) else 'OFF'}")
+cooldown_seconds = st.sidebar.number_input("cooldown_seconds", value=cfgi("cooldown_seconds", 1200))
 
 with st.sidebar.expander("🛡️ Exit Guards (Time-based)"):
     max_hold_seconds = st.number_input("MAX_HOLD_SECONDS", value=DEFAULT_MAX_HOLD_SECONDS, step=60)
     min_roi_to_close_by_time = st.number_input("MIN_ROI_TO_CLOSE_BY_TIME (fraction)", value=DEFAULT_MIN_ROI_TO_CLOSE_BY_TIME, format="%.4f")
 
 st.sidebar.subheader("🏃 Trailing & Breakeven")
-trailing_trigger = st.sidebar.number_input("trailing_trigger (%)", value=float(coin_cfg.get(symbol, {}).get("trailing_trigger", 0.4 if symbol else 0.4)))
-trailing_step = st.sidebar.number_input("trailing_step (%)", value=float(coin_cfg.get(symbol, {}).get("trailing_step", 0.3 if symbol else 0.3)))
-use_breakeven = st.sidebar.checkbox("use_breakeven", bool(int(coin_cfg.get(symbol, {}).get("use_breakeven", 1 if symbol else 1))))
-be_trigger_pct = st.sidebar.number_input("be_trigger_pct (fraction)", value=float(coin_cfg.get(symbol, {}).get("be_trigger_pct", 0.006 if symbol else 0.006)), format="%.4f")
+trailing_trigger = st.sidebar.number_input("trailing_trigger (%)", value=cfgf("trailing_trigger", 0.4))
+trailing_step = st.sidebar.number_input("trailing_step (%)", value=cfgf("trailing_step", 0.3))
+use_breakeven = st.sidebar.checkbox("use_breakeven", value=cfgb("use_breakeven", True))
+be_trigger_pct = st.sidebar.number_input("be_trigger_pct (fraction)", value=cfgf("be_trigger_pct", 0.006), format="%.4f")
 
 st.sidebar.subheader("🛑 Hard Stop Loss")
-sl_mode = st.sidebar.selectbox("sl_mode", ["ATR","PCT"], index=0 if str(coin_cfg.get(symbol,{}).get("sl_mode","ATR")).upper()=="ATR" else 1)
-sl_pct = st.sidebar.number_input("sl_pct (PCT mode) / fallback", value=float(coin_cfg.get(symbol,{}).get("sl_pct", 0.008 if symbol else 0.008)))
-sl_atr_mult = st.sidebar.number_input("sl_atr_mult (ATR mode)", value=float(coin_cfg.get(symbol,{}).get("sl_atr_mult", 1.5 if symbol else 1.5)))
-sl_min_pct = st.sidebar.number_input("sl_min_pct (clamp)", value=float(coin_cfg.get(symbol,{}).get("sl_min_pct", 0.012 if symbol else 0.012)))
-sl_max_pct = st.sidebar.number_input("sl_max_pct (clamp)", value=float(coin_cfg.get(symbol,{}).get("sl_max_pct", 0.035 if symbol else 0.035)))
+sl_mode_default = str(sym_cfg.get("sl_mode", "ATR")).upper() if sym_cfg else "ATR"
+sl_mode = st.sidebar.selectbox("sl_mode", ["ATR","PCT"], index=0 if sl_mode_default=="ATR" else 1)
+sl_pct = st.sidebar.number_input("sl_pct (PCT mode) / fallback", value=cfgf("sl_pct", 0.008))
+sl_atr_mult = st.sidebar.number_input("sl_atr_mult (ATR mode)", value=cfgf("sl_atr_mult", 1.5))
+sl_min_pct = st.sidebar.number_input("sl_min_pct (clamp)", value=cfgf("sl_min_pct", 0.012))
+sl_max_pct = st.sidebar.number_input("sl_max_pct (clamp)", value=cfgf("sl_max_pct", 0.035))
 
 st.sidebar.subheader("🎯 TP Bertingkat (opsional)")
 use_scalp_tiers = st.sidebar.checkbox("Aktifkan TP bertingkat", False)
@@ -119,7 +149,18 @@ tp3_p = st.sidebar.number_input("TP3 % (tutup 20%)", value=4.5)
 
 st.sidebar.subheader("🧪 ML Signal (opsional)")
 use_ml = st.sidebar.checkbox("Aktifkan ML signal", False)
-score_threshold = st.sidebar.slider("Minimal Skor Sinyal (non-ML)", 1.0, 5.0, 2.0, step=0.1)
+score_threshold = st.sidebar.slider("Minimal Skor Sinyal (non-ML)", 1.0, 5.0, 1.0, step=0.1)
+
+# NEW: Mode Debug
+st.sidebar.header("🧰 Debug")
+debug_mode = st.sidebar.checkbox("Mode Debug (longgarkan filter & tampilkan alasan blokir)", False)
+if debug_mode:
+    # Longgarkan filter supaya gampang lihat alur
+    min_atr_pct = 0.0
+    max_atr_pct = 1.0
+    max_body_atr = 999.0
+    cooldown_seconds = 0
+    use_htf_filter = False
 
 # ---------- Load CSV ----------
 if selected_file:
@@ -149,8 +190,8 @@ if selected_file:
         df = df.set_index('timestamp')
         agg_ops: dict[str, Any] = {'open':'first','high':'max','low':'min','close':'last','volume':'sum'}
         for extra in ['quote_volume']:
-            if extra in df.columns: agg_ops[extra] = 'sum' # type: ignore[assignment]
-        df = df.resample(timeframe).agg(agg_ops).dropna().reset_index() # type: ignore[arg-type]
+            if extra in df.columns: agg_ops[extra] = 'sum'
+        df = df.resample(timeframe).agg(agg_ops).dropna().reset_index() # type: ignore
 
     symbol = os.path.splitext(selected_file)[0].upper()
 
@@ -160,11 +201,11 @@ if selected_file:
     else:
         bar_seconds = 0
 
-    # ---------- HTF filter (1H EMA50 vs EMA200) ----------
+    # ---------- HTF filter (1h EMA50 vs EMA200) ----------
     def htf_trend_ok(side: str, base_df: pd.DataFrame) -> bool:
         try:
             tmp = base_df.set_index('timestamp')[['close']].copy()
-            htf = tmp['close'].resample('1H').last().dropna()
+            htf = tmp['close'].resample('1h').last().dropna()
             if len(htf) < 210: return True
             ema50 = htf.ewm(span=50, adjust=False).mean().iloc[-1]
             ema200 = htf.ewm(span=200, adjust=False).mean().iloc[-1]
@@ -212,34 +253,73 @@ if selected_file:
     df['short_signal'] = False
     cooldown_until_ts = None
 
+    # untuk debug: log alasan block
+    debug_rows: list[dict[str, Any]] = []
+
     for i in range(1, len(df)):
+        row = df.iloc[i]
         sc_long = 0.0; sc_short = 0.0
-        if df['ema'].iloc[i] > df['ma'].iloc[i] and df['macd'].iloc[i] > df['macd_signal'].iloc[i] and df['rsi'].iloc[i] >= 40 and df['rsi'].iloc[i] <= 70:
+        # base scoring
+        if row['ema'] > row['ma'] and row['macd'] > row['macd_signal'] and (40 <= row['rsi'] <= 70):
             sc_long += 1
-        if df['ema'].iloc[i] < df['ma'].iloc[i] and df['macd'].iloc[i] < df['macd_signal'].iloc[i] and df['rsi'].iloc[i] >= 30 and df['rsi'].iloc[i] <= 60:
+        if row['ema'] < row['ma'] and row['macd'] < row['macd_signal'] and (30 <= row['rsi'] <= 60):
             sc_short += 1
         if use_ml:
-            sc_long += (1 if df['ml_signal'].iloc[i]==1 else 0)
-            sc_short += (1 if df['ml_signal'].iloc[i]==0 else 0)
+            sc_long += (1 if row['ml_signal']==1 else 0)
+            sc_short += (1 if row['ml_signal']==0 else 0)
 
         long_raw = sc_long >= float(score_threshold)
         short_raw = sc_short >= float(score_threshold)
 
-        atr_pct_now = float(df['atr_pct'].iloc[i] or 0)
-        body_to_atr_now = float(df['body_to_atr'].iloc[i] or 0)
+        atr_pct_now = float(row['atr_pct'] or 0)
+        body_to_atr_now = float(row['body_to_atr'] or 0)
+        ts = row['timestamp'].to_pydatetime().timestamp()
 
+        blocked_reasons_long = []
+        blocked_reasons_short = []
+        # Jika base tidak lolos threshold
+        if not long_raw and sc_long>0:
+            blocked_reasons_long.append('score_below_threshold')
+        if not short_raw and sc_short>0:
+            blocked_reasons_short.append('score_below_threshold')
+
+        # Filters
         if not (min_atr_pct <= atr_pct_now <= max_atr_pct):
             long_raw = False; short_raw = False
+            blocked_reasons_long.append('atr_out_of_range')
+            blocked_reasons_short.append('atr_out_of_range')
         if body_to_atr_now > max_body_atr:
             long_raw = False; short_raw = False
-        if cooldown_until_ts and df['timestamp'].iloc[i].to_pydatetime().timestamp() < cooldown_until_ts:
+            blocked_reasons_long.append('body_exceeds_atr')
+            blocked_reasons_short.append('body_exceeds_atr')
+        if cooldown_until_ts and ts < cooldown_until_ts:
             long_raw = False; short_raw = False
+            blocked_reasons_long.append('cooldown_active')
+            blocked_reasons_short.append('cooldown_active')
         if use_htf_filter:
-            if long_raw and not htf_trend_ok('LONG', df.iloc[:i+1]): long_raw = False
-            if short_raw and not htf_trend_ok('SHORT', df.iloc[:i+1]): short_raw = False
+            if long_raw and not htf_trend_ok('LONG', df.iloc[:i+1]):
+                long_raw = False; blocked_reasons_long.append('htf_filter_blocked')
+            if short_raw and not htf_trend_ok('SHORT', df.iloc[:i+1]):
+                short_raw = False; blocked_reasons_short.append('htf_filter_blocked')
 
-        if long_raw: df.loc[i,'long_signal'] = True
-        if short_raw: df.loc[i,'short_signal'] = True
+        # Set sinyal akhir
+        if long_raw:
+            df.loc[i,'long_signal'] = True
+        elif sc_long>0 and debug_mode:
+            debug_rows.append({
+                'timestamp': row['timestamp'], 'price': float(row['close']), 'side': 'LONG',
+                'atr_pct': atr_pct_now, 'body_to_atr': body_to_atr_now,
+                'reasons': ';'.join(blocked_reasons_long) or 'blocked'
+            })
+
+        if short_raw:
+            df.loc[i,'short_signal'] = True
+        elif sc_short>0 and debug_mode:
+            debug_rows.append({
+                'timestamp': row['timestamp'], 'price': float(row['close']), 'side': 'SHORT',
+                'atr_pct': atr_pct_now, 'body_to_atr': body_to_atr_now,
+                'reasons': ';'.join(blocked_reasons_short) or 'blocked'
+            })
 
     # ---------- Backtest (selaras real) ----------
     in_position = False
@@ -254,6 +334,13 @@ if selected_file:
 
     def apply_slippage(px: float, side: str) -> float:
         return px * (1 + slippage_pct/100.0) if side == 'buy' else px * (1 - slippage_pct/100.0)
+
+    # Hitung buffer minimum supaya trailing tidak rugi akibat fee+slippage
+    # Contoh: fee taker 0.05% per sisi → 0.1% round-trip; slippage 0.02% per sisi → 0.04% round-trip.
+    # Kita tambah 0.05% safety. Jadi safe_buffer = 0.1% + 0.04% + 0.05% = 0.19%.
+    roundtrip_fee_pct = (taker_fee_val * 2.0) * 100.0
+    roundtrip_slip_pct = float(slippage_pct) * 2.0
+    safe_buffer_pct = roundtrip_fee_pct + roundtrip_slip_pct + 0.05  # persen
 
     for i in range(1, len(df)):
         row = df.iloc[i]
@@ -305,14 +392,16 @@ if selected_file:
                     if pnl_frac >= float(be_trigger_pct): sl = min(sl or 1e18, entry)
 
             # Trailing
+            # arm hanya jika profit melewati ambang aman (fee+slippage+step)
+            safe_trigger = max(float(trailing_trigger), safe_buffer_pct + float(trailing_step))
             if position_type == 'LONG':
                 profit_pct = (price - entry)/entry*100.0
-                if profit_pct >= float(trailing_trigger):
+                if profit_pct >= safe_trigger:
                     new_ts = price * (1 - float(trailing_step)/100.0)
                     trailing_sl = max(trailing_sl or sl or 0.0, new_ts)
             else:
                 profit_pct = (entry - price)/entry*100.0
-                if profit_pct >= float(trailing_trigger):
+                if profit_pct >= safe_trigger:
                     new_ts = price * (1 + float(trailing_step)/100.0)
                     trailing_sl = min(trailing_sl or sl or 1e18, new_ts)
 
@@ -408,6 +497,30 @@ if selected_file:
                 trades.append({'timestamp_entry':hold_start_ts,'timestamp_exit':row['timestamp'],'symbol':symbol,'type':position_type,'entry':entry,'exit':exit_px,'qty':qty,'fee':fee,'pnl':pnl,'roi_on_margin':roi,'reason':reason})
                 in_position = False; position_type=None; entry=sl=trailing_sl=None; qty=0.0; hold_start_ts=None
                 cooldown_until_ts = ts + float(cooldown_seconds)
+
+    # ---------- Diagnostics ----------
+    with st.expander("📟 Diagnostics (cek kenapa nggak entry)", expanded=False):
+        base_long = int(((df['ema']>df['ma']) & (df['macd']>df['macd_signal']) & df['rsi'].between(40,70)).sum())
+        base_short = int(((df['ema']<df['ma']) & (df['macd']<df['macd_signal']) & df['rsi'].between(30,60)).sum())
+        atr_ok = int((df['atr_pct'].between(min_atr_pct, max_atr_pct)).sum())
+        st.write({
+            "total_bar": int(len(df)),
+            "base_long_candidates": base_long,
+            "base_short_candidates": base_short,
+            "bars_dengan_ATR_dalam_batas": atr_ok,
+            "final_long_signal": int(df['long_signal'].sum()),
+            "final_short_signal": int(df['short_signal'].sum()),
+            "debug_rows": len(debug_rows)
+        })
+        if debug_mode and len(debug_rows)>0:
+            st.caption("Tabel ini menunjukkan bar yang PUNYA kandidat sinyal namun gagal lolos filter. Kolom 'reasons' menjelaskan alasannya.")
+            dbg_df = pd.DataFrame(debug_rows)
+            st.dataframe(dbg_df)
+            try:
+                st.write("🔍 Reason breakdown:")
+                st.write(dbg_df['reasons'].value_counts())
+            except Exception:
+                pass
 
     # ---------- Hasil ----------
     st.success(f"✅ Backtest SCALPING selesai untuk {symbol}")
