@@ -1,10 +1,11 @@
 """
-newrealtrading.py — presisi entri v3 (Hard SL + Breakeven)
+newrealtrading.py — presisi entri v3.1 (Hard SL + Breakeven + Anti-SAR Whipsaw)
 
-Tambahan utama v3:
+Tambahan utama v3.1:
 - Hard Stop Loss (mode PCT atau ATR) dihitung saat ENTRY, disimpan ke state, dan dicek real-time.
 - Breakeven opsional: geser SL ke harga masuk saat profit >= be_trigger_pct.
 - Filter presisi entri v2 tetap aktif: ATR regime, hindari candle kepanjangan, konfirmasi tren 1H, cooldown.
+- **Anti-SAR Whipsaw**: default **tidak** langsung menutup posisi hanya karena sinyal berlawanan muncul. Opsi Stop-And-Reverse (SAR) bisa diaktifkan dengan konfirmasi beberapa bar dan minimal waktu hold.
 - Perbaikan ReduceOnly -2022 (abaikan jika posisi memang sudah 0).
 - Fitur lama tetap: SYMBOLS via ENV, logging ramah read-only, WS loop recv(), leverage await, residual-close fix.
 """
@@ -239,6 +240,9 @@ class CoinTrader:
         self.cooldown_until: float = 0.0
         self._htf_cache = None
         self._htf_cache_ts = 0.0
+
+        # anti whipsaw / reversal guard
+        self.opp_sig_count: int = 0  # jumlah bar berturut-turut sinyal berlawanan
 
     async def require_client(self) -> AsyncClient:
         if self.client is None:
@@ -513,13 +517,78 @@ class CoinTrader:
 
         long_sig = bool(last.get('long_signal', False))
         short_sig = bool(last.get('short_signal', False))
+        cur_sig = 'LONG' if long_sig else ('SHORT' if short_sig else None)
 
-        # Reversal bila sinyal berlawanan
-        if self.in_position and ((self.position_type == 'LONG' and short_sig) or (self.position_type == 'SHORT' and long_sig)):
-            await self._close_position_reduce_only(price)
-            self.in_position = False
-
+        # ====== POSISI TERBUKA ======
         if self.in_position:
+            mp = await self._get_mark_price()
+            if mp is None:
+                return
+
+            # update counter sinyal berlawanan (untuk opsi SAR)
+            if cur_sig and cur_sig != self.position_type:
+                self.opp_sig_count += 1
+            else:
+                self.opp_sig_count = 0
+
+            # ===== Hard Stop Loss check =====
+            if self.stop_loss is not None:
+                if self.position_type == 'LONG' and mp <= self.stop_loss:
+                    await self._close_position_reduce_only(mp)
+                    return
+                if self.position_type == 'SHORT' and mp >= self.stop_loss:
+                    await self._close_position_reduce_only(mp)
+                    return
+
+            # ===== Breakeven (geser SL ke entry saat profit >= be_trigger_pct) =====
+            use_be = bool(int(self.config.get('use_breakeven', 1)))
+            be_trigger = float(self.config.get('be_trigger_pct', 0.006))
+            if use_be and self.entry_price:
+                if self.position_type == 'LONG':
+                    pnl_pct = (mp - self.entry_price)/self.entry_price
+                    if pnl_pct >= be_trigger:
+                        self.stop_loss = max(self.stop_loss or 0.0, self.entry_price)
+                else:
+                    pnl_pct = (self.entry_price - mp)/self.entry_price
+                    if pnl_pct >= be_trigger:
+                        self.stop_loss = min(self.stop_loss or 1e18, self.entry_price)
+
+            # ===== Trailing stop (saat profit) =====
+            trailing_trigger = float(self.config.get('trailing_trigger', 0.5))
+            trailing_step = float(self.config.get('trailing_step', 0.3))
+            if self.position_type == 'LONG':
+                ep = self.entry_price or mp
+                profit_pct = (mp - ep)/ep * 100.0
+                if profit_pct >= trailing_trigger:
+                    new_ts = mp * (1 - trailing_step/100)
+                    self.trailing_stop = max(self.trailing_stop or self.stop_loss or 0, new_ts)
+                if self.trailing_stop and mp <= self.trailing_stop:
+                    await self._close_position_reduce_only(mp)
+                    return
+            else:
+                ep = self.entry_price or mp
+                profit_pct = (ep - mp)/ep * 100.0
+                if profit_pct >= trailing_trigger:
+                    new_ts = mp * (1 + trailing_step/100)
+                    self.trailing_stop = min(self.trailing_stop or self.stop_loss or 1e18, new_ts)
+                if self.trailing_stop and mp >= self.trailing_stop:
+                    await self._close_position_reduce_only(mp)
+                    return
+
+            # ===== Optional Stop-And-Reverse (SAR) dengan konfirmasi =====
+            allow_sar = bool(int(self.config.get('allow_sar', 0)))
+            reverse_confirm_bars = int(self.config.get('reverse_confirm_bars', 2))
+            min_hold_seconds = int(self.config.get('min_hold_seconds', 1200))
+            held = time.time() - (self.hold_start_ts or time.time())
+            if allow_sar and cur_sig and cur_sig != self.position_type:
+                if held >= min_hold_seconds and self.opp_sig_count >= reverse_confirm_bars:
+                    await self._close_position_reduce_only(mp)
+                    self.in_position = False
+                    self.opp_sig_count = 0
+                    return
+
+            # jika masih pegang posisi, stop di sini
+            return
             mp = await self._get_mark_price()
             if mp is None:
                 return
@@ -713,7 +782,7 @@ class TradingManager:
         interval = int(os.getenv("CONFIG_WATCH_INTERVAL", "5"))
         if interval <= 0:
             return
-        safe_keys = {"risk_per_trade","leverage","trailing_trigger","trailing_step","max_hold_seconds","min_roi_to_close_by_time","taker_fee","maker_fee","min_atr_pct","max_atr_pct","max_body_atr","use_htf_filter","cooldown_seconds","sl_mode","sl_pct","sl_atr_mult","sl_min_pct","sl_max_pct","use_breakeven","be_trigger_pct"}
+        safe_keys = {"risk_per_trade","leverage","trailing_trigger","trailing_step","max_hold_seconds","min_roi_to_close_by_time","taker_fee","maker_fee","min_atr_pct","max_atr_pct","max_body_atr","use_htf_filter","cooldown_seconds","sl_mode","sl_pct","sl_atr_mult","sl_min_pct","sl_max_pct","use_breakeven","be_trigger_pct","allow_sar","reverse_confirm_bars","min_hold_seconds"}
         while True:
             try:
                 mtime = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None
