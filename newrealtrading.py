@@ -164,7 +164,7 @@ def htf_trend_ok(side: str, base_df: pd.DataFrame) -> bool:
     # EMA50 vs EMA200 di 1H
     try:
         tmp = base_df.set_index('timestamp')[['close']].copy()
-        htf = tmp['close'].resample('1H').last().dropna()
+        htf = tmp['close'].resample('1h').last().dropna()
         if len(htf) < 210: return True
         ema50 = htf.ewm(span=50, adjust=False).mean().iloc[-1]
         ema200 = htf.ewm(span=200, adjust=False).mean().iloc[-1]
@@ -193,6 +193,16 @@ class CoinTrader:
         self.pos = Position()
         self.cooldown_until_ts: Optional[float] = None
         self.verbose = _to_bool(self.config.get('VERBOSE', os.getenv('VERBOSE','0')), False)
+        self.cooldown_use_bar_time = _to_bool(
+            self.config.get('COOLDOWN_USE_BAR_TIME', os.getenv('COOLDOWN_USE_BAR_TIME', '1')),
+            True  # default ON biar dry-run normal
+        )
+        
+
+    def _now_ts(self, last_ts: Optional[pd.Timestamp]) -> float:
+        if self.cooldown_use_bar_time and isinstance(last_ts, pd.Timestamp) and pd.notna(last_ts):
+            return float(last_ts.timestamp())
+        return time.time()  
 
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
@@ -272,20 +282,20 @@ class CoinTrader:
                 if self.pos.trailing_sl != prev:
                     self._log(f"TRAIL SHORT -> {self.pos.trailing_sl:.6f} (prev={prev})")
 
-    def _cooldown_active(self) -> bool:
-        return bool(self.cooldown_until_ts and time.time() < self.cooldown_until_ts)
+    def _cooldown_active(self, now_ts: Optional[float] = None) -> bool:
+        now = float(now_ts) if now_ts is not None else time.time()
+        return bool(self.cooldown_until_ts and now < self.cooldown_until_ts)
 
-    def _enter_position(self, side: str, price: float, atr: float, balance: float) -> None:
-        if self._cooldown_active():
+    def _enter_position(self, side: str, price: float, atr: float, balance: float, now_ts: Optional[float] = None) -> None:
+        if self._cooldown_active(now_ts):
             return
         qty = self._size_position(price, balance)
         if qty <= 0:
             return
         sl = self._hard_sl_price(price, atr, side)
-        self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=pd.Timestamp.utcnow())
+        et = pd.to_datetime(now_ts, unit='s', utc=True) if now_ts is not None else pd.Timestamp.utcnow()
+        self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=et)
         self._log(f"ENTRY {side} price={price:.6f} qty={qty:.6f} sl={sl:.6f}")
-        # TODO: place order ke exchange di sini
-        # self.exchange.open_market_order(self.symbol, side, qty)
 
     def _should_exit(self, price: float) -> Tuple[bool, Optional[str]]:
         if not self.pos.side:
@@ -303,14 +313,12 @@ class CoinTrader:
                 return True, 'Hit Hard SL'
         return False, None
 
-    def _exit_position(self, price: float, reason: str) -> None:
-        # TODO: close position ke exchange
-        # self.exchange.close_market_order(self.symbol, self.pos.side, self.pos.qty)
+    def _exit_position(self, price: float, reason: str, now_ts: Optional[float] = None) -> None:
         self._log(f"EXIT {reason} price={price:.6f}")
-        self.pos = Position()  # reset
-        # cooldown
+        self.pos = Position()
         cd = _to_int(self.config.get('cooldown_seconds', DEFAULTS['cooldown_seconds']), DEFAULTS['cooldown_seconds'])
-        self.cooldown_until_ts = time.time() + max(cd, 0)
+        base_now = float(now_ts) if now_ts is not None else time.time()
+        self.cooldown_until_ts = base_now + max(cd, 0)
         try:
             self._log(f"COOLDOWN until {pd.Timestamp.utcfromtimestamp(self.cooldown_until_ts).isoformat()}")
         except Exception:
@@ -321,19 +329,23 @@ class CoinTrader:
             return
         df = calculate_indicators(df_raw)
         last = df.iloc[-1]
+        last_ts = last['timestamp'] if 'timestamp' in last.index else None
+        now_ts = self._now_ts(last_ts)
 
         # Filter ATR & body/ATR
         atr_ok = (last['atr_pct'] >= _to_float(self.config.get('min_atr_pct', DEFAULTS['min_atr_pct']), DEFAULTS['min_atr_pct'])) \
                  and (last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct']))
         body_ok = (last['body_to_atr'] <= _to_float(self.config.get('max_body_atr', DEFAULTS['max_body_atr']), DEFAULTS['max_body_atr']))
         if not (atr_ok and body_ok):
-            # kelola exit jika sudah di posisi
             if self.pos.side:
                 self._apply_breakeven(last['close'])
                 self._update_trailing(last['close'])
                 ex, rs = self._should_exit(last['close'])
-                if ex: self._exit_position(last['close'], rs or 'Filter Fail')
+                if ex:
+                    self._exit_position(last['close'], rs or 'Filter Fail', now_ts=now_ts)  # pass bar-time
+            self._log("ATR or body/ATR filter failed, skipping signal evaluation.")
             return
+
 
         # HTF filter (opsional)
         if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
@@ -369,15 +381,15 @@ class CoinTrader:
             self._update_trailing(price)
             ex, reason = self._should_exit(price)
             if ex:
-                self._exit_position(price, reason or 'Exit')
+                self._exit_position(price, reason or 'Exit', now_ts=now_ts)
                 return
 
         # Entry baru
-        if not self.pos.side and not self._cooldown_active():
+        if not self.pos.side and not self._cooldown_active(now_ts):
             if long_sig:
-                self._enter_position('LONG', price, atr, balance)
+                self._enter_position('LONG', price, atr, balance, now_ts=now_ts)
             elif short_sig:
-                self._enter_position('SHORT', price, atr, balance)
+                self._enter_position('SHORT', price, atr, balance, now_ts=now_ts)
 
 
 # ============================
@@ -448,6 +460,9 @@ if __name__ == "__main__":
     ap.add_argument("--symbol", default="ADAUSDT")
     ap.add_argument("--balance", type=float, default=20.0)
     ap.add_argument("--verbose", action="store_true", help="Print log keputusan & aksi")
+    ap.add_argument("--dry-run-loop", action="store_true", help="Replay CSV bar-by-bar (simulasi real-time)")
+    ap.add_argument("--sleep", type=float, default=0.0, help="Delay per step (detik) saat dry-run")
+    ap.add_argument("--limit", type=int, default=0, help="Batasi jumlah langkah dry-run (0 = semua)")
     args = ap.parse_args()
     if args.verbose:
         os.environ["VERBOSE"] = "1"
@@ -465,8 +480,32 @@ if __name__ == "__main__":
             elif 'date' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['date'])
         df['timestamp'] = pd.to_datetime(df['timestamp'])
-        data_map = {args.symbol.upper(): df}
-        mgr.run_once(data_map, {args.symbol.upper(): args.balance})
-        print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        sym = args.symbol.upper()
+
+        if args.dry_run_loop:
+            # warmup agar indikator & ML cukup data
+            try:
+                min_train = int(float(os.getenv('ML_MIN_TRAIN_BARS', '400')))
+            except Exception:
+                min_train = 400
+            warmup = max(300, min_train + 10)
+            start_i = min(warmup, len(df)-1)
+            steps = 0
+            mgr = TradingManager(args.coin_config, [sym])  # <-- PAKAI MANAGER YANG SAMA (state posisi tersimpan)
+            for i in range(start_i, len(df)):
+                data_map = {sym: df.iloc[:i+1].copy()}
+                mgr.run_once(data_map, {sym: args.balance})
+                steps += 1
+                if args.limit and steps >= args.limit:
+                    break
+                if args.sleep and args.sleep > 0:
+                    time.sleep(args.sleep)
+            last_side = mgr.traders[sym].pos.side if sym in mgr.traders else None
+            print(f"Dry-run completed: {steps} steps (start={start_i}, total_bars={len(df)}). Last position: {last_side}")
+        else:
+            data_map = {sym: df}
+            TradingManager(args.coin_config, [sym]).run_once(data_map, {sym: args.balance})
+            print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
     else:
         print("Tidak ada CSV. Mode dummy selesai.")

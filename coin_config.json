@@ -10,18 +10,18 @@
     "max_atr_pct": 0.03,
     "max_body_atr": 1.0,
     "use_htf_filter": 1,
-    "cooldown_seconds": 1200,
+    "cooldown_seconds": 900,
 
     "allow_sar": 0,              
     "reverse_confirm_bars": 2,   
     "min_hold_seconds": 1200,    
     "sl_mode": "ATR",            
     "sl_pct": 0.008,            
-    "sl_atr_mult": 1.5,          
+    "sl_atr_mult": 1.4,          
     "sl_min_pct": 0.012,
-    "sl_max_pct": 0.035,
+    "sl_max_pct": 0.030,
     "use_breakeven": 1,
-    "be_trigger_pct": 0.006
+    "be_trigger_pct": 0.005
   },
   "DOGEUSDT":  {
     "leverage": 15,
