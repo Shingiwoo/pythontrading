@@ -1,10 +1,12 @@
 """
-newrealtrading.py — presisi entri v2
+newrealtrading.py — presisi entri v3 (Hard SL + Breakeven)
 
-Tambahan utama:
-- FILTER PRESISI ENTRI: ATR regime (min/max), hindari candle kepanjangan (body/ATR), konfirmasi tren HTF (1H), cooldown setelah exit.
-- Perbaikan ReduceOnly -2022 (abaikan aman jika posisi sudah 0).
-- Fitur sebelumnya tetap: SYMBOLS via ENV, logging ramah read-only, WS loop recv(), leverage await, residual-close fix.
+Tambahan utama v3:
+- Hard Stop Loss (mode PCT atau ATR) dihitung saat ENTRY, disimpan ke state, dan dicek real-time.
+- Breakeven opsional: geser SL ke harga masuk saat profit >= be_trigger_pct.
+- Filter presisi entri v2 tetap aktif: ATR regime, hindari candle kepanjangan, konfirmasi tren 1H, cooldown.
+- Perbaikan ReduceOnly -2022 (abaikan jika posisi memang sudah 0).
+- Fitur lama tetap: SYMBOLS via ENV, logging ramah read-only, WS loop recv(), leverage await, residual-close fix.
 """
 
 import os
@@ -521,6 +523,30 @@ class CoinTrader:
             mp = await self._get_mark_price()
             if mp is None:
                 return
+
+            # ===== Hard Stop Loss check =====
+            if self.stop_loss is not None:
+                if self.position_type == 'LONG' and mp <= self.stop_loss:
+                    await self._close_position_reduce_only(mp)
+                    return
+                if self.position_type == 'SHORT' and mp >= self.stop_loss:
+                    await self._close_position_reduce_only(mp)
+                    return
+
+            # ===== Breakeven (geser SL ke entry saat profit >= be_trigger_pct) =====
+            use_be = bool(int(self.config.get('use_breakeven', 1)))
+            be_trigger = float(self.config.get('be_trigger_pct', 0.006))
+            if use_be and self.entry_price:
+                if self.position_type == 'LONG':
+                    pnl_pct = (mp - self.entry_price)/self.entry_price
+                    if pnl_pct >= be_trigger:
+                        self.stop_loss = max(self.stop_loss or 0.0, self.entry_price)
+                else:
+                    pnl_pct = (self.entry_price - mp)/self.entry_price
+                    if pnl_pct >= be_trigger:
+                        self.stop_loss = min(self.stop_loss or 1e18, self.entry_price)
+
+            # ===== Trailing stop (saat profit) =====
             trailing_trigger = float(self.config.get('trailing_trigger', 0.5))
             trailing_step = float(self.config.get('trailing_step', 0.3))
             if self.position_type == 'LONG':
@@ -551,7 +577,6 @@ class CoinTrader:
         max_atr_pct = float(self.config.get('max_atr_pct', 0.03))
         max_body_atr = float(self.config.get('max_body_atr', 1.0))
         use_htf_filter = bool(int(self.config.get('use_htf_filter', 1)))
-        cooldown_seconds = int(self.config.get('cooldown_seconds', 1200))
 
         if not (min_atr_pct <= atr_pct <= max_atr_pct):
             return
@@ -565,7 +590,7 @@ class CoinTrader:
             if not ok:
                 return
 
-        # Hitung sizing
+        # ===== Hitung sizing =====
         avail = await self._get_available_balance()
         max_cost = avail * risk
         if max_cost <= 0 or price <= 0:
@@ -579,14 +604,37 @@ class CoinTrader:
             await _send_telegram(f"⏭️ <b>{self.symbol}</b> skip open (qty<min) raw={raw_qty:.4f} price={price}")
             return
 
-        # set state & buka posisi
+        # ===== Hitung Hard SL saat ENTRY =====
+        sl_mode = str(self.config.get('sl_mode', 'ATR')).upper()
+        sl_min_pct = float(self.config.get('sl_min_pct', 0.006))
+        sl_max_pct = float(self.config.get('sl_max_pct', 0.025))
+        sl_pct = None
+        if sl_mode == 'PCT':
+            sl_pct = float(self.config.get('sl_pct', 0.015))
+        else:
+            atr = float(last.get('atr', 0) or 0)
+            sl_atr_mult = float(self.config.get('sl_atr_mult', 1.2))
+            if atr > 0 and price > 0:
+                sl_pct = (sl_atr_mult * atr) / price
+            else:
+                sl_pct = float(self.config.get('sl_pct', 0.015))
+        # clamp
+        sl_pct = max(sl_min_pct, min(sl_pct, sl_max_pct))
+        if long_sig:
+            calc_sl = price * (1 - sl_pct)
+        else:
+            calc_sl = price * (1 + sl_pct)
+
+        # ===== set state & buka posisi =====
         self.position_size = qty
         self.entry_price = price
         self.position_type = 'LONG' if long_sig else 'SHORT'
+        self.stop_loss = calc_sl
+        self.trailing_stop = None
         self.in_position = True
         self.hold_start_ts = time.time()
         _save_state({'symbol': self.symbol, 'in_position': True, 'position_type': self.position_type, 'entry_price': self.entry_price, 'position_size': self.position_size, 'stop_loss': self.stop_loss, 'take_profit': self.take_profit, 'trailing_stop': self.trailing_stop, 'hold_start_ts': self.hold_start_ts})
-        asyncio.create_task(_send_telegram(f"🚀 <b>{self.symbol}</b> OPEN {self.position_type} {self.position_size} @ {self.entry_price}"))
+        asyncio.create_task(_send_telegram(f"🚀 <b>{self.symbol}</b> OPEN {self.position_type} {self.position_size} @ {self.entry_price} SL={self.stop_loss}"))
 
         side = 'BUY' if self.position_type == 'LONG' else 'SELL'
         await self.place_order(side, self.position_size, reduce_only=False)
@@ -665,7 +713,7 @@ class TradingManager:
         interval = int(os.getenv("CONFIG_WATCH_INTERVAL", "5"))
         if interval <= 0:
             return
-        safe_keys = {"risk_per_trade","leverage","trailing_trigger","trailing_step","max_hold_seconds","min_roi_to_close_by_time","taker_fee","maker_fee","min_atr_pct","max_atr_pct","max_body_atr","use_htf_filter","cooldown_seconds"}
+        safe_keys = {"risk_per_trade","leverage","trailing_trigger","trailing_step","max_hold_seconds","min_roi_to_close_by_time","taker_fee","maker_fee","min_atr_pct","max_atr_pct","max_body_atr","use_htf_filter","cooldown_seconds","sl_mode","sl_pct","sl_atr_mult","sl_min_pct","sl_max_pct","use_breakeven","be_trigger_pct"}
         while True:
             try:
                 mtime = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None
