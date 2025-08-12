@@ -74,20 +74,24 @@
   "ADAUSDT":  {
     "use_htf_filter": 1,
 
-    "min_atr_pct": 0.006,
-    "max_atr_pct": 0.03,
-    "max_body_atr": 0.95,
+    "min_atr_pct": 0.0065,
+    "max_atr_pct": 0.030,
+    "max_body_atr": 1.0,
     "cooldown_seconds": 1500,
 
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
     "be_offset_pct": 0.0008,
     "trend_filter_mode": "ema200",
+    "adx_period": 14,
+    "adx_thresh": 20.0,
+    "adx_strong_thresh": 22.0,
+
 
     "leverage": 15,
     "risk_per_trade": 0.08,
     "trailing_trigger": 1.0,
-    "trailing_step": 0.30,
+    "trailing_step": 0.45,
     "taker_fee": 0.0005,
     "trailing_step_min_pct": 0.45,
     "trailing_step_max_pct": 1.00,
@@ -98,19 +102,20 @@
     "min_hold_seconds": 1200,
 
     "sl_mode": "ATR",
-    "sl_atr_mult": 1.6,
-    "sl_min_pct": 0.010,
-    "sl_max_pct": 0.028, 
+    "sl_atr_mult": 1.8,
+    "sl_min_pct": 0.012,
+    "sl_max_pct": 0.035, 
     "sl_pct": 0.008,
 
-    "early_stop_enabled": 1,
+    "early_stop_enabled": 0,
     "early_stop_bars": 3,
-    "early_stop_adverse_atr": 0.6,
-
+    "early_stop_adverse_atr": 0.65,
+    "early_stop_wick_factor": 1.15,
+    
+    "time_stop_only_if_loss": 1,
+    "max_hold_seconds_be": 7200,
     "cooldown_mul_hard_sl": 2.5,
     "cooldown_mul_trailing": 1.0,
-    "cooldown_mul_early_stop": 1.2,
-    "time_stop_only_if_loss": 1,
-    "max_hold_seconds_be": 7200
+    "cooldown_mul_early_stop": 3.0
   }
 }

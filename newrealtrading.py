@@ -346,30 +346,61 @@ class CoinTrader:
     def _early_stop_check(self, df: pd.DataFrame, now_ts: Optional[float]) -> bool:
         if not self.early_stop_enabled or not (self.pos and self.pos.side and self.pos.entry and self.pos.entry_time is not None):
             return False
+
         last = df.iloc[-1]
         atr = float(last.get('atr', 0.0) or 0.0)
-        if atr <= 0: return False
+        if atr <= 0:
+            return False
+
         try:
             bars_since = int((df['timestamp'] > self.pos.entry_time).sum())
         except Exception:
             bars_since = 0
-        if bars_since <= 0 or bars_since > int(self.early_stop_bars):
+
+        # batas evaluasi early stop
+        max_es_bars = int(self.config.get('early_stop_bars', 2))  # <= 2 bar saja
+        if bars_since <= 0 or bars_since > max_es_bars:
             return False
+
         ent = float(self.pos.entry)
-        # wick-aware: LONG pakai low, SHORT pakai high
         low = float(last.get('low', last.get('close', ent)))
         high = float(last.get('high', last.get('close', ent)))
-        adverse_thr = float(self.early_stop_adverse_atr) * (atr / max(ent, 1e-9))
+        close = float(last.get('close', ent))
+
+        # ambang dasar (proporsi thd harga, berbasis ATR)
+        adverse_prop = float(self.config.get('early_stop_adverse_atr', 0.9)) * (atr / max(ent, 1e-9))
+
+        # ADX context
+        adx_last = float(last.get('adx', 0.0) or 0.0)
+        adx_strong = float(self.config.get('adx_strong_thresh', 22.0))
+        wick_factor = float(self.config.get('early_stop_wick_factor', 1.30))  # wick butuh move > ambang
+
+        use_close_only = (adx_last >= adx_strong) or (bars_since >= 2)
+
         if self.pos.side == 'LONG':
-            dd = (ent - low)/max(ent, 1e-9)
-            if dd >= adverse_thr:
-                self._exit_position(low, f"Early Stop wick (dd={dd*100:.2f}% >= {self.early_stop_adverse_atr}*ATR)", now_ts=now_ts)
-                return True
-        else:
-            dd = (high - ent)/max(ent, 1e-9)
-            if dd >= adverse_thr:
-                self._exit_position(high, f"Early Stop wick (dd={dd*100:.2f}% >= {self.early_stop_adverse_atr}*ATR)", now_ts=now_ts)
-                return True
+            if use_close_only:
+                dd = (ent - close) / max(ent, 1e-9)
+                if dd >= adverse_prop:
+                    self._exit_position(close, f"Early Stop close (dd={dd*100:.2f}% >= {adverse_prop*100:.2f}%)", now_ts=now_ts)
+                    return True
+            else:
+                # bar ke-1 & adx lemah -> izinkan wick, tapi ambang diperbesar
+                dd_wick = (ent - low) / max(ent, 1e-9)
+                if dd_wick >= adverse_prop * wick_factor:
+                    self._exit_position(low, f"Early Stop wick (dd={dd_wick*100:.2f}% >= {(adverse_prop*wick_factor)*100:.2f}%)", now_ts=now_ts)
+                    return True
+        else:  # SHORT
+            if use_close_only:
+                dd = (close - ent) / max(ent, 1e-9)
+                if dd >= adverse_prop:
+                    self._exit_position(close, f"Early Stop close (dd={dd*100:.2f}% >= {adverse_prop*100:.2f}%)", now_ts=now_ts)
+                    return True
+            else:
+                dd_wick = (high - ent) / max(ent, 1e-9)
+                if dd_wick >= adverse_prop * wick_factor:
+                    self._exit_position(high, f"Early Stop wick (dd={dd_wick*100:.2f}% >= {(adverse_prop*wick_factor)*100:.2f}%)", now_ts=now_ts)
+                    return True
+
         return False
 
     # ---------------------- Entry / Exit core ----------------------
