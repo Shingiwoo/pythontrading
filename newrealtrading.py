@@ -266,15 +266,33 @@ class CoinTrader:
 
     # ------------------------- sizing & SL -------------------------
     def _size_position(self, price: float, balance: float, atr: float) -> float:
-        lev = _to_float(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
-        risk_pct = _to_float(self.config.get('risk_per_trade', DEFAULTS['risk_per_trade']), DEFAULTS['risk_per_trade'])
-        risk_usdt = max(0.0001, balance * risk_pct)
-        sl_atr_mult = _to_float(self.config.get('sl_atr_mult', DEFAULTS['sl_atr_mult']), DEFAULTS['sl_atr_mult'])
-        sl_min_pct = _to_float(self.config.get('sl_min_pct', DEFAULTS['sl_min_pct']), DEFAULTS['sl_min_pct'])
-        sl_dist_pct = max(sl_min_pct, (sl_atr_mult * (atr/price)))
-        notional = (risk_usdt / max(sl_dist_pct, 1e-6)) * lev
-        qty = max(0.0, notional / price)
-        return round(qty, 3)
+    # === risk inputs ===
+    risk_pct = _to_float(self.config.get('risk_per_trade', DEFAULTS['risk_per_trade']),
+                         DEFAULTS['risk_per_trade'])
+    risk_usdt = max(0.0001, balance * risk_pct)
+
+    # === stop distance (dalam %) ===
+    sl_atr_mult = _to_float(self.config.get('sl_atr_mult', DEFAULTS['sl_atr_mult']),
+                            DEFAULTS['sl_atr_mult'])
+    sl_min_pct = _to_float(self.config.get('sl_min_pct', DEFAULTS['sl_min_pct']),
+                           DEFAULTS['sl_min_pct'])
+    sl_max_pct = _to_float(self.config.get('sl_max_pct', DEFAULTS['sl_max_pct']),
+                           DEFAULTS['sl_max_pct'])
+
+    # jarak SL (%) berbasis ATR lalu dijepit min/max
+    sl_dist_pct = max(sl_min_pct, sl_atr_mult * (atr / max(price, 1e-9)))
+    sl_dist_pct = min(sl_dist_pct, sl_max_pct)
+
+    # === NOTIONAL TANPA LEVERAGE ===
+    # Tujuan: jika kena SL, kerugian ≈ risk_usdt
+    # Kerugian di SL ≈ notional * sl_dist_pct  ⇒  notional = risk_usdt / sl_dist_pct
+    notional = risk_usdt / max(sl_dist_pct, 1e-6)
+
+    # qty (coin) = notional / price
+    qty = max(0.0, notional / max(price, 1e-9))
+
+    # (opsional) pembulatan 3 desimal; sesuaikan kebutuhan exchange
+    return round(qty, 3)
 
     def _hard_sl_price(self, price: float, atr: float, side: str) -> float:
         mode = str(self.config.get('sl_mode', DEFAULTS['sl_mode'])).upper()
