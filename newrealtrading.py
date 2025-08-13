@@ -4,12 +4,13 @@
 newrealtrading.py — Engine trading (live/dry-run) sinkron dengan backtester
 
 PATCH 2025-08-13:
-- FIX: Position sizing TANPA mengalikan leverage (leverage hanya mempengaruhi margin, bukan risk di SL).
-- Time Stop v2: hanya tutup kalau rugi (ROI < MIN_ROI_TO_CLOSE_BY_TIME); hold lebih lama jika BE aktif.
-- Trailing ATR dinamis + BE offset.
-- Early Stop wick-aware (bisa dimatikan via config, default OFF pada rekomendasi).
-- Trend filter opsional: "ema200" atau "ema200_adx".
-- CLI: --dry-run-loop, --sleep, --limit, --verbose. Log SIZING untuk verifikasi risk.
+- FIX SIZING: Tanpa mengalikan leverage; risk di SL ≈ balance * risk_per_trade.
+- Time Stop v2: hanya close jika rugi (ROI < MIN_ROI_TO_CLOSE_BY_TIME). BE memperpanjang hold.
+- Breakeven + Trailing ATR dinamis (step berdasar ATR% saat ini).
+- Early Stop wick-aware (default OFF; bisa ON via coin_config).
+- Trend filter: "ema200" atau "ema200_adx".
+- CLI: --dry-run-loop, --sleep, --limit, --verbose, --debug-mode, --bypass-filters.
+- Debug filters: log nilai ATR%, body_atr, ambang; auto-relax sementara bila pass-ratio rendah.
 
 Catatan:
 - tools_dryrun_summary.py meng-hook _enter_position/_exit_position; signature dijaga:
@@ -18,26 +19,32 @@ Catatan:
 
 from __future__ import annotations
 
-import os, json, time, argparse
+import os
+import json
+import time
+import argparse
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List, Protocol, runtime_checkable, cast
 
 import numpy as np
 import pandas as pd
+from collections import deque
 
 
 # ============================ Utils ============================
 
 def _to_float(x: Any, d: float) -> float:
     try:
-        if x is None: return float(d)
+        if x is None:
+            return float(d)
         return float(x)
     except Exception:
         return float(d)
 
 def _to_int(x: Any, d: int) -> int:
     try:
-        if x is None: return int(d)
+        if x is None:
+            return int(d)
         return int(float(x))
     except Exception:
         return int(d)
@@ -49,15 +56,17 @@ def _to_bool(x: Any, d: bool) -> bool:
         return bool(int(x))
     if isinstance(x, str):
         s = x.strip().lower()
-        if s in {"1","true","y","yes","on"}:  return True
-        if s in {"0","false","n","no","off"}: return False
+        if s in {"1", "true", "y", "yes", "on"}:
+            return True
+        if s in {"0", "false", "n", "no", "off"}:
+            return False
     return bool(d)
 
 
 # ============================ Defaults ============================
 
 DEFAULTS: Dict[str, Any] = {
-    "leverage": 10,                 # hanya untuk perhitungan margin (opsional)
+    "leverage": 10,                 # hanya untuk margin-cap (opsional)
     "risk_per_trade": 0.05,         # proporsi balance → risk USDT
 
     "taker_fee": 0.0005,
@@ -92,9 +101,9 @@ DEFAULTS: Dict[str, Any] = {
     "cooldown_mul_early_stop": 1.2,
 
     # Early Stop (wick-aware)
-    "early_stop_enabled": 0,        # DISABLE by default (nyalakan jika perlu)
+    "early_stop_enabled": 0,        # DISABLE by default
     "early_stop_bars": 2,           # cek hanya n bar pertama
-    "early_stop_adverse_atr": 0.90, # proporsional ATR (agak longgar)
+    "early_stop_adverse_atr": 0.90, # proporsional ATR (longgar)
     "early_stop_wick_factor": 1.30, # bila pakai wick → ambang dinaikkan
     "adx_strong_thresh": 22.0,
 
@@ -247,26 +256,50 @@ class CoinTrader:
         self.pos = Position()
         self.cooldown_until_ts: Optional[float] = None
 
-        self.verbose = _to_bool(self.config.get("VERBOSE", os.getenv("VERBOSE","0")), False)
-        self.cooldown_use_bar_time = _to_bool(self.config.get("COOLDOWN_USE_BAR_TIME", os.getenv("COOLDOWN_USE_BAR_TIME","1")), True)
+        self.verbose = _to_bool(self.config.get("VERBOSE", os.getenv("VERBOSE", "0")), False)
+        self.cooldown_use_bar_time = _to_bool(
+            self.config.get("COOLDOWN_USE_BAR_TIME", os.getenv("COOLDOWN_USE_BAR_TIME", "1")),
+            True
+        )
 
         # Early stop
-        self.early_stop_enabled = _to_bool(self.config.get("early_stop_enabled", DEFAULTS["early_stop_enabled"]), DEFAULTS["early_stop_enabled"])
-        self.early_stop_bars = _to_int(self.config.get("early_stop_bars", DEFAULTS["early_stop_bars"]), DEFAULTS["early_stop_bars"])
-        self.early_stop_adverse_atr = _to_float(self.config.get("early_stop_adverse_atr", DEFAULTS["early_stop_adverse_atr"]), DEFAULTS["early_stop_adverse_atr"])
-        self.early_stop_wick_factor = _to_float(self.config.get("early_stop_wick_factor", DEFAULTS["early_stop_wick_factor"]), DEFAULTS["early_stop_wick_factor"])
-        self.adx_strong_thresh = _to_float(self.config.get("adx_strong_thresh", DEFAULTS["adx_strong_thresh"]), DEFAULTS["adx_strong_thresh"])
+        self.early_stop_enabled = _to_bool(self.config.get("early_stop_enabled", DEFAULTS["early_stop_enabled"]),
+                                           DEFAULTS["early_stop_enabled"])
+        self.early_stop_bars = _to_int(self.config.get("early_stop_bars", DEFAULTS["early_stop_bars"]),
+                                       DEFAULTS["early_stop_bars"])
+        self.early_stop_adverse_atr = _to_float(self.config.get("early_stop_adverse_atr", DEFAULTS["early_stop_adverse_atr"]),
+                                                DEFAULTS["early_stop_adverse_atr"])
+        self.early_stop_wick_factor = _to_float(self.config.get("early_stop_wick_factor", DEFAULTS["early_stop_wick_factor"]),
+                                                DEFAULTS["early_stop_wick_factor"])
+        self.adx_strong_thresh = _to_float(self.config.get("adx_strong_thresh", DEFAULTS["adx_strong_thresh"]),
+                                           DEFAULTS["adx_strong_thresh"])
 
         # Time stop v2
-        self.max_hold_seconds = _to_int(self.config.get("max_hold_seconds", os.getenv("MAX_HOLD_SECONDS", DEFAULTS["max_hold_seconds"])), DEFAULTS["max_hold_seconds"])
-        self.max_hold_seconds_be = _to_int(self.config.get("max_hold_seconds_be", DEFAULTS["max_hold_seconds_be"]), DEFAULTS["max_hold_seconds_be"])
-        self.min_roi_time_close = _to_float(self.config.get("min_roi_to_close_by_time", os.getenv("MIN_ROI_TO_CLOSE_BY_TIME", DEFAULTS["min_roi_to_close_by_time"])), DEFAULTS["min_roi_to_close_by_time"])
-        self.time_stop_only_if_loss = _to_bool(self.config.get("time_stop_only_if_loss", DEFAULTS["time_stop_only_if_loss"]), DEFAULTS["time_stop_only_if_loss"])
+        self.max_hold_seconds = _to_int(self.config.get("max_hold_seconds", os.getenv("MAX_HOLD_SECONDS", DEFAULTS["max_hold_seconds"])),
+                                        DEFAULTS["max_hold_seconds"])
+        self.max_hold_seconds_be = _to_int(self.config.get("max_hold_seconds_be", DEFAULTS["max_hold_seconds_be"]),
+                                           DEFAULTS["max_hold_seconds_be"])
+        self.min_roi_time_close = _to_float(self.config.get("min_roi_to_close_by_time",
+                                                           os.getenv("MIN_ROI_TO_CLOSE_BY_TIME",
+                                                                     DEFAULTS["min_roi_to_close_by_time"])),
+                                            DEFAULTS["min_roi_to_close_by_time"])
+        self.time_stop_only_if_loss = _to_bool(self.config.get("time_stop_only_if_loss", DEFAULTS["time_stop_only_if_loss"]),
+                                               DEFAULTS["time_stop_only_if_loss"])
 
         # Trend filter
         self.trend_filter_mode = str(self.config.get("trend_filter_mode", DEFAULTS["trend_filter_mode"])).lower().strip()
         self.adx_period = _to_int(self.config.get("adx_period", DEFAULTS["adx_period"]), DEFAULTS["adx_period"])
         self.adx_thresh = _to_float(self.config.get("adx_thresh", DEFAULTS["adx_thresh"]), DEFAULTS["adx_thresh"])
+
+        # Debug filters
+        self.debug_mode = _to_bool(self.config.get("debug_mode", os.getenv("DEBUG_MODE", "0")), False)
+        self.bypass_filters = _to_bool(os.getenv("BYPASS_FILTERS", "0"), False)
+        self.min_atr_pct_debug = _to_float(self.config.get("min_atr_pct_debug", 0.003), 0.003)
+        self.max_body_atr_debug = _to_float(self.config.get("max_body_atr_debug", 1.50), 1.50)
+        self.relax_on_debug = _to_bool(self.config.get("relax_filters_on_debug", 1), True)
+        self._flt_hist = deque(maxlen=_to_int(self.config.get("filter_auto_relax_window", 50), 50))
+        self._flt_relax_ratio = _to_float(self.config.get("filter_auto_relax_ratio", 0.25), 0.25)
+        self._flt_relax_factor = _to_float(self.config.get("filter_auto_relax_factor", 0.85), 0.85)
 
         # ML
         if MLImplClass is not None:
@@ -291,13 +324,14 @@ class CoinTrader:
     # ---------------------- sizing & stop level ----------------------
     def _size_position(self, price: float, balance: float, atr: float) -> float:
         # Risk in USDT (tidak pakai leverage multiplier)
-        risk_pct   = _to_float(self.config.get("risk_per_trade", DEFAULTS["risk_per_trade"]), DEFAULTS["risk_per_trade"])
-        risk_usdt  = max(0.0001, balance * risk_pct)
+        risk_pct = _to_float(self.config.get("risk_per_trade", DEFAULTS["risk_per_trade"]),
+                             DEFAULTS["risk_per_trade"])
+        risk_usdt = max(0.0001, balance * risk_pct)
 
         # Stop distance (dalam %) berbasis ATR lalu dijepit min/max
         sl_atr_mult = _to_float(self.config.get("sl_atr_mult", DEFAULTS["sl_atr_mult"]), DEFAULTS["sl_atr_mult"])
-        sl_min_pct  = _to_float(self.config.get("sl_min_pct",  DEFAULTS["sl_min_pct"]),  DEFAULTS["sl_min_pct"])
-        sl_max_pct  = _to_float(self.config.get("sl_max_pct",  DEFAULTS["sl_max_pct"]),  DEFAULTS["sl_max_pct"])
+        sl_min_pct = _to_float(self.config.get("sl_min_pct", DEFAULTS["sl_min_pct"]), DEFAULTS["sl_min_pct"])
+        sl_max_pct = _to_float(self.config.get("sl_max_pct", DEFAULTS["sl_max_pct"]), DEFAULTS["sl_max_pct"])
         sl_dist_pct = max(sl_min_pct, sl_atr_mult * (atr / max(price, 1e-9)))
         sl_dist_pct = min(sl_dist_pct, sl_max_pct)
 
@@ -305,7 +339,7 @@ class CoinTrader:
         # loss ≈ notional * sl_dist_pct  => notional = risk_usdt / sl_dist_pct
         notional = risk_usdt / max(sl_dist_pct, 1e-6)
 
-        # Opsional: batasi oleh kapasitas margin (balance * leverage)
+        # Batasi oleh kapasitas margin (balance * leverage)
         lev = _to_float(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
         max_margin = balance * 0.95  # jangan gunakan 100% saldo
         max_notional_by_margin = max_margin * max(lev, 1.0)
@@ -313,16 +347,15 @@ class CoinTrader:
             notional = max_notional_by_margin
 
         qty = max(0.0, notional / max(price, 1e-9))
-        # pembulatan 3 desimal (sesuaikan precision exchange)
-        return round(qty, 3)
+        return round(qty, 3)  # pembulatan (sesuaikan precision exchange)
 
     def _hard_sl_price(self, price: float, atr: float, side: str) -> float:
         mode = str(self.config.get("sl_mode", DEFAULTS["sl_mode"])).upper()
         if mode == "ATR":
-            mult   = _to_float(self.config.get("sl_atr_mult", DEFAULTS["sl_atr_mult"]), DEFAULTS["sl_atr_mult"])
-            minpct = _to_float(self.config.get("sl_min_pct",  DEFAULTS["sl_min_pct"]),  DEFAULTS["sl_min_pct"])
-            maxpct = _to_float(self.config.get("sl_max_pct",  DEFAULTS["sl_max_pct"]),  DEFAULTS["sl_max_pct"])
-            sl_pct = min(max(minpct, mult * (atr/max(price, 1e-9))), maxpct)
+            mult = _to_float(self.config.get("sl_atr_mult", DEFAULTS["sl_atr_mult"]), DEFAULTS["sl_atr_mult"])
+            minpct = _to_float(self.config.get("sl_min_pct", DEFAULTS["sl_min_pct"]), DEFAULTS["sl_min_pct"])
+            maxpct = _to_float(self.config.get("sl_max_pct", DEFAULTS["sl_max_pct"]), DEFAULTS["sl_max_pct"])
+            sl_pct = min(max(minpct, mult * (atr / max(price, 1e-9))), maxpct)
         else:
             sl_pct = _to_float(self.config.get("sl_pct", DEFAULTS["sl_pct"]), DEFAULTS["sl_pct"])
         return price * (1.0 - sl_pct) if side == "LONG" else price * (1.0 + sl_pct)
@@ -334,15 +367,15 @@ class CoinTrader:
         if not _to_bool(self.config.get("use_breakeven", DEFAULTS["use_breakeven"]), DEFAULTS["use_breakeven"]):
             return
         be_trg = _to_float(self.config.get("be_trigger_pct", DEFAULTS["be_trigger_pct"]), DEFAULTS["be_trigger_pct"])
-        be_off = _to_float(self.config.get("be_offset_pct",  DEFAULTS["be_offset_pct"]),  DEFAULTS["be_offset_pct"])
+        be_off = _to_float(self.config.get("be_offset_pct", DEFAULTS["be_offset_pct"]), DEFAULTS["be_offset_pct"])
         ent = float(self.pos.entry)
         if self.pos.side == "LONG":
-            if (price - ent)/ent >= be_trg:
+            if (price - ent) / ent >= be_trg:
                 new_sl = ent * (1 + be_off)
                 if not self.pos.sl or new_sl > self.pos.sl:
                     self.pos.sl = new_sl
         else:
-            if (ent - price)/ent >= be_trg:
+            if (ent - price) / ent >= be_trg:
                 new_sl = ent * (1 - be_off)
                 if not self.pos.sl or new_sl < self.pos.sl:
                     self.pos.sl = new_sl
@@ -350,26 +383,31 @@ class CoinTrader:
     def _update_trailing(self, price: float, atr: float) -> None:
         if not (self.pos and self.pos.side and self.pos.entry):
             return
-        trg = _to_float(self.config.get("trailing_trigger", DEFAULTS["trailing_trigger"]), DEFAULTS["trailing_trigger"])
+        trg = _to_float(self.config.get("trailing_trigger", DEFAULTS["trailing_trigger"]),
+                        DEFAULTS["trailing_trigger"])
         ent = float(self.pos.entry)
-        moved_long  = (price - ent)/ent * 100.0
-        moved_short = (ent - price)/ent * 100.0
+        moved_long = (price - ent) / ent * 100.0
+        moved_short = (ent - price) / ent * 100.0
         if self.pos.side == "LONG":
-            if moved_long < trg:  return
+            if moved_long < trg:
+                return
         else:
-            if moved_short < trg: return
+            if moved_short < trg:
+                return
 
         atr_pct_now = (atr / max(price, 1e-9)) * 100.0
-        step_min = _to_float(self.config.get("trailing_step_min_pct", DEFAULTS["trailing_step_min_pct"]), DEFAULTS["trailing_step_min_pct"])
-        step_max = _to_float(self.config.get("trailing_step_max_pct", DEFAULTS["trailing_step_max_pct"]), DEFAULTS["trailing_step_max_pct"])
+        step_min = _to_float(self.config.get("trailing_step_min_pct", DEFAULTS["trailing_step_min_pct"]),
+                             DEFAULTS["trailing_step_min_pct"])
+        step_max = _to_float(self.config.get("trailing_step_max_pct", DEFAULTS["trailing_step_max_pct"]),
+                             DEFAULTS["trailing_step_max_pct"])
         k = _to_float(self.config.get("trail_atr_k", DEFAULTS["trail_atr_k"]), DEFAULTS["trail_atr_k"])
         dyn_step = max(step_min, min(step_max, k * atr_pct_now))
 
         if self.pos.side == "LONG":
-            new_tsl = price * (1.0 - dyn_step/100.0)
+            new_tsl = price * (1.0 - dyn_step / 100.0)
             self.pos.trailing_sl = max(self.pos.trailing_sl or 0.0, new_tsl)
         else:
-            new_tsl = price * (1.0 + dyn_step/100.0)
+            new_tsl = price * (1.0 + dyn_step / 100.0)
             self.pos.trailing_sl = min(self.pos.trailing_sl or 1e12, new_tsl)
 
     # --------------------------- Exit check -------------------------
@@ -377,11 +415,15 @@ class CoinTrader:
         if not self.pos.side:
             return False, None
         if self.pos.side == "LONG":
-            if self.pos.sl and price <= self.pos.sl:         return True, "Hit Hard SL"
-            if self.pos.trailing_sl and price <= self.pos.trailing_sl: return True, "Hit Trailing SL"
+            if self.pos.sl and price <= self.pos.sl:
+                return True, "Hit Hard SL"
+            if self.pos.trailing_sl and price <= self.pos.trailing_sl:
+                return True, "Hit Trailing SL"
         else:
-            if self.pos.sl and price >= self.pos.sl:         return True, "Hit Hard SL"
-            if self.pos.trailing_sl and price >= self.pos.trailing_sl: return True, "Hit Trailing SL"
+            if self.pos.sl and price >= self.pos.sl:
+                return True, "Hit Hard SL"
+            if self.pos.trailing_sl and price >= self.pos.trailing_sl:
+                return True, "Hit Trailing SL"
         return False, None
 
     # --------------------- Early Stop (wick-aware) ------------------
@@ -391,7 +433,8 @@ class CoinTrader:
 
         last = df.iloc[-1]
         atr = float(last.get("atr", 0.0) or 0.0)
-        if atr <= 0: return False
+        if atr <= 0:
+            return False
 
         try:
             bars_since = int((df["timestamp"] > self.pos.entry_time).sum())
@@ -402,9 +445,9 @@ class CoinTrader:
         if bars_since <= 0 or bars_since > max_es_bars:
             return False
 
-        ent   = float(self.pos.entry)
-        low   = float(last.get("low",   last.get("close", ent)))
-        high  = float(last.get("high",  last.get("close", ent)))
+        ent = float(self.pos.entry)
+        low = float(last.get("low", last.get("close", ent)))
+        high = float(last.get("high", last.get("close", ent)))
         close = float(last.get("close", ent))
 
         adverse_prop = float(self.early_stop_adverse_atr) * (atr / max(ent, 1e-9))
@@ -441,19 +484,20 @@ class CoinTrader:
         if self._cooldown_active(now_ts):
             return
         qty = self._size_position(price, balance, atr)
-        if qty <= 0: return
+        if qty <= 0:
+            return
         sl = self._hard_sl_price(price, atr, side)
         et = pd.to_datetime(now_ts, unit="s", utc=True) if now_ts is not None else pd.Timestamp.utcnow()
         self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=et)
 
         # Log sizing sanity
         sl_atr_mult = _to_float(self.config.get("sl_atr_mult", DEFAULTS["sl_atr_mult"]), DEFAULTS["sl_atr_mult"])
-        sl_min_pct  = _to_float(self.config.get("sl_min_pct",  DEFAULTS["sl_min_pct"]),  DEFAULTS["sl_min_pct"])
-        sl_max_pct  = _to_float(self.config.get("sl_max_pct",  DEFAULTS["sl_max_pct"]),  DEFAULTS["sl_max_pct"])
+        sl_min_pct = _to_float(self.config.get("sl_min_pct", DEFAULTS["sl_min_pct"]), DEFAULTS["sl_min_pct"])
+        sl_max_pct = _to_float(self.config.get("sl_max_pct", DEFAULTS["sl_max_pct"]), DEFAULTS["sl_max_pct"])
         sl_dist_pct = max(sl_min_pct, sl_atr_mult * (atr / max(price, 1e-9)))
         sl_dist_pct = min(sl_dist_pct, sl_max_pct)
 
-        risk_pct  = _to_float(self.config.get("risk_per_trade", DEFAULTS["risk_per_trade"]), DEFAULTS["risk_per_trade"])
+        risk_pct = _to_float(self.config.get("risk_per_trade", DEFAULTS["risk_per_trade"]), DEFAULTS["risk_per_trade"])
         risk_usdt = max(0.0001, balance * risk_pct)
         theo_loss_at_sl = (qty * price) * sl_dist_pct  # kira-kira loss di SL
 
@@ -465,15 +509,19 @@ class CoinTrader:
 
     def _exit_position(self, price: float, reason: str, now_ts: Optional[float] = None) -> None:
         self._log(f"EXIT {reason} price={price:.6f}")
-        cd_base = _to_int(self.config.get("cooldown_seconds", DEFAULTS["cooldown_seconds"]), DEFAULTS["cooldown_seconds"])
+        cd_base = _to_int(self.config.get("cooldown_seconds", DEFAULTS["cooldown_seconds"]),
+                          DEFAULTS["cooldown_seconds"])
         r = (reason or "").lower()
         mul = 1.0
         if "hard sl" in r:
-            mul = _to_float(self.config.get("cooldown_mul_hard_sl", DEFAULTS["cooldown_mul_hard_sl"]), DEFAULTS["cooldown_mul_hard_sl"])
+            mul = _to_float(self.config.get("cooldown_mul_hard_sl", DEFAULTS["cooldown_mul_hard_sl"]),
+                            DEFAULTS["cooldown_mul_hard_sl"])
         elif "trailing" in r:
-            mul = _to_float(self.config.get("cooldown_mul_trailing", DEFAULTS["cooldown_mul_trailing"]), DEFAULTS["cooldown_mul_trailing"])
+            mul = _to_float(self.config.get("cooldown_mul_trailing", DEFAULTS["cooldown_mul_trailing"]),
+                            DEFAULTS["cooldown_mul_trailing"])
         elif "early stop" in r:
-            mul = _to_float(self.config.get("cooldown_mul_early_stop", DEFAULTS["cooldown_mul_early_stop"]), DEFAULTS["cooldown_mul_early_stop"])
+            mul = _to_float(self.config.get("cooldown_mul_early_stop", DEFAULTS["cooldown_mul_early_stop"]),
+                            DEFAULTS["cooldown_mul_early_stop"])
         base_now = float(now_ts) if now_ts is not None else time.time()
         self.cooldown_until_ts = base_now + max(0, int(cd_base * mul))
         self.pos = Position()
@@ -486,18 +534,73 @@ class CoinTrader:
         d = calculate_indicators(df, adx_period=self.adx_period)
         last = d.iloc[-1]
         price = float(last["close"])
-        atr   = float(last.get("atr", 0.0) or 0.0)
+        atr = float(last.get("atr", 0.0) or 0.0)
         last_ts = last["timestamp"] if "timestamp" in last else None
         now_ts = self._now_ts(last_ts)
 
-        # Filter volatilitas & body
+        # ---------------- FILTERS ----------------
         atr_pct = (atr / max(price, 1e-9))
         min_atr_pct = _to_float(self.config.get("min_atr_pct", DEFAULTS["min_atr_pct"]), DEFAULTS["min_atr_pct"])
         max_atr_pct = _to_float(self.config.get("max_atr_pct", DEFAULTS["max_atr_pct"]), DEFAULTS["max_atr_pct"])
-        body_atr_ok = bool(last.get("body_atr", np.nan) <= _to_float(self.config.get("max_body_atr", DEFAULTS["max_body_atr"]), DEFAULTS["max_body_atr"]))
+        max_body_atr = _to_float(self.config.get("max_body_atr", DEFAULTS["max_body_atr"]), DEFAULTS["max_body_atr"])
+        body_atr_val = float(last.get("body_atr", np.inf))
+        body_atr_ok = bool(body_atr_val <= max_body_atr)
         atr_ok = (atr_pct >= min_atr_pct) and (atr_pct <= max_atr_pct)
 
-        # Kelola posisi aktif dulu
+        # Debug-mode relax
+        if self.debug_mode and self.relax_on_debug:
+            min_atr_pct = min(min_atr_pct, self.min_atr_pct_debug)
+            max_body_atr = max(max_body_atr, self.max_body_atr_debug)
+            body_atr_ok = bool(body_atr_val <= max_body_atr)
+            atr_ok = (atr_pct >= min_atr_pct) and (atr_pct <= max_atr_pct)
+
+        # Auto-relax jika pass-ratio rendah (debug saja)
+        self._flt_hist.append(1 if (atr_ok and body_atr_ok) else 0)
+        if self.debug_mode and len(self._flt_hist) >= self._flt_hist.maxlen:
+            pass_ratio = sum(self._flt_hist) / len(self._flt_hist)
+            if pass_ratio < self._flt_relax_ratio:
+                old_min = min_atr_pct
+                old_maxb = max_body_atr
+                min_atr_pct *= self._flt_relax_factor           # turunkan lower bound ATR
+                max_body_atr *= (1.0 / self._flt_relax_factor)  # naikkan toleransi body/ATR
+                body_atr_ok = bool(body_atr_val <= max_body_atr)
+                atr_ok = (atr_pct >= min_atr_pct) and (atr_pct <= max_atr_pct)
+                self._log(f"FILTER_AUTO_RELAX pass_ratio={pass_ratio:.2f} "
+                          f"min_atr: {old_min:.4f}->{min_atr_pct:.4f} "
+                          f"max_body_atr: {old_maxb:.2f}->{max_body_atr:.2f}")
+
+        # Bypass (debug)
+        if self.bypass_filters:
+            atr_ok = True
+            body_atr_ok = True
+
+        if not (atr_ok and body_atr_ok):
+            if self.debug_mode:
+                self._log(
+                    "FILTER_VALS "
+                    f"price={price:.6f} atr={atr:.6f} atr_pct={atr_pct*100:.3f}% "
+                    f"min_atr={min_atr_pct*100:.3f}% max_atr={max_atr_pct*100:.3f}% "
+                    f"body_atr={body_atr_val:.3f} max_body_atr={max_body_atr:.3f}"
+                )
+                reasons = []
+                if not atr_ok:
+                    reasons.append("ATR")
+                if not body_atr_ok:
+                    reasons.append("BODY")
+                self._log(f"FILTER_FAIL reason={'+'.join(reasons)}")
+            # tetap kelola posisi aktif (BE/TSL) walau bar gagal
+            if self.pos.side:
+                self._apply_breakeven(price)
+                self._update_trailing(price, atr)
+                ex, rs = self._should_exit(price)
+                if ex:
+                    self._exit_position(price, rs or "Filter Fail", now_ts=now_ts)
+            else:
+                self._log(f"FILTER BLOCK atr_ok={atr_ok} body_ok={body_atr_ok} price={price:.6f} pos={self.pos.side}")
+            return
+        # -------------- END FILTERS --------------
+
+        # Kelola posisi aktif (setelah lolos filter)
         if self.pos.side:
             # Early stop (jika ON)
             if self._early_stop_check(d, now_ts):
@@ -508,11 +611,13 @@ class CoinTrader:
                 if self.pos.entry_time is not None:
                     hold_sec = max(0.0, float(now_ts) - float(self.pos.entry_time.timestamp()))
                     ent = float(self.pos.entry or price)
-                    roi = (price - ent)/ent if self.pos.side == "LONG" else (ent - price)/ent
+                    roi = (price - ent) / ent if self.pos.side == "LONG" else (ent - price) / ent
                     be_active = False
                     if self.pos.sl is not None:
-                        if self.pos.side == "LONG"  and self.pos.sl >= ent: be_active = True
-                        if self.pos.side == "SHORT" and self.pos.sl <= ent: be_active = True
+                        if self.pos.side == "LONG" and self.pos.sl >= ent:
+                            be_active = True
+                        if self.pos.side == "SHORT" and self.pos.sl <= ent:
+                            be_active = True
                     max_hold = self.max_hold_seconds_be if be_active else int(self.max_hold_seconds)
                     roi_thr = float(self.min_roi_time_close)
                     if hold_sec >= max_hold:
@@ -531,19 +636,8 @@ class CoinTrader:
                 self._exit_position(price, rs or "Exit", now_ts=now_ts)
                 return
 
-        # Filter gagal → log & kesempatan SL/TSL
-        if not (atr_ok and body_atr_ok):
-            if self.pos.side:
-                self._apply_breakeven(price)
-                self._update_trailing(price, atr)
-                ex, rs = self._should_exit(price)
-                if ex:
-                    self._exit_position(price, rs or "Filter Fail", now_ts=now_ts)
-            self._log(f"FILTER BLOCK atr_ok={atr_ok} body_ok={body_atr_ok} price={price:.6f} pos={self.pos.side}")
-            return
-
         # Base sinyal
-        base_long  = (bool(last["macd"] > last["macd_sig"]) and bool(last["rsi"] > 52) and bool(last["ema_fast"] > last["ema_slow"]))
+        base_long = (bool(last["macd"] > last["macd_sig"]) and bool(last["rsi"] > 52) and bool(last["ema_fast"] > last["ema_slow"]))
         base_short = (bool(last["macd"] < last["macd_sig"]) and bool(last["rsi"] < 48) and bool(last["ema_fast"] < last["ema_slow"]))
 
         # Trend filter
@@ -575,7 +669,7 @@ class CoinTrader:
         # Entry
         if not self.pos.side and not self._cooldown_active(now_ts):
             if long_sig:
-                self._enter_position("LONG",  price, atr, balance, now_ts=now_ts)
+                self._enter_position("LONG", price, atr, balance, now_ts=now_ts)
             elif short_sig:
                 self._enter_position("SHORT", price, atr, balance, now_ts=now_ts)
 
@@ -628,10 +722,20 @@ def main():
     ap.add_argument("--sleep", type=float, default=0.0)
     ap.add_argument("--limit", type=int, default=0)
 
+    # >>> PATCH: opsi debug & bypass filter
+    ap.add_argument("--debug-mode", action="store_true", help="Tampilkan nilai filter & alasan gagal")
+    ap.add_argument("--bypass-filters", action="store_true", help="(Debug) Lewati filter ATR/body/HTF")
+
     args = ap.parse_args()
 
     if args.verbose:
         os.environ["VERBOSE"] = "1"
+
+    # Set env flag agar bisa dibaca trader
+    if args.debug_mode:
+        os.environ["DEBUG_MODE"] = "1"
+    if args.bypass_filters:
+        os.environ["BYPASS_FILTERS"] = "1"
 
     if args.csv and os.path.exists(args.csv):
         df = _load_csv_sorted(args.csv)
@@ -640,15 +744,19 @@ def main():
         if args.dry_run_loop:
             min_train = int(float(os.getenv("ML_MIN_TRAIN_BARS", "400")))
             warmup = max(300, min_train + 10)
-            start_i = min(warmup, len(df)-1)
+            start_i = min(warmup, len(df) - 1)
             steps = 0
 
             mgr = TradingManager(args.coin_config, [sym])
-            if args.verbose and sym in mgr.traders:
-                mgr.traders[sym].verbose = True
+            # aktifkan verbose/debug untuk trader
+            for t in mgr.traders.values():
+                if args.verbose:
+                    t.verbose = True
+                t.debug_mode = bool(args.debug_mode) or _to_bool(os.getenv("DEBUG_MODE", "0"), False)
+                t.bypass_filters = bool(args.bypass_filters) or _to_bool(os.getenv("BYPASS_FILTERS", "0"), False)
 
             for i in range(start_i, len(df)):
-                data_map = {sym: df.iloc[:i+1].copy()}
+                data_map = {sym: df.iloc[:i + 1].copy()}
                 mgr.run_once(data_map, {sym: args.balance})
                 steps += 1
                 if args.limit and steps >= args.limit:
@@ -659,7 +767,10 @@ def main():
             print(f"Dry-run completed: {steps} steps (start={start_i}, total_bars={len(df)}). Last position: {last_side}")
         else:
             data_map = {sym: df}
-            TradingManager(args.coin_config, [sym]).run_once(data_map, {sym: args.balance})
+            mgr = TradingManager(args.coin_config, [sym])
+            if args.verbose and sym in mgr.traders:
+                mgr.traders[sym].verbose = True
+            mgr.run_once(data_map, {sym: args.balance})
             print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
     else:
         print("Tidak ada CSV yang diberikan. Gunakan --csv untuk simulasi dry-run.")
