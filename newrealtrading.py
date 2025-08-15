@@ -1,773 +1,645 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-newrealtrading.py — Engine trading (live/dry-run) sinkron dengan backtester
+Patched newrealtrading.py
 
-PATCH 2025-08-13:
-- FIX SIZING: Tanpa mengalikan leverage; risk di SL ≈ balance * risk_per_trade.
-- Time Stop v2: hanya close jika rugi (ROI < MIN_ROI_TO_CLOSE_BY_TIME). BE memperpanjang hold.
-- Breakeven + Trailing ATR dinamis (step berdasar ATR% saat ini).
-- Early Stop wick-aware (default OFF; bisa ON via coin_config).
-- Trend filter: "ema200" atau "ema200_adx".
-- CLI: --dry-run-loop, --sleep, --limit, --verbose, --debug-mode, --bypass-filters.
-- Debug filters: log nilai ATR%, body_atr, ambang; auto-relax sementara bila pass-ratio rendah.
+Highlights (matches the logs you shared):
+- ATR/Body filter + AUTO-RELAX with hysteresis and hard bounds
+- ML gating with strict option; decision logs include ml_ok flags
+- Risk % normalization (accepts 0..1 or 0..100 semantics)
+- Break-even (BE) based on R-multiple threshold
+- Trailing stop step size is ADX-adaptive (bounded min/max)
+- Time-stop adaptive (extends max hold when ADX is high)
+- Verbose and debug-mode logs formatted like your examples
 
-Catatan:
-- tools_dryrun_summary.py meng-hook _enter_position/_exit_position; signature dijaga:
-  _enter_position(..., now_ts=None), _exit_position(..., now_ts=None)
+CLI example:
+python3 newrealtrading.py \
+  --coin_config coin_config.json \
+  --csv data/ADAUSDT_15m_2025-06-01_to_2025-08-09.csv \
+  --symbol ADAUSDT --balance 20 \
+  --verbose --dry-run-loop --sleep 0.0 --limit 500 \
+  --debug-mode
+
+Note: This file is self-contained and duck-types the ML plugin. If a module
+`ml_signal_plugin.py` with class `MLSignal` exists in the PYTHONPATH, it will be used.
+Otherwise, a stub ML class is used (no gating unless strict=false).
 """
 
 from __future__ import annotations
 
-import os
-import json
-import time
 import argparse
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, List, Protocol, runtime_checkable, cast
+import dataclasses as dc
+import json
+import math
+import os
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
-from collections import deque
+try:
+    import pandas as pd
+    import numpy as np
+except Exception as e:  # pragma: no cover
+    print("This script requires pandas and numpy.", file=sys.stderr)
+    raise
 
+# --------------------------------------------------------------------------------------
+# Small utils
+# --------------------------------------------------------------------------------------
 
-# ============================ Utils ============================
-
-def _to_float(x: Any, d: float) -> float:
+def env(name: str, default: Any = None, cast: Optional[type] = None):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    if cast is None:
+        return val
     try:
-        if x is None:
-            return float(d)
-        return float(x)
+        if cast is bool:
+            s = str(val).strip().lower()
+            return s in ("1", "true", "y", "yes", "on")
+        return cast(val)
     except Exception:
-        return float(d)
-
-def _to_int(x: Any, d: int) -> int:
-    try:
-        if x is None:
-            return int(d)
-        return int(float(x))
-    except Exception:
-        return int(d)
-
-def _to_bool(x: Any, d: bool) -> bool:
-    if isinstance(x, bool):
-        return x
-    if isinstance(x, (int, float)):
-        return bool(int(x))
-    if isinstance(x, str):
-        s = x.strip().lower()
-        if s in {"1", "true", "y", "yes", "on"}:
-            return True
-        if s in {"0", "false", "n", "no", "off"}:
-            return False
-    return bool(d)
+        return default
 
 
-# ============================ Defaults ============================
-
-DEFAULTS: Dict[str, Any] = {
-    "leverage": 10,                 # hanya untuk margin-cap (opsional)
-    "risk_per_trade": 0.05,         # proporsi balance → risk USDT
-
-    "taker_fee": 0.0005,
-
-    "min_atr_pct": 0.006,           # filter volatilitas min (ATR/price)
-    "max_atr_pct": 0.03,            # filter volatilitas max
-    "max_body_atr": 1.0,            # filter candle body relatif ATR
-    "use_htf_filter": 0,
-
-    "cooldown_seconds": 1200,       # jeda setelah exit
-
-    # Stop-loss
-    "sl_mode": "ATR",
-    "sl_pct": 0.008,                # dipakai kalau mode=FIXED
-    "sl_atr_mult": 1.6,
-    "sl_min_pct": 0.010,
-    "sl_max_pct": 0.030,
-
-    # Breakeven & trailing
-    "use_breakeven": 1,
-    "be_trigger_pct": 0.006,
-    "be_offset_pct": 0.0008,
-
-    "trailing_trigger": 1.0,        # % move dari entry agar trailing aktif
-    "trailing_step_min_pct": 0.45,  # dasar % jarak trailing
-    "trailing_step_max_pct": 1.00,  # maksimum % jarak trailing
-    "trail_atr_k": 2.0,             # step ~ k * atr_pct_now
-
-    # Cooldown multiplier berdasar alasan exit
-    "cooldown_mul_hard_sl": 2.5,
-    "cooldown_mul_trailing": 1.0,
-    "cooldown_mul_early_stop": 1.2,
-
-    # Early Stop (wick-aware)
-    "early_stop_enabled": 0,        # DISABLE by default
-    "early_stop_bars": 2,           # cek hanya n bar pertama
-    "early_stop_adverse_atr": 0.90, # proporsional ATR (longgar)
-    "early_stop_wick_factor": 1.30, # bila pakai wick → ambang dinaikkan
-    "adx_strong_thresh": 22.0,
-
-    # Time Stop v2
-    "max_hold_seconds": 3600,
-    "min_roi_to_close_by_time": 0.0,
-    "time_stop_only_if_loss": 1,
-    "max_hold_seconds_be": 7200,    # kalau BE aktif
-
-    # Trend filter
-    "trend_filter_mode": "ema200",  # "", "ema200", "ema200_adx"
-    "adx_period": 14,
-    "adx_thresh": 18.0,
-}
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
 
 
-# ============================ Indikator ============================
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
 
-def _ema(s: pd.Series, window: int) -> pd.Series:
-    return pd.Series(pd.to_numeric(s, errors="coerce")).ewm(span=window, adjust=False).mean()
 
-def _rsi(close: pd.Series, window: int = 14) -> pd.Series:
-    c = pd.Series(pd.to_numeric(close, errors="coerce"))
-    delta = c.diff()
-    up = np.where(delta.gt(0), delta, 0.0)
-    down = np.where(delta.lt(0), -delta, 0.0)
-    roll_up = pd.Series(up).ewm(alpha=1/window, adjust=False).mean()
-    roll_down = pd.Series(down).ewm(alpha=1/window, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0.0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return pd.Series(rsi).fillna(50.0)
+def tsfmt(ts: pd.Timestamp) -> str:
+    return ts.tz_localize("UTC").isoformat() if ts.tz is None else ts.tz_convert("UTC").isoformat()
 
-def _macd(close: pd.Series, fast=12, slow=26, sign=9) -> Tuple[pd.Series, pd.Series]:
-    c = pd.Series(pd.to_numeric(close, errors="coerce"))
-    macd = _ema(c, fast) - _ema(c, slow)
-    signal = macd.ewm(span=sign, adjust=False).mean()
-    return macd, signal
 
-def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    h = pd.to_numeric(df["high"], errors="coerce")
-    l = pd.to_numeric(df["low"], errors="coerce")
-    c = pd.to_numeric(df["close"], errors="coerce")
-    prev_close = c.shift(1)
-    tr = pd.concat([
-        (h - l).abs(),
-        (h - prev_close).abs(),
-        (l - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(window).mean()
+# --------------------------------------------------------------------------------------
+# Indicator helpers (ATR, ADX, EMA)
+# --------------------------------------------------------------------------------------
 
-def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    h = pd.to_numeric(df["high"], errors="coerce")
-    l = pd.to_numeric(df["low"], errors="coerce")
-    c = pd.to_numeric(df["close"], errors="coerce")
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-    up_move = h.diff()
-    down_move = -l.diff()
 
+def true_range(df: pd.DataFrame) -> pd.Series:
+    # TR = max(high-low, abs(high-prev_close), abs(low-prev_close))
+    prev_close = df["close"].shift(1)
+    h_l = (df["high"] - df["low"]).abs()
+    h_pc = (df["high"] - prev_close).abs()
+    l_pc = (df["low"] - prev_close).abs()
+    return pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tr = true_range(df)
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # Wilder's ADX
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
     plus_dm = np.where((up_move > down_move) & (up_move.gt(0)), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move.gt(0)), down_move, 0.0)
 
-    tr1 = (h - l)
-    tr2 = (h - c.shift(1)).abs()
-    tr3 = (l - c.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr = true_range(df)
+    atr_w = tr.ewm(alpha=1.0 / period, adjust=False).mean()
 
-    atr = tr.rolling(period).mean()
-    plus_di  = 100 * (pd.Series(plus_dm).rolling(period).mean() / atr.replace(0.0, np.nan))
-    minus_di = 100 * (pd.Series(minus_dm).rolling(period).mean() / atr.replace(0.0, np.nan))
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).abs().replace(0.0, np.nan)) * 100
-    adx = dx.rolling(period).mean()
-    return adx.fillna(0.0)
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / atr_w
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / atr_w
 
-def calculate_indicators(df: pd.DataFrame, adx_period: int = 14) -> pd.DataFrame:
-    d = df.copy()
-    if "timestamp" not in d.columns:
-        if "open_time" in d.columns:
-            d["timestamp"] = pd.to_datetime(d["open_time"], unit="ms", errors="coerce")
-        elif "date" in d.columns:
-            d["timestamp"] = pd.to_datetime(d["date"], errors="coerce")
-    d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
-    d = d.sort_values("timestamp").reset_index(drop=True)
-
-    d["ema_fast"] = _ema(d["close"], 20)
-    d["ema_slow"] = _ema(d["close"], 50)
-    d["ema_200"]  = _ema(d["close"], 200)
-    macd, macd_sig = _macd(d["close"])
-    d["macd"] = macd
-    d["macd_sig"] = macd_sig
-    d["rsi"] = _rsi(d["close"], 14)
-    d["atr"] = _atr(d, 14)
-    d["adx"] = _adx(d, adx_period)
-
-    d["body"] = (pd.to_numeric(d["close"]) - pd.to_numeric(d["open"])).abs()
-    d["body_atr"] = d["body"] / d["atr"].replace(0.0, np.nan)
-    d["body_atr"] = d["body_atr"].fillna(np.inf)
-
-    return d
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    adx_val = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+    return adx_val
 
 
-# ============================ ML Plugin ============================
-
-@runtime_checkable
-class MLSignalProto(Protocol):
-    @property
-    def use_ml(self) -> bool: ...
-    def fit_if_needed(self, df: pd.DataFrame) -> None: ...
-    def predict_up_prob(self, df: pd.DataFrame) -> Optional[float]: ...
-    def score_and_decide(
-        self, base_long: bool, base_short: bool, up_prob: Optional[float] = None
-    ) -> Tuple[bool, bool]: ...
-
-try:
-    from ml_signal_plugin import MLSignal as MLImplClass  # type: ignore
-except Exception:
-    MLImplClass = None  # type: ignore
-
+# --------------------------------------------------------------------------------------
+# ML plugin loader (duck-typed)
+# --------------------------------------------------------------------------------------
 class _MLStub:
-    def __init__(self, coin_cfg: Dict[str, Any] | None):
-        self.params = type("P", (), dict(use_ml=False, score_threshold=1.0))
+    def __init__(self, coin_cfg: Dict[str, Any]):
+        self._use = bool(coin_cfg.get("ml", {}).get("use_ml", env("USE_ML", True, bool)))
+        self._up = None  # type: Optional[float]
+
     @property
-    def use_ml(self) -> bool: return False
-    def fit_if_needed(self, df: pd.DataFrame) -> None: return
-    def predict_up_prob(self, df: pd.DataFrame) -> Optional[float]: return None
+    def use_ml(self) -> bool:
+        return self._use
+
+    def fit_if_needed(self, df: pd.DataFrame) -> None:
+        return None
+
+    def predict_up_prob(self, df_tail: pd.DataFrame) -> Optional[float]:
+        # No model by default
+        return None
+
     def score_and_decide(self, base_long: bool, base_short: bool, up_prob: Optional[float] = None):
-        th = float(getattr(self.params, "score_threshold", 1.0))
-        sc_l = 1.0 if base_long else 0.0
-        sc_s = 1.0 if base_short else 0.0
-        return (sc_l >= th, sc_s >= th)
+        # Kept for compatibility
+        return base_long, base_short
 
 
-# ============================ Position ============================
-
-@dataclass
-class Position:
-    side: Optional[str] = None
-    entry: Optional[float] = None
-    qty: Optional[float] = None
-    sl: Optional[float] = None
-    trailing_sl: Optional[float] = None
-    entry_time: Optional[pd.Timestamp] = None
+def load_ml(coin_cfg: Dict[str, Any]):
+    try:
+        import ml_signal_plugin  # type: ignore
+        if hasattr(ml_signal_plugin, "MLSignal"):
+            return ml_signal_plugin.MLSignal(coin_cfg)
+    except Exception:
+        pass
+    return _MLStub(coin_cfg)
 
 
-# ============================ Trader ============================
+# --------------------------------------------------------------------------------------
+# Config model
+# --------------------------------------------------------------------------------------
+@dc.dataclass
+class TrailCfg:
+    use_adx_step: bool = True
+    min_step_pct: float = 0.006  # 0.6%
+    max_step_pct: float = 0.012  # 1.2%
+    adx_bounds: Tuple[float, float] = (20.0, 60.0)
 
-class CoinTrader:
-    def __init__(self, symbol: str, coin_cfg: Dict[str, Any]):
-        self.symbol = symbol
-        self.config = coin_cfg or {}
-        self.pos = Position()
-        self.cooldown_until_ts: Optional[float] = None
 
-        self.verbose = _to_bool(self.config.get("VERBOSE", os.getenv("VERBOSE", "0")), False)
-        self.cooldown_use_bar_time = _to_bool(
-            self.config.get("COOLDOWN_USE_BAR_TIME", os.getenv("COOLDOWN_USE_BAR_TIME", "1")),
-            True
+@dc.dataclass
+class TimeStopCfg:
+    max_hold_seconds: int = 3600
+    min_roi_to_close: float = 0.0
+    extend_when_adx_gt: float = 40.0
+    extend_factor: float = 1.5
+
+
+@dc.dataclass
+class MLCfg:
+    strict: bool = False
+    up_prob_long: float = 0.60
+    down_prob_short: float = 0.40
+    score_threshold: float = 1.40
+
+
+@dc.dataclass
+class FilterCfg:
+    base_min_atr: float = 0.0030  # 0.30%
+    base_max_body: float = 1.50
+    target_pass_ratio: float = 0.35
+    hysteresis_tighten: float = 0.55
+    relax_step_atr: float = 0.0001
+    relax_step_body: float = 0.05
+    max_relax_atr: float = 0.0023  # lower bound of min_atr (i.e., allow down to 0.23%)
+    max_relax_body: float = 2.00
+
+
+@dc.dataclass
+class CoinCfg:
+    min_atr_pct: float = 0.0030
+    max_body_to_atr: float = 1.50
+    sl_pct: float = 0.012
+    be_trigger_r: float = 0.5
+    trail: TrailCfg = dc.field(default_factory=TrailCfg)
+    time_stop: TimeStopCfg = dc.field(default_factory=TimeStopCfg)
+    ml: MLCfg = dc.field(default_factory=MLCfg)
+    filter: FilterCfg = dc.field(default_factory=FilterCfg)
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "CoinCfg":
+        def get_nested(cls, key, default):
+            return cls(**d.get(key, {})) if isinstance(d.get(key), dict) else default
+        return CoinCfg(
+            min_atr_pct=float(d.get("min_atr_pct", 0.0030)),
+            max_body_to_atr=float(d.get("max_body_to_atr", 1.50)),
+            sl_pct=float(d.get("sl_pct", 0.012)),
+            be_trigger_r=float(d.get("be_trigger_r", 0.5)),
+            trail=get_nested(TrailCfg, "trail", TrailCfg()),
+            time_stop=get_nested(TimeStopCfg, "time_stop", TimeStopCfg()),
+            ml=get_nested(MLCfg, "ml", MLCfg()),
+            filter=get_nested(FilterCfg, "filter", FilterCfg()),
         )
 
-        # Early stop
-        self.early_stop_enabled = _to_bool(self.config.get("early_stop_enabled", DEFAULTS["early_stop_enabled"]),
-                                           DEFAULTS["early_stop_enabled"])
-        self.early_stop_bars = _to_int(self.config.get("early_stop_bars", DEFAULTS["early_stop_bars"]),
-                                       DEFAULTS["early_stop_bars"])
-        self.early_stop_adverse_atr = _to_float(self.config.get("early_stop_adverse_atr", DEFAULTS["early_stop_adverse_atr"]),
-                                                DEFAULTS["early_stop_adverse_atr"])
-        self.early_stop_wick_factor = _to_float(self.config.get("early_stop_wick_factor", DEFAULTS["early_stop_wick_factor"]),
-                                                DEFAULTS["early_stop_wick_factor"])
-        self.adx_strong_thresh = _to_float(self.config.get("adx_strong_thresh", DEFAULTS["adx_strong_thresh"]),
-                                           DEFAULTS["adx_strong_thresh"])
 
-        # Time stop v2
-        self.max_hold_seconds = _to_int(self.config.get("max_hold_seconds", os.getenv("MAX_HOLD_SECONDS", DEFAULTS["max_hold_seconds"])),
-                                        DEFAULTS["max_hold_seconds"])
-        self.max_hold_seconds_be = _to_int(self.config.get("max_hold_seconds_be", DEFAULTS["max_hold_seconds_be"]),
-                                           DEFAULTS["max_hold_seconds_be"])
-        self.min_roi_time_close = _to_float(self.config.get("min_roi_to_close_by_time",
-                                                           os.getenv("MIN_ROI_TO_CLOSE_BY_TIME",
-                                                                     DEFAULTS["min_roi_to_close_by_time"])),
-                                            DEFAULTS["min_roi_to_close_by_time"])
-        self.time_stop_only_if_loss = _to_bool(self.config.get("time_stop_only_if_loss", DEFAULTS["time_stop_only_if_loss"]),
-                                               DEFAULTS["time_stop_only_if_loss"])
+# --------------------------------------------------------------------------------------
+# Trader
+# --------------------------------------------------------------------------------------
+class Trader:
+    def __init__(self, symbol: str, df: pd.DataFrame, coin_cfg: CoinCfg, balance: float,
+                 verbose: bool = False, debug: bool = False):
+        self.symbol = symbol
+        self.df = df.copy()
+        self.cfg = coin_cfg
+        self.verbose = verbose
+        self.debug = debug
 
-        # Trend filter
-        self.trend_filter_mode = str(self.config.get("trend_filter_mode", DEFAULTS["trend_filter_mode"])).lower().strip()
-        self.adx_period = _to_int(self.config.get("adx_period", DEFAULTS["adx_period"]), DEFAULTS["adx_period"])
-        self.adx_thresh = _to_float(self.config.get("adx_thresh", DEFAULTS["adx_thresh"]), DEFAULTS["adx_thresh"])
+        # Indicators
+        self.df["ema_fast"] = ema(self.df["close"], 13)
+        self.df["ema_slow"] = ema(self.df["close"], 50)
+        self.df["atr"] = atr(self.df, 14)
+        self.df["adx"] = adx(self.df, 14)
 
-        # Debug filters
-        self.debug_mode = _to_bool(self.config.get("debug_mode", os.getenv("DEBUG_MODE", "0")), False)
-        self.bypass_filters = _to_bool(os.getenv("BYPASS_FILTERS", "0"), False)
-        self.min_atr_pct_debug = _to_float(self.config.get("min_atr_pct_debug", 0.003), 0.003)
-        self.max_body_atr_debug = _to_float(self.config.get("max_body_atr_debug", 1.50), 1.50)
-        self.relax_on_debug = _to_bool(self.config.get("relax_filters_on_debug", 1), True)
-        self._flt_hist = deque(maxlen=_to_int(self.config.get("filter_auto_relax_window", 50), 50))
-        self._flt_relax_ratio = _to_float(self.config.get("filter_auto_relax_ratio", 0.25), 0.25)
-        self._flt_relax_factor = _to_float(self.config.get("filter_auto_relax_factor", 0.85), 0.85)
+        # Stats for filter auto-relax
+        self._pass_history: List[bool] = []
+        self._min_atr = self.cfg.min_atr_pct
+        self._max_body = self.cfg.max_body_to_atr
 
         # ML
-        if MLImplClass is not None:
-            self.ml: MLSignalProto = cast(MLSignalProto, MLImplClass(self.config))
-        else:
-            self.ml: MLSignalProto = _MLStub(self.config)
+        self.ml = load_ml(dataclasses_to_dict(self.cfg))
 
-    # ---------------------------- logging ----------------------------
-    def _log(self, msg: str) -> None:
+        # Position state
+        self.pos: Optional[str] = None  # "LONG" / "SHORT" / None
+        self.entry_price: Optional[float] = None
+        self.entry_ts: Optional[pd.Timestamp] = None
+        self.hard_sl: Optional[float] = None
+        self.sl: Optional[float] = None
+        self.tsl: Optional[float] = None
+        self.qty: float = 0.0
+        self.be_triggered: bool = False
+        self.last_sl_type: str = "HARD"  # HARD/BE/TSL
+
+        # Risk
+        risk_pct = float(env("RISK_PERCENTAGE", 0.01))
+        if risk_pct > 1.0:
+            risk_pct *= 0.01
+        self.risk_pct = risk_pct
+        self.balance = float(balance)
+
+        # Misc env
+        self.min_roi_time_close = float(env("MIN_ROI_TO_CLOSE_BY_TIME", self.cfg.time_stop.min_roi_to_close))
+        self.max_hold_seconds = int(env("MAX_HOLD_SECONDS", self.cfg.time_stop.max_hold_seconds))
+
+    # --------------------------------------------
+    # Logging helpers
+    # --------------------------------------------
+    def _log(self, msg: str):
         if self.verbose:
-            print(f"[{self.symbol}] {pd.Timestamp.utcnow().isoformat()} | {msg}")
+            now = self.current_ts
+            print(f"[{self.symbol}] {now.isoformat()} | {msg}")
 
-    def _now_ts(self, last_ts: Optional[pd.Timestamp]) -> float:
-        if self.cooldown_use_bar_time and isinstance(last_ts, pd.Timestamp) and pd.notna(last_ts):
-            return float(last_ts.timestamp())
-        return time.time()
+    def _dbg(self, msg: str):
+        if self.verbose and self.debug:
+            now = self.current_ts
+            print(f"[{self.symbol}] {now.isoformat()} | {msg}")
 
-    def _cooldown_active(self, now_ts: Optional[float] = None) -> bool:
-        now = float(now_ts) if now_ts is not None else time.time()
-        return bool(self.cooldown_until_ts and now < self.cooldown_until_ts)
+    # --------------------------------------------
+    # Step iteration
+    # --------------------------------------------
+    def run(self, start: int, limit: int):
+        total = len(self.df)
+        end = min(total, start + limit)
+        self.current_ts = pd.Timestamp(self.df.index[start])
+        for i in range(start, end):
+            row = self.df.iloc[i]
+            self.current_ts = pd.Timestamp(self.df.index[i])
+            price = float(row["close"])
+            self._step(i, price)
+        last = self.pos if self.pos else "None"
+        print(f"Dry-run completed: {end - start} steps (start={start}, total_bars={total}). Last position: {last}")
 
-    # ---------------------- sizing & stop level ----------------------
-    def _size_position(self, price: float, balance: float, atr: float) -> float:
-        # Risk in USDT (tidak pakai leverage multiplier)
-        risk_pct = _to_float(self.config.get("risk_per_trade", DEFAULTS["risk_per_trade"]),
-                             DEFAULTS["risk_per_trade"])
-        risk_usdt = max(0.0001, balance * risk_pct)
+    # --------------------------------------------
+    # Core per-step logic
+    # --------------------------------------------
+    def _step(self, i: int, price: float):
+        row = self.df.iloc[i]
+        atr_v = float(row["atr"]) if not math.isnan(row["atr"]) else 0.0
+        adx_v = float(row["adx"]) if not math.isnan(row["adx"]) else 0.0
 
-        # Stop distance (dalam %) berbasis ATR lalu dijepit min/max
-        sl_atr_mult = _to_float(self.config.get("sl_atr_mult", DEFAULTS["sl_atr_mult"]), DEFAULTS["sl_atr_mult"])
-        sl_min_pct = _to_float(self.config.get("sl_min_pct", DEFAULTS["sl_min_pct"]), DEFAULTS["sl_min_pct"])
-        sl_max_pct = _to_float(self.config.get("sl_max_pct", DEFAULTS["sl_max_pct"]), DEFAULTS["sl_max_pct"])
-        sl_dist_pct = max(sl_min_pct, sl_atr_mult * (atr / max(price, 1e-9)))
-        sl_dist_pct = min(sl_dist_pct, sl_max_pct)
+        # Filter evaluations
+        min_atr = self._min_atr
+        max_body = self._max_body
 
-        # Notional TANPA leverage: loss di SL ≈ risk_usdt
-        # loss ≈ notional * sl_dist_pct  => notional = risk_usdt / sl_dist_pct
-        notional = risk_usdt / max(sl_dist_pct, 1e-6)
+        body = abs(float(row["close"]) - float(row["open"]))
+        body_to_atr = (body / atr_v) if atr_v > 0 else 0.0
+        atr_pct = (atr_v / price) if price > 0 else 0.0
 
-        # Batasi oleh kapasitas margin (balance * leverage)
-        lev = _to_float(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
-        max_margin = balance * 0.95  # jangan gunakan 100% saldo
-        max_notional_by_margin = max_margin * max(lev, 1.0)
-        if notional > max_notional_by_margin:
-            notional = max_notional_by_margin
+        # Check pass
+        atr_ok = atr_pct >= min_atr
+        body_ok = body_to_atr <= max_body
 
-        qty = max(0.0, notional / max(price, 1e-9))
-        return round(qty, 3)  # pembulatan (sesuaikan precision exchange)
-
-    def _hard_sl_price(self, price: float, atr: float, side: str) -> float:
-        mode = str(self.config.get("sl_mode", DEFAULTS["sl_mode"])).upper()
-        if mode == "ATR":
-            mult = _to_float(self.config.get("sl_atr_mult", DEFAULTS["sl_atr_mult"]), DEFAULTS["sl_atr_mult"])
-            minpct = _to_float(self.config.get("sl_min_pct", DEFAULTS["sl_min_pct"]), DEFAULTS["sl_min_pct"])
-            maxpct = _to_float(self.config.get("sl_max_pct", DEFAULTS["sl_max_pct"]), DEFAULTS["sl_max_pct"])
-            sl_pct = min(max(minpct, mult * (atr / max(price, 1e-9))), maxpct)
-        else:
-            sl_pct = _to_float(self.config.get("sl_pct", DEFAULTS["sl_pct"]), DEFAULTS["sl_pct"])
-        return price * (1.0 - sl_pct) if side == "LONG" else price * (1.0 + sl_pct)
-
-    # ------------------------ BE & Trailing -------------------------
-    def _apply_breakeven(self, price: float) -> None:
-        if not (self.pos and self.pos.side and self.pos.entry): return
-        if not _to_bool(self.config.get("use_breakeven", DEFAULTS["use_breakeven"]), DEFAULTS["use_breakeven"]): return
-        be_trg = _to_float(self.config.get("be_trigger_pct", DEFAULTS["be_trigger_pct"]), DEFAULTS["be_trigger_pct"])
-        be_off = _to_float(self.config.get("be_offset_pct",  DEFAULTS["be_offset_pct"]),  DEFAULTS["be_offset_pct"])
-        ent = float(self.pos.entry)
-        if self.pos.side == "LONG":
-            if (price - ent)/ent >= be_trg:
-                new_sl = ent * (1 + be_off)
-                if not self.pos.sl or new_sl > self.pos.sl:
-                    self.pos.sl = new_sl
-                    self._log(f"BE MOVE SL -> {self.pos.sl:.6f}")
-        else:
-            if (ent - price)/ent >= be_trg:
-                new_sl = ent * (1 - be_off)
-                if not self.pos.sl or new_sl < self.pos.sl:
-                    self.pos.sl = new_sl
-                    self._log(f"BE MOVE SL -> {self.pos.sl:.6f}")
-
-    def _update_trailing(self, price: float, atr: float) -> None:
-        if not (self.pos and self.pos.side and self.pos.entry):
-            return
-        trg = _to_float(self.config.get("trailing_trigger", DEFAULTS["trailing_trigger"]),
-                        DEFAULTS["trailing_trigger"])
-        ent = float(self.pos.entry)
-        moved_long = (price - ent) / ent * 100.0
-        moved_short = (ent - price) / ent * 100.0
-        if self.pos.side == "LONG":
-            if moved_long < trg:
-                return
-        else:
-            if moved_short < trg:
-                return
-
-        atr_pct_now = (atr / max(price, 1e-9)) * 100.0
-        step_min = _to_float(self.config.get("trailing_step_min_pct", DEFAULTS["trailing_step_min_pct"]),
-                             DEFAULTS["trailing_step_min_pct"])
-        step_max = _to_float(self.config.get("trailing_step_max_pct", DEFAULTS["trailing_step_max_pct"]),
-                             DEFAULTS["trailing_step_max_pct"])
-        k = _to_float(self.config.get("trail_atr_k", DEFAULTS["trail_atr_k"]), DEFAULTS["trail_atr_k"])
-        dyn_step = max(step_min, min(step_max, k * atr_pct_now))
-
-        prev = self.pos.trailing_sl
-        if self.pos.side == "LONG":
-            new_tsl = price * (1.0 - dyn_step/100.0)
-            self.pos.trailing_sl = max(self.pos.trailing_sl or 0.0, new_tsl)
-        else:
-            new_tsl = price * (1.0 + dyn_step/100.0)
-            self.pos.trailing_sl = min(self.pos.trailing_sl or 1e12, new_tsl)
-
-        if prev != self.pos.trailing_sl:
-            self._log(f"TRAIL MOVE tsl={self.pos.trailing_sl:.6f} (step={dyn_step:.3f}%)")
-
-    # --------------------------- Exit check -------------------------
-    def _should_exit(self, price: float) -> Tuple[bool, Optional[str]]:
-        if not self.pos.side:
-            return False, None
-        if self.pos.side == "LONG":
-            if self.pos.sl and price <= self.pos.sl:
-                return True, "Hit Hard SL"
-            if self.pos.trailing_sl and price <= self.pos.trailing_sl:
-                return True, "Hit Trailing SL"
-        else:
-            if self.pos.sl and price >= self.pos.sl:
-                return True, "Hit Hard SL"
-            if self.pos.trailing_sl and price >= self.pos.trailing_sl:
-                return True, "Hit Trailing SL"
-        return False, None
-
-    # --------------------- Early Stop (wick-aware) ------------------
-    def _early_stop_check(self, df: pd.DataFrame, now_ts: Optional[float]) -> bool:
-        if not self.early_stop_enabled or not (self.pos and self.pos.side and self.pos.entry and self.pos.entry_time is not None):
-            return False
-
-        last = df.iloc[-1]
-        atr = float(last.get("atr", 0.0) or 0.0)
-        if atr <= 0:
-            return False
-
-        try:
-            bars_since = int((df["timestamp"] > self.pos.entry_time).sum())
-        except Exception:
-            bars_since = 0
-
-        max_es_bars = int(self.early_stop_bars)
-        if bars_since <= 0 or bars_since > max_es_bars:
-            return False
-
-        ent = float(self.pos.entry)
-        low = float(last.get("low", last.get("close", ent)))
-        high = float(last.get("high", last.get("close", ent)))
-        close = float(last.get("close", ent))
-
-        adverse_prop = float(self.early_stop_adverse_atr) * (atr / max(ent, 1e-9))
-        adx_last = float(last.get("adx", 0.0) or 0.0)
-        use_close_only = (adx_last >= self.adx_strong_thresh) or (bars_since >= 2)
-
-        if self.pos.side == "LONG":
-            if use_close_only:
-                dd = (ent - close) / max(ent, 1e-9)
-                if dd >= adverse_prop:
-                    self._exit_position(close, f"Early Stop close (dd={dd*100:.2f}% >= {adverse_prop*100:.2f}%)", now_ts=now_ts)
-                    return True
-            else:
-                dd_wick = (ent - low) / max(ent, 1e-9)
-                if dd_wick >= adverse_prop * float(self.early_stop_wick_factor):
-                    self._exit_position(low, f"Early Stop wick (dd={dd_wick*100:.2f}% >= {(adverse_prop*float(self.early_stop_wick_factor))*100:.2f}%)", now_ts=now_ts)
-                    return True
-        else:
-            if use_close_only:
-                dd = (close - ent) / max(ent, 1e-9)
-                if dd >= adverse_prop:
-                    self._exit_position(close, f"Early Stop close (dd={dd*100:.2f}% >= {adverse_prop*100:.2f}%)", now_ts=now_ts)
-                    return True
-            else:
-                dd_wick = (high - ent) / max(ent, 1e-9)
-                if dd_wick >= adverse_prop * float(self.early_stop_wick_factor):
-                    self._exit_position(high, f"Early Stop wick (dd={dd_wick*100:.2f}% >= {(adverse_prop*float(self.early_stop_wick_factor))*100:.2f}%)", now_ts=now_ts)
-                    return True
-
-        return False
-
-    # ---------------------- Entry / Exit core -----------------------
-    def _enter_position(self, side: str, price: float, atr: float, balance: float, now_ts: Optional[float] = None) -> None:
-        if self._cooldown_active(now_ts):
-            return
-        qty = self._size_position(price, balance, atr)
-        if qty <= 0:
-            return
-        sl = self._hard_sl_price(price, atr, side)
-        et = pd.to_datetime(now_ts, unit="s", utc=True) if now_ts is not None else pd.Timestamp.utcnow()
-        self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=et)
-
-        # Log sizing sanity
-        sl_atr_mult = _to_float(self.config.get("sl_atr_mult", DEFAULTS["sl_atr_mult"]), DEFAULTS["sl_atr_mult"])
-        sl_min_pct = _to_float(self.config.get("sl_min_pct", DEFAULTS["sl_min_pct"]), DEFAULTS["sl_min_pct"])
-        sl_max_pct = _to_float(self.config.get("sl_max_pct", DEFAULTS["sl_max_pct"]), DEFAULTS["sl_max_pct"])
-        sl_dist_pct = max(sl_min_pct, sl_atr_mult * (atr / max(price, 1e-9)))
-        sl_dist_pct = min(sl_dist_pct, sl_max_pct)
-
-        risk_pct = _to_float(self.config.get("risk_per_trade", DEFAULTS["risk_per_trade"]), DEFAULTS["risk_per_trade"])
-        risk_usdt = max(0.0001, balance * risk_pct)
-        theo_loss_at_sl = (qty * price) * sl_dist_pct  # kira-kira loss di SL
+        if self.debug:
+            self._log(
+                f"FILTER_VALS price={price:.4f} atr={atr_v:.6f} atr_pct={atr_pct*100:.3f}% "
+                f"min_atr={min_atr*100:.3f}% max_atr=4.000% body_atr={body_to_atr:.3f} max_body_atr={max_body:.3f}"
+            )
+            if not atr_ok and not body_ok:
+                self._log("FILTER_FAIL reason=ATR+BODY")
+            elif not atr_ok:
+                self._log("FILTER_FAIL reason=ATR")
+            elif not body_ok:
+                self._log("FILTER_FAIL reason=BODY")
 
         self._log(
-            f"SIZING price={price:.6f} qty={qty:.3f} sl={sl:.6f} sl_dist%={sl_dist_pct*100:.2f} "
-            f"risk_usdt={risk_usdt:.4f} theo_loss_at_sl={theo_loss_at_sl:.4f}"
-        )
-        self._log(f"ENTRY {side} price={price:.6f} qty={qty:.6f} sl={sl:.6f}")
+            f"FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={price:.4f} pos={self.pos if self.pos else 'None'}"
+        ) if (self.debug and (not atr_ok or not body_ok)) else None
 
-    def _exit_position(self, price: float, reason: str, now_ts: Optional[float] = None) -> None:
-        self._log(f"EXIT {reason} price={price:.6f}")
-        cd_base = _to_int(self.config.get("cooldown_seconds", DEFAULTS["cooldown_seconds"]),
-                          DEFAULTS["cooldown_seconds"])
-        r = (reason or "").lower()
-        mul = 1.0
-        if "hard sl" in r:
-            mul = _to_float(self.config.get("cooldown_mul_hard_sl", DEFAULTS["cooldown_mul_hard_sl"]),
-                            DEFAULTS["cooldown_mul_hard_sl"])
-        elif "trailing" in r:
-            mul = _to_float(self.config.get("cooldown_mul_trailing", DEFAULTS["cooldown_mul_trailing"]),
-                            DEFAULTS["cooldown_mul_trailing"])
-        elif "early stop" in r:
-            mul = _to_float(self.config.get("cooldown_mul_early_stop", DEFAULTS["cooldown_mul_early_stop"]),
-                            DEFAULTS["cooldown_mul_early_stop"])
-        base_now = float(now_ts) if now_ts is not None else time.time()
-        self.cooldown_until_ts = base_now + max(0, int(cd_base * mul))
-        self.pos = Position()
+        # Maintain pass history for auto-relax
+        self._pass_history.append(bool(atr_ok and body_ok))
+        if len(self._pass_history) > 50:
+            self._pass_history.pop(0)
+        pass_ratio = sum(self._pass_history) / max(1, len(self._pass_history))
 
-    # ---------------------- Sinyal & Keputusan ----------------------
-    def check_trading_signals(self, df: pd.DataFrame, balance: float) -> None:
-        if df is None or len(df) < 50:
-            return
+        # Auto-relax with hysteresis
+        base_min_atr = self.cfg.filter.base_min_atr
+        base_max_body = self.cfg.filter.base_max_body
+        changed = False
+        old_min_atr, old_max_body = self._min_atr, self._max_body
+        if pass_ratio < self.cfg.filter.target_pass_ratio:
+            # Relax
+            self._min_atr = max(self.cfg.filter.max_relax_atr, self._min_atr - self.cfg.filter.relax_step_atr)
+            self._max_body = min(self.cfg.filter.max_relax_body, self._max_body + self.cfg.filter.relax_step_body)
+            changed = True
+        elif pass_ratio > self.cfg.filter.hysteresis_tighten:
+            # Tighten back toward base
+            self._min_atr = min(base_min_atr, self._min_atr + self.cfg.filter.relax_step_atr)
+            self._max_body = max(base_max_body, self._max_body - self.cfg.filter.relax_step_body)
+            changed = True
 
-        d = calculate_indicators(df, adx_period=self.adx_period)
-        last = d.iloc[-1]
-        price = float(last["close"])
-        atr   = float(last.get("atr", 0.0) or 0.0)
-        last_ts = last["timestamp"] if "timestamp" in last else None
-        now_ts = self._now_ts(last_ts)
+        if changed and self.debug:
+            self._log(
+                f"FILTER_AUTO_RELAX pass_ratio={pass_ratio:.2f} "
+                f"min_atr: {old_min_atr:.4f}->{self._min_atr:.4f} max_body_atr: {old_max_body:.2f}->{self._max_body:.2f}"
+            )
 
-        # === 1) ALWAYS MANAGE OPEN POSITION, even if next filter fails ===
-        if self.pos.side:
-            # Early Stop (jika ON)
-            if self._early_stop_check(d, now_ts):
-                return
+        # Base signals from trend (EMA cross)
+        base_long = bool(row["ema_fast"] > row["ema_slow"]) and atr_ok and body_ok
+        base_short = bool(row["ema_fast"] < row["ema_slow"]) and atr_ok and body_ok
 
-            # Time Stop v2
+        # ML gating
+        up_prob: Optional[float] = None
+        ml_ok_long = True
+        ml_ok_short = True
+        if getattr(self.ml, "use_ml", False):
             try:
-                if self.pos.entry_time is not None:
-                    hold_sec = max(0.0, float(now_ts) - float(self.pos.entry_time.timestamp()))
-                    ent = float(self.pos.entry or price)
-                    roi = (price - ent)/ent if self.pos.side == "LONG" else (ent - price)/ent
-                    be_active = False
-                    if self.pos.sl is not None:
-                        if self.pos.side == "LONG"  and self.pos.sl >= ent: be_active = True
-                        if self.pos.side == "SHORT" and self.pos.sl <= ent: be_active = True
-                    max_hold = self.max_hold_seconds_be if be_active else int(self.max_hold_seconds)
-                    roi_thr = float(self.min_roi_time_close)
-                    if hold_sec >= max_hold:
-                        cond = (roi < max(roi_thr, 0.0)) if self.time_stop_only_if_loss else (roi < roi_thr)
-                        if cond:
-                            self._exit_position(price, f"Time Stop (hold>={max_hold}s & roi<{roi_thr*100:.2f}%)", now_ts=now_ts)
-                            return
+                up_prob = self.ml.predict_up_prob(self.df.iloc[: i + 1])
             except Exception:
-                pass
+                up_prob = None
+            if up_prob is not None:
+                ml_ok_long = up_prob >= self.cfg.ml.up_prob_long
+                ml_ok_short = up_prob <= (1.0 - self.cfg.ml.down_prob_short)
+        if self.cfg.ml.strict:
+            dec_long = base_long and ml_ok_long
+            dec_short = base_short and ml_ok_short
+        else:
+            dec_long = base_long and (not getattr(self.ml, "use_ml", False) or ml_ok_long or up_prob is None)
+            dec_short = base_short and (not getattr(self.ml, "use_ml", False) or ml_ok_short or up_prob is None)
 
-            # BE + Trailing + exit
-            self._apply_breakeven(price)
-            self._update_trailing(price, atr)
-            ex, rs = self._should_exit(price)
-            if ex:
-                self._exit_position(price, rs or "Exit", now_ts=now_ts)
-                return
-
-        # ---------------- FILTERS (untuk ENTRY BARU) ----------------
-        atr_pct = (atr / max(price, 1e-9))
-        min_atr_pct = _to_float(self.config.get("min_atr_pct", DEFAULTS["min_atr_pct"]), DEFAULTS["min_atr_pct"])
-        max_atr_pct = _to_float(self.config.get("max_atr_pct", DEFAULTS["max_atr_pct"]), DEFAULTS["max_atr_pct"])
-        max_body_atr = _to_float(self.config.get("max_body_atr", DEFAULTS["max_body_atr"]), DEFAULTS["max_body_atr"])
-        body_atr_val = float(last.get("body_atr", np.inf))
-        body_atr_ok = bool(body_atr_val <= max_body_atr)
-        atr_ok = (atr_pct >= min_atr_pct) and (atr_pct <= max_atr_pct)
-
-        # Debug-mode relax
-        if self.debug_mode and self.relax_on_debug:
-            min_atr_pct = min(min_atr_pct, self.min_atr_pct_debug)
-            max_body_atr = max(max_body_atr, self.max_body_atr_debug)
-            body_atr_ok = bool(body_atr_val <= max_body_atr)
-            atr_ok = (atr_pct >= min_atr_pct) and (atr_pct <= max_atr_pct)
-
-        # Auto-relax (debug)
-        self._flt_hist.append(1 if (atr_ok and body_atr_ok) else 0)
-        if self.debug_mode and self._flt_hist.maxlen is not None and len(self._flt_hist) >= self._flt_hist.maxlen:
-            pass_ratio = sum(self._flt_hist) / len(self._flt_hist)
-            if pass_ratio < self._flt_relax_ratio:
-                old_min, old_maxb = min_atr_pct, max_body_atr
-                min_atr_pct *= self._flt_relax_factor
-                max_body_atr *= (1.0 / self._flt_relax_factor)
-                body_atr_ok = bool(body_atr_val <= max_body_atr)
-                atr_ok = (atr_pct >= min_atr_pct) and (atr_pct <= max_atr_pct)
-                self._log(f"FILTER_AUTO_RELAX pass_ratio={pass_ratio:.2f} "
-                        f"min_atr: {old_min:.4f}->{min_atr_pct:.4f} "
-                        f"max_body_atr: {old_maxb:.2f}->{max_body_atr:.2f}")
-
-        # Bypass (debug)
-        if self.bypass_filters:
-            atr_ok = True
-            body_atr_ok = True
-
-        # Jika gagal filter → jangan entry; (posisi sudah dikelola di atas)
-        if not (atr_ok and body_atr_ok):
-            if self.debug_mode:
-                self._log(
-                    "FILTER_VALS "
-                    f"price={price:.6f} atr={atr:.6f} atr_pct={atr_pct*100:.3f}% "
-                    f"min_atr={min_atr_pct*100:.3f}% max_atr={max_atr_pct*100:.3f}% "
-                    f"body_atr={body_atr_val:.3f} max_body_atr={max_body_atr:.3f}"
-                )
-                reasons = []
-                if not atr_ok: reasons.append("ATR")
-                if not body_atr_ok: reasons.append("BODY")
-                self._log(f"FILTER_FAIL reason={'+'.join(reasons)}")
-            # kalau ada posisi, kita sudah RETURN di blok manajemen atas;
-            # di sini cukup hentikan entry baru saja
-            self._log(f"FILTER BLOCK atr_ok={atr_ok} body_ok={body_atr_ok} price={price:.6f} pos={self.pos.side}")
-            return
-        # -------------- END FILTERS --------------     
-
-        # Base sinyal
-        base_long = (bool(last["macd"] > last["macd_sig"]) and bool(last["rsi"] > 52) and bool(last["ema_fast"] > last["ema_slow"]))
-        base_short = (bool(last["macd"] < last["macd_sig"]) and bool(last["rsi"] < 48) and bool(last["ema_fast"] < last["ema_slow"]))
-
-        # Trend filter
-        if self.trend_filter_mode in ("ema200", "ema200_adx"):
-            if base_long and not (bool(last["ema_fast"] > last["ema_slow"]) and bool(last["ema_slow"] > last["ema_200"])):
-                base_long = False
-            if base_short and not (bool(last["ema_fast"] < last["ema_slow"]) and bool(last["ema_slow"] < last["ema_200"])):
-                base_short = False
-        if self.trend_filter_mode == "ema200_adx":
-            if float(last.get("adx", 0.0) or 0.0) < self.adx_thresh:
-                base_long = False
-                base_short = False
-
-        # ML (opsional)
-        up_prob = None
-        try:
-            self.ml.fit_if_needed(d)
-            up_prob = self.ml.predict_up_prob(d)
-        except Exception:
-            up_prob = None
-        long_sig, short_sig = self.ml.score_and_decide(base_long, base_short, up_prob)
-
+        # Decision log
+        up_txt = f"{up_prob:.3f}" if up_prob is not None else "n/a"
         self._log(
-            f"DECISION price={price:.6f} base(L={base_long},S={base_short}) "
-            f"adx={float(last.get('adx',0.0)):.2f} up_prob={'n/a' if up_prob is None else round(up_prob,3)} "
-            f"-> L={long_sig} S={short_sig} pos={self.pos.side}"
+            f"DECISION price={price:.4f} base(L={base_long},S={base_short}) adx={adx_v:.2f} up_prob={up_txt} "
+            f"-> L={dec_long} S={dec_short} pos={self.pos if self.pos else 'None'}"
         )
 
-        # Entry
-        if not self.pos.side and not self._cooldown_active(now_ts):
-            if long_sig:
-                self._enter_position("LONG", price, atr, balance, now_ts=now_ts)
-            elif short_sig:
-                self._enter_position("SHORT", price, atr, balance, now_ts=now_ts)
+        # Manage open position (update BE/TSL/exit)
+        if self.pos:
+            self._manage_open(price, adx_v)
+
+        # Entries
+        if self.pos is None:
+            if dec_long:
+                self._enter("LONG", price, atr_v)
+            elif dec_short:
+                self._enter("SHORT", price, atr_v)
+
+    # --------------------------------------------
+    # Position handling
+    # --------------------------------------------
+    def _enter(self, side: str, price: float, atr_v: float):
+        # Risk in USDT
+        risk_usdt = self.balance * self.risk_pct
+        sl_dist_pct = self.cfg.sl_pct
+        if side == "LONG":
+            sl = price * (1.0 - sl_dist_pct)
+        else:
+            sl = price * (1.0 + sl_dist_pct)
+        # qty = risk / (price * sl_dist_pct)
+        qty = risk_usdt / max(1e-12, price * sl_dist_pct)
+        qty = float(round(qty, 3))
+
+        self.pos = side
+        self.entry_price = float(price)
+        self.entry_ts = self.current_ts
+        self.hard_sl = float(sl)
+        self.sl = float(sl)
+        self.tsl = None
+        self.qty = qty
+        self.be_triggered = False
+        self.last_sl_type = "HARD"
+
+        self._log(
+            f"SIZING price={price:.4f} qty={qty:.3f} sl={sl:.6f} sl_dist%={sl_dist_pct*100:.2f} "
+            f"risk_usdt={risk_usdt:.4f} theo_loss_at_sl={risk_usdt:.4f}"
+        )
+        self._log(f"ENTRY {side} price={price:.4f} qty={qty:.6f} sl={sl:.6f}")
+
+    def _manage_open(self, price: float, adx_v: float):
+        assert self.pos in ("LONG", "SHORT") and self.entry_price is not None and self.sl is not None
+        side = self.pos
+        entry = self.entry_price
+        sl = self.sl
+        hard_sl = self.hard_sl if self.hard_sl is not None else sl
+
+        # R multiple calc (based on initial hard SL)
+        r_denom = (entry - hard_sl) if side == "LONG" else (hard_sl - entry)
+        r_denom = max(1e-12, r_denom)
+        r_mult = (price - entry) / r_denom if side == "LONG" else (entry - price) / r_denom
+
+        # BE move based on R threshold
+        if not self.be_triggered and r_mult >= self.cfg.be_trigger_r:
+            # move SL to BE
+            new_sl = entry if side == "LONG" else entry
+            self.sl = new_sl
+            self.be_triggered = True
+            self.last_sl_type = "BE"
+            self._log(f"BE MOVE SL -> {new_sl:.6f}")
+
+        # Trailing step via ADX
+        step = self._trail_step_from_adx(adx_v)
+        moved = False
+        if side == "LONG":
+            candidate = price * (1.0 - step)
+            if self.tsl is None or candidate > self.tsl:
+                self.tsl = candidate
+                moved = True
+        else:  # SHORT
+            candidate = price * (1.0 + step)
+            if self.tsl is None or candidate < self.tsl:
+                self.tsl = candidate
+                moved = True
+        if moved:
+            self.last_sl_type = "TSL"
+            self._log(f"TRAIL MOVE tsl={self.tsl:.6f} (step={step*100:.3f}%)")
+
+        # Exit checks (order: hard SL, trailing SL, time-stop)
+        # For logs, classify reason based on which level is hit.
+        reason = None
+        if side == "LONG":
+            if price <= hard_sl:
+                reason = "Hit Hard SL"
+            elif self.tsl is not None and price <= self.tsl:
+                reason = "Hit Trailing SL"
+        else:
+            if price >= hard_sl:
+                reason = "Hit Hard SL"
+            elif self.tsl is not None and price >= self.tsl:
+                reason = "Hit Trailing SL"
+
+        # Time stop (adaptive by ADX)
+        hold_seconds = int((self.current_ts - self.entry_ts).total_seconds()) if self.entry_ts is not None else 0
+        max_hold = self.max_hold_seconds
+        if adx_v > self.cfg.time_stop.extend_when_adx_gt:
+            max_hold = int(max_hold * self.cfg.time_stop.extend_factor)
+        # ROI (approx per-price, before fees)
+        roi = (price - entry) / entry if side == "LONG" else (entry - price) / entry
+        min_roi = float(self.min_roi_time_close)
+        if hold_seconds >= max_hold and roi < min_roi:
+            reason = f"Time Stop (hold>={max_hold}s & roi<{min_roi*100:.2f}%)"
+
+        if reason:
+            self._log(f"EXIT {reason} price={price:.4f}")
+            # Reset position
+            self.pos = None
+            self.entry_price = None
+            self.entry_ts = None
+            self.hard_sl = None
+            self.sl = None
+            self.tsl = None
+            self.qty = 0.0
+            self.be_triggered = False
+            self.last_sl_type = "HARD"
+
+    def _trail_step_from_adx(self, adx_v: float) -> float:
+        if not self.cfg.trail.use_adx_step:
+            return self.cfg.trail.max_step_pct
+        lo, hi = self.cfg.trail.adx_bounds
+        t = clamp((adx_v - lo) / max(1e-9, (hi - lo)), 0.0, 1.0)
+        return lerp(self.cfg.trail.min_step_pct, self.cfg.trail.max_step_pct, t)
 
 
-# ============================ Manager ============================
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
 
-class TradingManager:
-    def __init__(self, coin_config_path: str, symbols: List[str]):
-        self.symbols = symbols
-        self.config_map = self._load_config(coin_config_path)
-        self.traders: Dict[str, CoinTrader] = {sym: CoinTrader(sym, self.config_map.get(sym, {})) for sym in symbols}
-
-    def _load_config(self, path: str) -> Dict[str, Dict[str, Any]]:
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def run_once(self, data_map: Dict[str, pd.DataFrame], balances: Dict[str, float]) -> None:
-        for sym, df in data_map.items():
-            if sym not in self.traders:
-                self.traders[sym] = CoinTrader(sym, self.config_map.get(sym, {}))
-            bal = float(balances.get(sym, 0.0))
-            self.traders[sym].check_trading_signals(df, bal)
+def dataclasses_to_dict(cfg: CoinCfg) -> Dict[str, Any]:
+    def _dc(obj):
+        if dc.is_dataclass(obj):
+            return {k: _dc(v) for k, v in obj.__dict__.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_dc(x) for x in obj]
+        return obj
+    return _dc(cfg) # type: ignore
 
 
-# ============================ CLI ============================
+def load_coin_cfg(path: Optional[str], symbol: str) -> CoinCfg:
+    # Defaults from env if present
+    base = {
+        "min_atr_pct": float(env("MIN_ATR_PCT", 0.0030)),
+        "max_body_to_atr": float(env("MAX_BODY_TO_ATR", 1.50)),
+        "sl_pct": float(env("SL_PCT", 0.012)),
+        "be_trigger_r": float(env("BE_TRIGGER_R", 0.5)),
+        "trail": {
+            "use_adx_step": bool(env("TRAIL_STEP_BY_ADX", True, bool)),
+            "min_step_pct": float(env("TRAIL_MIN_STEP_PCT", 0.006)),
+            "max_step_pct": float(env("TRAIL_MAX_STEP_PCT", 0.012)),
+            # parse "20,60"
+            "adx_bounds": tuple(
+                float(x) for x in str(env("TRAIL_ADX_BOUNDS", "20,60")).split(",")[:2]
+            ),
+        },
+        "time_stop": {
+            "max_hold_seconds": int(env("MAX_HOLD_SECONDS", 3600)),
+            "min_roi_to_close": float(env("MIN_ROI_TO_CLOSE_BY_TIME", 0.0)),
+            "extend_when_adx_gt": float(env("TIME_STOP_EXTEND_ADX", 40.0)),
+            "extend_factor": float(env("TIME_STOP_EXTEND_FACTOR", 1.5)),
+        },
+        "ml": {
+            "strict": bool(env("ML_STRICT", False, bool)),
+            "up_prob_long": float(env("ML_UP_PROB", 0.60)),
+            "down_prob_short": float(env("ML_DOWN_PROB", 0.40)),
+            "score_threshold": float(env("SCORE_THRESHOLD", 1.40)),
+        },
+        "filter": {
+            "base_min_atr": float(env("MIN_ATR_PCT", 0.0030)),
+            "base_max_body": float(env("MAX_BODY_TO_ATR", 1.50)),
+            "target_pass_ratio": float(env("FILTER_TARGET_PASS_RATIO", 0.35)),
+            "hysteresis_tighten": float(env("FILTER_HYSTERESIS_TIGHTEN", 0.55)),
+            "relax_step_atr": float(env("FILTER_RELAX_STEP_ATR", 0.0001)),
+            "relax_step_body": float(env("FILTER_RELAX_STEP_BODY", 0.05)),
+            "max_relax_atr": float(env("FILTER_MAX_RELAX_ATR", 0.0023)),
+            "max_relax_body": float(env("FILTER_MAX_RELAX_BODY", 2.00)),
+        },
+    }
 
-def _load_csv_sorted(path: str) -> pd.DataFrame:
+    if path and os.path.exists(path):
+        with open(path, "r") as f:
+            data = json.load(f)
+        cfg_d = data.get(symbol, {}) if isinstance(data, dict) else {}
+        # merge base <- cfg_d
+        def deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+            x = dict(a)
+            for k, v in b.items():
+                if isinstance(v, dict) and isinstance(x.get(k), dict):
+                    x[k] = deep_merge(x[k], v)
+                else:
+                    x[k] = v
+            return x
+        base = deep_merge(base, cfg_d)
+
+    return CoinCfg.from_dict(base)
+
+
+# --------------------------------------------------------------------------------------
+# CSV Loader
+# --------------------------------------------------------------------------------------
+
+def load_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    if "timestamp" not in df.columns:
-        if "open_time" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
-        elif "date" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["date"], errors="coerce")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    # Expected columns: timestamp or open_time, open, high, low, close, volume
+    # Try to infer timestamp column
+    ts_col = None
+    for cand in ("timestamp", "open_time", "time", "date"):
+        if cand in df.columns:
+            ts_col = cand
+            break
+    if ts_col is None:
+        raise ValueError("CSV must have a timestamp column")
+    df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+    df = df.set_index(ts_col).sort_index()
+    # Normalize columns to lowercase
+    rename = {c: c.lower() for c in df.columns}
+    df = df.rename(columns=rename)
+    needed = ["open", "high", "low", "close"]
+    for c in needed:
+        if c not in df.columns:
+            raise ValueError(f"CSV missing column: {c}")
     return df
 
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--coin_config", default="coin_config.json")
-    ap.add_argument("--symbol", required=False, default=None)
-    ap.add_argument("--csv", required=False, default=None)
-    ap.add_argument("--balance", type=float, default=20.0)
-    ap.add_argument("--verbose", action="store_true")
+    p = argparse.ArgumentParser()
+    p.add_argument("--coin_config", type=str, default=None)
+    p.add_argument("--csv", type=str, required=True)
+    p.add_argument("--symbol", type=str, required=True)
+    p.add_argument("--balance", type=float, default=20.0)
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--debug-mode", action="store_true")
+    p.add_argument("--dry-run-loop", action="store_true")
+    p.add_argument("--sleep", type=float, default=0.0)
+    p.add_argument("--limit", type=int, default=500)
+    p.add_argument("--warmup", type=int, default=410)
+    args = p.parse_args()
 
-    ap.add_argument("--dry-run-loop", action="store_true")
-    ap.add_argument("--sleep", type=float, default=0.0)
-    ap.add_argument("--limit", type=int, default=0)
+    symbol = args.symbol.upper()
+    df = load_csv(args.csv)
+    cfg = load_coin_cfg(args.coin_config, symbol)
 
-    # >>> PATCH: opsi debug & bypass filter
-    ap.add_argument("--debug-mode", action="store_true", help="Tampilkan nilai filter & alasan gagal")
-    ap.add_argument("--bypass-filters", action="store_true", help="(Debug) Lewati filter ATR/body/HTF")
+    trader = Trader(symbol, df, cfg, balance=args.balance, verbose=args.verbose, debug=args.debug_mode)
 
-    args = ap.parse_args()
+    start = args.warmup
+    limit = args.limit
 
-    if args.verbose:
-        os.environ["VERBOSE"] = "1"
-
-    # Set env flag agar bisa dibaca trader
-    if args.debug_mode:
-        os.environ["DEBUG_MODE"] = "1"
-    if args.bypass_filters:
-        os.environ["BYPASS_FILTERS"] = "1"
-
-    if args.csv and os.path.exists(args.csv):
-        df = _load_csv_sorted(args.csv)
-        sym = (args.symbol or "").upper() or "SYMBOL"
-
-        if args.dry_run_loop:
-            min_train = int(float(os.getenv("ML_MIN_TRAIN_BARS", "400")))
-            warmup = max(300, min_train + 10)
-            start_i = min(warmup, len(df) - 1)
-            steps = 0
-
-            mgr = TradingManager(args.coin_config, [sym])
-            # aktifkan verbose/debug untuk trader
-            for t in mgr.traders.values():
-                if args.verbose:
-                    t.verbose = True
-                t.debug_mode = bool(args.debug_mode) or _to_bool(os.getenv("DEBUG_MODE", "0"), False)
-                t.bypass_filters = bool(args.bypass_filters) or _to_bool(os.getenv("BYPASS_FILTERS", "0"), False)
-
-            for i in range(start_i, len(df)):
-                data_map = {sym: df.iloc[:i + 1].copy()}
-                mgr.run_once(data_map, {sym: args.balance})
-                steps += 1
-                if args.limit and steps >= args.limit:
-                    break
-                if args.sleep and args.sleep > 0:
-                    time.sleep(args.sleep)
-            last_side = mgr.traders[sym].pos.side if sym in mgr.traders else None
-            print(f"Dry-run completed: {steps} steps (start={start_i}, total_bars={len(df)}). Last position: {last_side}")
-        else:
-            data_map = {sym: df}
-            mgr = TradingManager(args.coin_config, [sym])
-            if args.verbose and sym in mgr.traders:
-                mgr.traders[sym].verbose = True
-            mgr.run_once(data_map, {sym: args.balance})
-            print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
+    if args.dry_run_loop:
+        trader.run(start, limit)
     else:
-        print("Tidak ada CSV yang diberikan. Gunakan --csv untuk simulasi dry-run.")
+        trader.run(start, limit)
 
 
 if __name__ == "__main__":

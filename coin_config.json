@@ -4,9 +4,9 @@
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
 
-    "min_atr_pct": 0.0065,
+    "min_atr_pct": 0.0026,
     "max_atr_pct": 0.040,
-    "max_body_atr": 1.20,
+    "max_body_atr": 1.75,
     "use_htf_filter": 0,
 
     "cooldown_seconds": 1200,
@@ -16,6 +16,28 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
+
+    "be_trigger_r": 0.5,
+    "trail": {
+      "use_adx_step": true,
+      "min_step_pct": 0.006,
+      "max_step_pct": 0.012,
+      "adx_bounds": [20, 60]
+    },
+
+    "time_stop": {
+      "max_hold_seconds": 3600,
+      "min_roi_to_close": -0.002,
+      "extend_when_adx_gt": 40,
+      "extend_factor": 1.5
+    },
+
+    "ml": {
+      "strict": true,
+      "up_prob_long": 0.60,
+      "down_prob_short": 0.40,
+      "score_threshold": 1.40
+    },
 
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
