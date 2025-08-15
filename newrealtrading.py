@@ -128,8 +128,8 @@ def _ema(s: pd.Series, window: int) -> pd.Series:
 def _rsi(close: pd.Series, window: int = 14) -> pd.Series:
     c = pd.Series(pd.to_numeric(close, errors="coerce"))
     delta = c.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
+    up = np.where(delta.gt(0), delta, 0.0)
+    down = np.where(delta.lt(0), -delta, 0.0)
     roll_up = pd.Series(up).ewm(alpha=1/window, adjust=False).mean()
     roll_down = pd.Series(down).ewm(alpha=1/window, adjust=False).mean()
     rs = roll_up / roll_down.replace(0.0, np.nan)
@@ -162,8 +162,8 @@ def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     up_move = h.diff()
     down_move = -l.diff()
 
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm = np.where((up_move > down_move) & (up_move.gt(0)), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move.gt(0)), down_move, 0.0)
 
     tr1 = (h - l)
     tr2 = (h - c.shift(1)).abs()
@@ -362,23 +362,23 @@ class CoinTrader:
 
     # ------------------------ BE & Trailing -------------------------
     def _apply_breakeven(self, price: float) -> None:
-        if not (self.pos and self.pos.side and self.pos.entry):
-            return
-        if not _to_bool(self.config.get("use_breakeven", DEFAULTS["use_breakeven"]), DEFAULTS["use_breakeven"]):
-            return
+        if not (self.pos and self.pos.side and self.pos.entry): return
+        if not _to_bool(self.config.get("use_breakeven", DEFAULTS["use_breakeven"]), DEFAULTS["use_breakeven"]): return
         be_trg = _to_float(self.config.get("be_trigger_pct", DEFAULTS["be_trigger_pct"]), DEFAULTS["be_trigger_pct"])
-        be_off = _to_float(self.config.get("be_offset_pct", DEFAULTS["be_offset_pct"]), DEFAULTS["be_offset_pct"])
+        be_off = _to_float(self.config.get("be_offset_pct",  DEFAULTS["be_offset_pct"]),  DEFAULTS["be_offset_pct"])
         ent = float(self.pos.entry)
         if self.pos.side == "LONG":
-            if (price - ent) / ent >= be_trg:
+            if (price - ent)/ent >= be_trg:
                 new_sl = ent * (1 + be_off)
                 if not self.pos.sl or new_sl > self.pos.sl:
                     self.pos.sl = new_sl
+                    self._log(f"BE MOVE SL -> {self.pos.sl:.6f}")
         else:
-            if (ent - price) / ent >= be_trg:
+            if (ent - price)/ent >= be_trg:
                 new_sl = ent * (1 - be_off)
                 if not self.pos.sl or new_sl < self.pos.sl:
                     self.pos.sl = new_sl
+                    self._log(f"BE MOVE SL -> {self.pos.sl:.6f}")
 
     def _update_trailing(self, price: float, atr: float) -> None:
         if not (self.pos and self.pos.side and self.pos.entry):
@@ -403,12 +403,16 @@ class CoinTrader:
         k = _to_float(self.config.get("trail_atr_k", DEFAULTS["trail_atr_k"]), DEFAULTS["trail_atr_k"])
         dyn_step = max(step_min, min(step_max, k * atr_pct_now))
 
+        prev = self.pos.trailing_sl
         if self.pos.side == "LONG":
-            new_tsl = price * (1.0 - dyn_step / 100.0)
+            new_tsl = price * (1.0 - dyn_step/100.0)
             self.pos.trailing_sl = max(self.pos.trailing_sl or 0.0, new_tsl)
         else:
-            new_tsl = price * (1.0 + dyn_step / 100.0)
+            new_tsl = price * (1.0 + dyn_step/100.0)
             self.pos.trailing_sl = min(self.pos.trailing_sl or 1e12, new_tsl)
+
+        if prev != self.pos.trailing_sl:
+            self._log(f"TRAIL MOVE tsl={self.pos.trailing_sl:.6f} (step={dyn_step:.3f}%)")
 
     # --------------------------- Exit check -------------------------
     def _should_exit(self, price: float) -> Tuple[bool, Optional[str]]:
@@ -534,11 +538,45 @@ class CoinTrader:
         d = calculate_indicators(df, adx_period=self.adx_period)
         last = d.iloc[-1]
         price = float(last["close"])
-        atr = float(last.get("atr", 0.0) or 0.0)
+        atr   = float(last.get("atr", 0.0) or 0.0)
         last_ts = last["timestamp"] if "timestamp" in last else None
         now_ts = self._now_ts(last_ts)
 
-        # ---------------- FILTERS ----------------
+        # === 1) ALWAYS MANAGE OPEN POSITION, even if next filter fails ===
+        if self.pos.side:
+            # Early Stop (jika ON)
+            if self._early_stop_check(d, now_ts):
+                return
+
+            # Time Stop v2
+            try:
+                if self.pos.entry_time is not None:
+                    hold_sec = max(0.0, float(now_ts) - float(self.pos.entry_time.timestamp()))
+                    ent = float(self.pos.entry or price)
+                    roi = (price - ent)/ent if self.pos.side == "LONG" else (ent - price)/ent
+                    be_active = False
+                    if self.pos.sl is not None:
+                        if self.pos.side == "LONG"  and self.pos.sl >= ent: be_active = True
+                        if self.pos.side == "SHORT" and self.pos.sl <= ent: be_active = True
+                    max_hold = self.max_hold_seconds_be if be_active else int(self.max_hold_seconds)
+                    roi_thr = float(self.min_roi_time_close)
+                    if hold_sec >= max_hold:
+                        cond = (roi < max(roi_thr, 0.0)) if self.time_stop_only_if_loss else (roi < roi_thr)
+                        if cond:
+                            self._exit_position(price, f"Time Stop (hold>={max_hold}s & roi<{roi_thr*100:.2f}%)", now_ts=now_ts)
+                            return
+            except Exception:
+                pass
+
+            # BE + Trailing + exit
+            self._apply_breakeven(price)
+            self._update_trailing(price, atr)
+            ex, rs = self._should_exit(price)
+            if ex:
+                self._exit_position(price, rs or "Exit", now_ts=now_ts)
+                return
+
+        # ---------------- FILTERS (untuk ENTRY BARU) ----------------
         atr_pct = (atr / max(price, 1e-9))
         min_atr_pct = _to_float(self.config.get("min_atr_pct", DEFAULTS["min_atr_pct"]), DEFAULTS["min_atr_pct"])
         max_atr_pct = _to_float(self.config.get("max_atr_pct", DEFAULTS["max_atr_pct"]), DEFAULTS["max_atr_pct"])
@@ -554,26 +592,26 @@ class CoinTrader:
             body_atr_ok = bool(body_atr_val <= max_body_atr)
             atr_ok = (atr_pct >= min_atr_pct) and (atr_pct <= max_atr_pct)
 
-        # Auto-relax jika pass-ratio rendah (debug saja)
+        # Auto-relax (debug)
         self._flt_hist.append(1 if (atr_ok and body_atr_ok) else 0)
-        if self.debug_mode and len(self._flt_hist) >= self._flt_hist.maxlen:
+        if self.debug_mode and self._flt_hist.maxlen is not None and len(self._flt_hist) >= self._flt_hist.maxlen:
             pass_ratio = sum(self._flt_hist) / len(self._flt_hist)
             if pass_ratio < self._flt_relax_ratio:
-                old_min = min_atr_pct
-                old_maxb = max_body_atr
-                min_atr_pct *= self._flt_relax_factor           # turunkan lower bound ATR
-                max_body_atr *= (1.0 / self._flt_relax_factor)  # naikkan toleransi body/ATR
+                old_min, old_maxb = min_atr_pct, max_body_atr
+                min_atr_pct *= self._flt_relax_factor
+                max_body_atr *= (1.0 / self._flt_relax_factor)
                 body_atr_ok = bool(body_atr_val <= max_body_atr)
                 atr_ok = (atr_pct >= min_atr_pct) and (atr_pct <= max_atr_pct)
                 self._log(f"FILTER_AUTO_RELAX pass_ratio={pass_ratio:.2f} "
-                          f"min_atr: {old_min:.4f}->{min_atr_pct:.4f} "
-                          f"max_body_atr: {old_maxb:.2f}->{max_body_atr:.2f}")
+                        f"min_atr: {old_min:.4f}->{min_atr_pct:.4f} "
+                        f"max_body_atr: {old_maxb:.2f}->{max_body_atr:.2f}")
 
         # Bypass (debug)
         if self.bypass_filters:
             atr_ok = True
             body_atr_ok = True
 
+        # Jika gagal filter → jangan entry; (posisi sudah dikelola di atas)
         if not (atr_ok and body_atr_ok):
             if self.debug_mode:
                 self._log(
@@ -583,58 +621,14 @@ class CoinTrader:
                     f"body_atr={body_atr_val:.3f} max_body_atr={max_body_atr:.3f}"
                 )
                 reasons = []
-                if not atr_ok:
-                    reasons.append("ATR")
-                if not body_atr_ok:
-                    reasons.append("BODY")
+                if not atr_ok: reasons.append("ATR")
+                if not body_atr_ok: reasons.append("BODY")
                 self._log(f"FILTER_FAIL reason={'+'.join(reasons)}")
-            # tetap kelola posisi aktif (BE/TSL) walau bar gagal
-            if self.pos.side:
-                self._apply_breakeven(price)
-                self._update_trailing(price, atr)
-                ex, rs = self._should_exit(price)
-                if ex:
-                    self._exit_position(price, rs or "Filter Fail", now_ts=now_ts)
-            else:
-                self._log(f"FILTER BLOCK atr_ok={atr_ok} body_ok={body_atr_ok} price={price:.6f} pos={self.pos.side}")
+            # kalau ada posisi, kita sudah RETURN di blok manajemen atas;
+            # di sini cukup hentikan entry baru saja
+            self._log(f"FILTER BLOCK atr_ok={atr_ok} body_ok={body_atr_ok} price={price:.6f} pos={self.pos.side}")
             return
-        # -------------- END FILTERS --------------
-
-        # Kelola posisi aktif (setelah lolos filter)
-        if self.pos.side:
-            # Early stop (jika ON)
-            if self._early_stop_check(d, now_ts):
-                return
-
-            # Time Stop v2
-            try:
-                if self.pos.entry_time is not None:
-                    hold_sec = max(0.0, float(now_ts) - float(self.pos.entry_time.timestamp()))
-                    ent = float(self.pos.entry or price)
-                    roi = (price - ent) / ent if self.pos.side == "LONG" else (ent - price) / ent
-                    be_active = False
-                    if self.pos.sl is not None:
-                        if self.pos.side == "LONG" and self.pos.sl >= ent:
-                            be_active = True
-                        if self.pos.side == "SHORT" and self.pos.sl <= ent:
-                            be_active = True
-                    max_hold = self.max_hold_seconds_be if be_active else int(self.max_hold_seconds)
-                    roi_thr = float(self.min_roi_time_close)
-                    if hold_sec >= max_hold:
-                        cond = (roi < max(roi_thr, 0.0)) if self.time_stop_only_if_loss else (roi < roi_thr)
-                        if cond:
-                            self._exit_position(price, f"Time Stop (hold>={max_hold}s & roi<{roi_thr*100:.2f}%)", now_ts=now_ts)
-                            return
-            except Exception:
-                pass
-
-            # BE + trailing + exit
-            self._apply_breakeven(price)
-            self._update_trailing(price, atr)
-            ex, rs = self._should_exit(price)
-            if ex:
-                self._exit_position(price, rs or "Exit", now_ts=now_ts)
-                return
+        # -------------- END FILTERS --------------     
 
         # Base sinyal
         base_long = (bool(last["macd"] > last["macd_sig"]) and bool(last["rsi"] > 52) and bool(last["ema_fast"] > last["ema_slow"]))

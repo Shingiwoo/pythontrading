@@ -5,8 +5,8 @@
     "taker_fee": 0.0005,
 
     "min_atr_pct": 0.0065,
-    "max_atr_pct": 0.030,
-    "max_body_atr": 1.0,
+    "max_atr_pct": 0.040,
+    "max_body_atr": 1.20,
     "use_htf_filter": 0,
 
     "cooldown_seconds": 1200,
