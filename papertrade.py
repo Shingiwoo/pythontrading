@@ -235,7 +235,7 @@ class JournaledCoinTrader(CoinTrader):
         # Jika benar-benar masuk (qty > 0 & ada side)
         if self.pos.side and self.pos.qty > 0 and self.pos.qty != before_qty:
             self.journal.on_entry(
-                self.symbol, self.pos.side, self.pos.entry, self.pos.qty,
+                self.symbol, self.pos.side, self.pos.entry if self.pos.entry is not None else 0.0, self.pos.qty,
                 self.pos.sl, self.pos.trailing_sl
             )
 
