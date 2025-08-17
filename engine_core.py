@@ -193,7 +193,10 @@ def step_trailing(side: str, bar: pd.Series, prev_state: Dict[str, Optional[floa
     step = _to_float(coin_cfg.get('trailing_step', 0.45), 0.45)
     entry = prev_state.get('entry', 0.0)
     price = float(bar['close'])
-    profit_pct = (price-entry)/entry*100 if side=='LONG' else (entry-price)/entry*100
+    if entry is None or price is None or entry == 0:
+        profit_pct = 0.0
+    else:
+        profit_pct = (price - entry) / entry * 100 if side == 'LONG' else (entry - price) / entry * 100
     if profit_pct < trigger:
         return prev_state.get('tsl')
     if side=='LONG':
