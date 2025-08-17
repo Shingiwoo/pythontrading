@@ -67,9 +67,9 @@
     "leverage": 15,
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
-    "min_atr_pct": 0.0065,
-    "max_atr_pct": 0.03,
-    "max_body_atr": 1.0,
+    "min_atr_pct": 0.0026,
+    "max_atr_pct": 0.04,
+    "max_body_atr": 1.75,
     "use_htf_filter": 0,
     "cooldown_seconds": 1200,
     "sl_mode": "ATR",
@@ -77,6 +77,28 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
+    "be_trigger_r": 0.5,
+    "trail": {
+      "use_adx_step": true,
+      "min_step_pct": 0.006,
+      "max_step_pct": 0.012,
+      "adx_bounds": [
+        20,
+        60
+      ]
+    },
+    "time_stop": {
+      "max_hold_seconds": 3600,
+      "min_roi_to_close": -0.002,
+      "extend_when_adx_gt": 40,
+      "extend_factor": 1.5
+    },
+    "ml": {
+      "strict": true,
+      "up_prob_long": 0.6,
+      "down_prob_short": 0.4,
+      "score_threshold": 1.4
+    },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
     "be_offset_pct": 0.0008,
@@ -109,9 +131,9 @@
     "leverage": 15,
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
-    "min_atr_pct": 0.0065,
-    "max_atr_pct": 0.03,
-    "max_body_atr": 1.0,
+    "min_atr_pct": 0.0026,
+    "max_atr_pct": 0.04,
+    "max_body_atr": 1.75,
     "use_htf_filter": 0,
     "cooldown_seconds": 1200,
     "sl_mode": "ATR",
@@ -119,6 +141,28 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
+    "be_trigger_r": 0.5,
+    "trail": {
+      "use_adx_step": true,
+      "min_step_pct": 0.006,
+      "max_step_pct": 0.012,
+      "adx_bounds": [
+        20,
+        60
+      ]
+    },
+    "time_stop": {
+      "max_hold_seconds": 3600,
+      "min_roi_to_close": -0.002,
+      "extend_when_adx_gt": 40,
+      "extend_factor": 1.5
+    },
+    "ml": {
+      "strict": true,
+      "up_prob_long": 0.6,
+      "down_prob_short": 0.4,
+      "score_threshold": 1.4
+    },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
     "be_offset_pct": 0.0008,
@@ -140,15 +184,20 @@
     "adx_thresh": 18.0,
     "cooldown_mul_hard_sl": 2.5,
     "cooldown_mul_trailing": 1.0,
-    "cooldown_mul_early_stop": 1.2
+    "cooldown_mul_early_stop": 1.2,
+    "stepSize": 1.0,
+    "minQty": 1.0,
+    "quantityPrecision": 0,
+    "minNotional": 5.0,
+    "SLIPPAGE_PCT": 0.02
   },
   "TURBOUSDT": {
     "leverage": 15,
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
-    "min_atr_pct": 0.0065,
-    "max_atr_pct": 0.03,
-    "max_body_atr": 1.0,
+    "min_atr_pct": 0.0026,
+    "max_atr_pct": 0.04,
+    "max_body_atr": 1.75,
     "use_htf_filter": 0,
     "cooldown_seconds": 1200,
     "sl_mode": "ATR",
@@ -156,6 +205,28 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
+    "be_trigger_r": 0.5,
+    "trail": {
+      "use_adx_step": true,
+      "min_step_pct": 0.006,
+      "max_step_pct": 0.012,
+      "adx_bounds": [
+        20,
+        60
+      ]
+    },
+    "time_stop": {
+      "max_hold_seconds": 3600,
+      "min_roi_to_close": -0.002,
+      "extend_when_adx_gt": 40,
+      "extend_factor": 1.5
+    },
+    "ml": {
+      "strict": true,
+      "up_prob_long": 0.6,
+      "down_prob_short": 0.4,
+      "score_threshold": 1.4
+    },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
     "be_offset_pct": 0.0008,
@@ -177,6 +248,11 @@
     "adx_thresh": 18.0,
     "cooldown_mul_hard_sl": 2.5,
     "cooldown_mul_trailing": 1.0,
-    "cooldown_mul_early_stop": 1.2
+    "cooldown_mul_early_stop": 1.2,
+    "stepSize": 1.0,
+    "minQty": 1.0,
+    "quantityPrecision": 0,
+    "minNotional": 5.0,
+    "SLIPPAGE_PCT": 0.02
   }
 }
