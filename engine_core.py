@@ -79,26 +79,45 @@ def merge_config(symbol: str, base_cfg: Dict[str, Any]) -> Dict[str, Any]:
 # -----------------------------------------------------
 def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
     d = df.copy()
+
+    # (opsional) Heikin Ashi
     if heikin:
         ha = d.copy()
-        ha['ha_close'] = (ha['open']+ha['high']+ha['low']+ha['close'])/4
-        ha['ha_open'] = ha['open'].shift(1)
-        ha['ha_open'].iloc[0] = (ha['open'].iloc[0]+ha['close'].iloc[0])/2
-        ha['ha_high'] = ha[['high','ha_open','ha_close']].max(axis=1)
-        ha['ha_low'] = ha[['low','ha_open','ha_close']].min(axis=1)
+        ha['ha_close'] = (ha['open'] + ha['high'] + ha['low'] + ha['close']) / 4
+        ha['ha_open']  = ha['open'].shift(1)
+        ha.loc[ha.index[0], 'ha_open'] = (ha.loc[ha.index[0], 'open'] + ha.loc[ha.index[0], 'close']) / 2
+        ha['ha_high']  = ha[['high','ha_open','ha_close']].max(axis=1)
+        ha['ha_low']   = ha[['low','ha_open','ha_close']].min(axis=1)
         d[['open','high','low','close']] = ha[['ha_open','ha_high','ha_low','ha_close']]
+
+    # TA utama
     d['ema'] = EMAIndicator(d['close'], 22).ema_indicator()
-    d['ma'] = SMAIndicator(d['close'], 20).sma_indicator()
-    macd = MACD(d['close']); d['macd']=macd.macd(); d['macd_signal']=macd.macd_signal()
-    rsi = RSIIndicator(d['close'], 25); d['rsi']=rsi.rsi()
+    d['ma']  = SMAIndicator(d['close'], 20).sma_indicator()
+    macd     = MACD(d['close'])
+    d['macd'] = macd.macd()
+    d['macd_signal'] = macd.macd_signal()
+    rsi = RSIIndicator(d['close'], 14)  # SAMA dengan backtester
+    d['rsi'] = rsi.rsi()
+
+    # ATR (EMA Wilder-ish)
     prev_close = d['close'].shift(1)
-    tr = pd.DataFrame({'a': d['high']-d['low'], 'b': (d['high']-prev_close).abs(), 'c': (d['low']-prev_close).abs()})
-    d['tr'] = tr.max(axis=1)
-    d['atr'] = d['tr'].ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    tr = pd.DataFrame({
+        'a': (d['high'] - d['low']).abs(),
+        'b': (d['high'] - prev_close).abs(),
+        'c': (d['low']  - prev_close).abs()
+    }).max(axis=1)
+    d['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     d['atr_pct'] = d['atr'] / d['close']
-    d['body_atr'] = (d['close']-d['open']).abs()/d['atr']
-    d['long_base'] = (d['ema']>d['ma']) & (d['macd']>d['macd_signal']) & d['rsi'].between(10,40)
-    d['short_base'] = (d['ema']<d['ma']) & (d['macd']<d['macd_signal']) & d['rsi'].between(70,90)
+
+    # Body / ATR
+    d['body'] = (d['close'] - d['open']).abs()
+    d['body_to_atr'] = d['body'] / d['atr']
+    d['body_atr']    = d['body_to_atr']  # alias, untuk backward compatibility
+
+    # Base signals (SAMA dengan backtester_scalping)
+    d['long_base']  = (d['ema'] > d['ma']) & (d['macd'] > d['macd_signal']) & d['rsi'].between(40, 70)
+    d['short_base'] = (d['ema'] < d['ma']) & (d['macd'] < d['macd_signal']) & d['rsi'].between(30, 60)
+
     return d
 
 def htf_trend_ok(side: str, base_df: pd.DataFrame) -> bool:
@@ -116,8 +135,14 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
     max_atr = _to_float(coin_cfg.get('max_atr_pct', 1.0), 1.0)
     max_body = _to_float(coin_cfg.get('max_body_atr', 999.0), 999.0)
     atr_ok = (ind['atr_pct'] >= min_atr) and (ind['atr_pct'] <= max_atr)
-    body_ok = (ind['body_atr'] <= max_body)
-    return atr_ok, body_ok, {'atr_pct': float(ind['atr_pct']), 'body_atr': float(ind['body_atr'])}
+
+    body_val = ind.get('body_to_atr', ind.get('body_atr'))
+    body_ok = (float(body_val) <= max_body) if body_val is not None else False
+
+    return atr_ok, body_ok, {
+        'atr_pct': float(ind['atr_pct']),
+        'body_to_atr': float(body_val) if body_val is not None else float('nan')
+    }
 
 def decide_base(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Dict[str, bool]:
     return {'L': bool(ind.get('long_base', False)), 'S': bool(ind.get('short_base', False))}
