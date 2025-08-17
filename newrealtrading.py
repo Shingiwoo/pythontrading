@@ -228,13 +228,18 @@ class CoinTrader:
     def check_trading_signals(self, df_raw: pd.DataFrame, balance: float) -> None:
         if df_raw is None or df_raw.empty:
             return
-        df = calculate_indicators(df_raw)
+        heikin = _to_bool(self.config.get('heikin', False), False)
+        df = calculate_indicators(df_raw, heikin=heikin)
         last = df.iloc[-1]
 
         # Filter ATR & body/ATR
         atr_ok = (last['atr_pct'] >= _to_float(self.config.get('min_atr_pct', DEFAULTS['min_atr_pct']), DEFAULTS['min_atr_pct'])) \
                  and (last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct']))
-        body_ok = (last['body_to_atr'] <= _to_float(self.config.get('max_body_atr', DEFAULTS['max_body_atr']), DEFAULTS['max_body_atr']))
+
+        # GUARD: pakai body_to_atr kalau ada, kalau tidak fallback ke body_atr
+        body_val = last.get('body_to_atr', last.get('body_atr'))
+        body_ok = (float(body_val) <= _to_float(self.config.get('max_body_atr', DEFAULTS['max_body_atr']), DEFAULTS['max_body_atr'])) if body_val is not None else False
+
         if not (atr_ok and body_ok):
             # kelola exit jika sudah di posisi
             if self.pos.side:
@@ -269,7 +274,8 @@ class CoinTrader:
         if self.ml.use_ml:
             self.ml.fit_if_needed(df)
             up_prob = self.ml.predict_up_prob(df)
-        self.ml.params.score_threshold = _to_float(self.config.get('SCORE_THRESHOLD', ENV_DEFAULTS['SCORE_THRESHOLD']), ENV_DEFAULTS['SCORE_THRESHOLD'])
+        score_thr = _to_float(self.config.get('ml', {}).get('score_threshold', self.config.get('SCORE_THRESHOLD', ENV_DEFAULTS['SCORE_THRESHOLD'])), ENV_DEFAULTS['SCORE_THRESHOLD'])
+        self.ml.params.score_threshold = score_thr
         long_sig, short_sig = self.ml.score_and_decide(long_base, short_base, up_prob)
 
         # Kelola posisi
