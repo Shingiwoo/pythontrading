@@ -59,7 +59,7 @@ cfg_default_path = st.sidebar.text_input("Path coin_config.json", value="./coin_
 load_cfg = st.sidebar.checkbox("Muat konfigurasi dari coin_config.json", True)
 
 st.sidebar.header("🕒 Timeframe")
-timeframe = st.sidebar.selectbox("Resample", ["as-is","15m","1h","4h","1d"], index=0)
+timeframe = st.sidebar.selectbox("Resample", ["as-is","5min","15m","1h","4h","1d"], index=0)
 
 st.sidebar.header("💰 Money Management")
 initial_capital = st.sidebar.number_input("Available Balance (USDT)", value=20.0, min_value=0.0, step=1.0)
@@ -217,7 +217,7 @@ if selected_file:
     df['ema'] = EMAIndicator(df['close'], 22).ema_indicator()
     df['ma'] = SMAIndicator(df['close'], 20).sma_indicator()
     macd = MACD(df['close']); df['macd']=macd.macd(); df['macd_signal']=macd.macd_signal()
-    rsi = RSIIndicator(df['close'], 14); df['rsi']=rsi.rsi()
+    rsi = RSIIndicator(df['close'], 25); df['rsi']=rsi.rsi()
 
     prev_close = df['close'].shift(1)
     tr = pd.DataFrame({'a': df['high']-df['low'],
