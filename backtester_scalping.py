@@ -260,9 +260,9 @@ if selected_file:
         row = df.iloc[i]
         sc_long = 0.0; sc_short = 0.0
         # base scoring
-        if row['ema'] > row['ma'] and row['macd'] > row['macd_signal'] and (40 <= row['rsi'] <= 70):
+        if row['ema'] > row['ma'] and row['macd'] > row['macd_signal'] and (10 <= row['rsi'] <= 40):
             sc_long += 1
-        if row['ema'] < row['ma'] and row['macd'] < row['macd_signal'] and (30 <= row['rsi'] <= 60):
+        if row['ema'] < row['ma'] and row['macd'] < row['macd_signal'] and (70 <= row['rsi'] <= 90):
             sc_short += 1
         if use_ml:
             sc_long += (1 if row['ml_signal']==1 else 0)

@@ -152,7 +152,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d['ema'] = EMAIndicator(d['close'], 22).ema_indicator()
     d['ma']  = SMAIndicator(d['close'], 20).sma_indicator()
     macd = MACD(d['close']); d['macd']=macd.macd(); d['macd_signal']=macd.macd_signal()
-    rsi = RSIIndicator(d['close'], 14); d['rsi']=rsi.rsi()
+    rsi = RSIIndicator(d['close'], 25); d['rsi']=rsi.rsi()
     prev_close = d['close'].shift(1)
     tr = pd.DataFrame({
         'a': d['high']-d['low'],
@@ -166,8 +166,8 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d['body_to_atr'] = d['body'] / d['atr']
 
     # sinyal dasar (skor base)
-    d['long_base']  = (d['ema']>d['ma']) & (d['macd']>d['macd_signal']) & d['rsi'].between(40,70)
-    d['short_base'] = (d['ema']<d['ma']) & (d['macd']<d['macd_signal']) & d['rsi'].between(30,60)
+    d['long_base']  = (d['ema']>d['ma']) & (d['macd']>d['macd_signal']) & d['rsi'].between(10,40)
+    d['short_base'] = (d['ema']<d['ma']) & (d['macd']<d['macd_signal']) & d['rsi'].between(70,90)
     return d
 
 
