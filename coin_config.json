@@ -33,7 +33,7 @@
       "strict": true,
       "up_prob_long": 0.6,
       "down_prob_short": 0.4,
-      "score_threshold": 1.4
+      "score_threshold": 1.2
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
@@ -97,7 +97,7 @@
       "strict": true,
       "up_prob_long": 0.6,
       "down_prob_short": 0.4,
-      "score_threshold": 1.4
+      "score_threshold": 1.2
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
@@ -161,7 +161,7 @@
       "strict": true,
       "up_prob_long": 0.6,
       "down_prob_short": 0.4,
-      "score_threshold": 1.4
+      "score_threshold": 1.2
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
@@ -187,7 +187,7 @@
     "cooldown_mul_early_stop": 1.2,
     "stepSize": 1.0,
     "minQty": 1.0,
-    "quantityPrecision": 0,
+    "quantityPrecision": 1,
     "minNotional": 5.0,
     "SLIPPAGE_PCT": 0.02
   },
@@ -225,7 +225,7 @@
       "strict": true,
       "up_prob_long": 0.6,
       "down_prob_short": 0.4,
-      "score_threshold": 1.4
+      "score_threshold": 1.2
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
