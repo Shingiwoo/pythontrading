@@ -83,9 +83,13 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
     # (opsional) Heikin Ashi
     if heikin:
         ha = d.copy()
-        ha['ha_close'] = (ha['open'] + ha['high'] + ha['low'] + ha['close']) / 4
-        ha['ha_open']  = ha['open'].shift(1)
-        ha.loc[ha.index[0], 'ha_open'] = (ha.loc[ha.index[0], 'open'] + ha.loc[ha.index[0], 'close']) / 2
+        ha['ha_close'] = (pd.to_numeric(ha['open'], errors='coerce') + 
+                          pd.to_numeric(ha['high'], errors='coerce') + 
+                          pd.to_numeric(ha['low'], errors='coerce') + 
+                          pd.to_numeric(ha['close'], errors='coerce')) / 4
+        ha['ha_open'] = pd.to_numeric(ha['open'], errors='coerce').shift(1)
+        ha.loc[ha.index[0], 'ha_open'] = (pd.to_numeric(ha.loc[ha.index[0], 'open'], errors='coerce') + 
+                                          pd.to_numeric(ha.loc[ha.index[0], 'close'], errors='coerce')) / 2
         ha['ha_high']  = ha[['high','ha_open','ha_close']].max(axis=1)
         ha['ha_low']   = ha[['low','ha_open','ha_close']].min(axis=1)
         d[['open','high','low','close']] = ha[['ha_open','ha_high','ha_low','ha_close']]
@@ -115,8 +119,8 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
     d['body_atr']    = d['body_to_atr']  # alias, untuk backward compatibility
 
     # Base signals (SAMA dengan backtester_scalping)
-    d['long_base']  = (d['ema'] > d['ma']) & (d['macd'] > d['macd_signal']) & d['rsi'].between(40, 70)
-    d['short_base'] = (d['ema'] < d['ma']) & (d['macd'] < d['macd_signal']) & d['rsi'].between(30, 60)
+    d['long_base']  = (d['ema'] > d['ma']) & (d['macd'] > d['macd_signal']) & d['rsi'].between(10, 40)
+    d['short_base'] = (d['ema'] < d['ma']) & (d['macd'] < d['macd_signal']) & d['rsi'].between(70, 90)
 
     return d
 
