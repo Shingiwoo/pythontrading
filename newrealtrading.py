@@ -27,6 +27,12 @@ try:
 except Exception:
     pass
 
+from engine_core import (
+    _to_float, _to_int, _to_bool, floor_to_step,
+    load_coin_config, merge_config, compute_indicators as calculate_indicators,
+    htf_trend_ok
+)
+
 __all__ = [
     "CoinTrader",
     "TradingManager",
@@ -37,37 +43,6 @@ __all__ = [
     "merge_config",
     "calculate_indicators",
 ]
-
-# ============================
-# Utils
-# ============================
-
-def _to_float(v: Any, d: float) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return float(d)
-
-def _to_int(v: Any, d: int) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return int(d)
-
-def _to_bool(v: Any, d: bool) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(int(v))
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in {"1","true","y","yes","on"}: return True
-        if s in {"0","false","n","no","off"}: return False
-    return bool(d)
-
-def floor_to_step(x: float, step: float) -> float:
-    if step is None or step <= 0: return float(x)
-    return math.floor(float(x)/float(step))*float(step)
 
 # ============================
 # Config
@@ -105,83 +80,6 @@ ENV_DEFAULTS = {
 # ============================
 # Loader coin_config.json
 # ============================
-
-def load_coin_config(path: str) -> Dict[str, Any]:
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def merge_config(symbol: str, base_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    sym_cfg = base_cfg.get(symbol, {}) if isinstance(symbol, str) else {}
-    env = os.environ
-
-    cfg: Dict[str, Any] = {**DEFAULTS}
-    # overlay dari coin_config.json jika ada
-    for k in DEFAULTS.keys():
-        if k in sym_cfg:
-            cfg[k] = sym_cfg[k]
-    # ENV overrides
-    if "TAKER_FEE" in env: cfg["taker_fee"] = _to_float(env.get("TAKER_FEE"), cfg["taker_fee"])
-    # beberapa ENV lain (opsional)
-    cfg["SLIPPAGE_PCT"] = _to_float(env.get("SLIPPAGE_PCT", ENV_DEFAULTS["SLIPPAGE_PCT"]), ENV_DEFAULTS["SLIPPAGE_PCT"])
-    cfg["SCORE_THRESHOLD"] = _to_float(env.get("SCORE_THRESHOLD", ENV_DEFAULTS["SCORE_THRESHOLD"]), ENV_DEFAULTS["SCORE_THRESHOLD"])
-    # ML params bisa dibaca langsung oleh MLSignal dari cfg ini (plugin akan fallback ke ENV jika tidak ada)
-    for k in [
-        "USE_ML","ML_MIN_TRAIN_BARS","ML_LOOKAHEAD","ML_RETRAIN_EVERY","ML_UP_PROB","ML_DOWN_PROB"
-    ]:
-        if k in sym_cfg:
-            cfg[k] = sym_cfg[k]
-        elif k in env:
-            cfg[k] = env.get(k)
-
-    return cfg
-
-# ============================
-# Indikator & sinyal dasar (selaras backtester)
-# ============================
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    if 'timestamp' in d.columns:
-        d['timestamp'] = pd.to_datetime(d['timestamp'])
-    d = d.sort_values('timestamp').reset_index(drop=True)
-    # indikator
-    d['ema'] = EMAIndicator(d['close'], 22).ema_indicator()
-    d['ma']  = SMAIndicator(d['close'], 20).sma_indicator()
-    macd = MACD(d['close']); d['macd']=macd.macd(); d['macd_signal']=macd.macd_signal()
-    rsi = RSIIndicator(d['close'], 25); d['rsi']=rsi.rsi()
-    prev_close = d['close'].shift(1)
-    tr = pd.DataFrame({
-        'a': d['high']-d['low'],
-        'b': (d['high']-prev_close).abs(),
-        'c': (d['low']-prev_close).abs()
-    })
-    d['tr'] = tr.max(axis=1)
-    d['atr'] = d['tr'].ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    d['atr_pct'] = d['atr'] / d['close']
-    d['body'] = (d['close'] - d['open']).abs()
-    d['body_to_atr'] = d['body'] / d['atr']
-
-    # sinyal dasar (skor base)
-    d['long_base']  = (d['ema']>d['ma']) & (d['macd']>d['macd_signal']) & d['rsi'].between(10,40)
-    d['short_base'] = (d['ema']<d['ma']) & (d['macd']<d['macd_signal']) & d['rsi'].between(70,90)
-    return d
-
-
-def htf_trend_ok(side: str, base_df: pd.DataFrame) -> bool:
-    # EMA50 vs EMA200 di 1H
-    try:
-        tmp = base_df.set_index('timestamp')[['close']].copy()
-        htf = tmp['close'].resample('1H').last().dropna()
-        if len(htf) < 210: return True
-        ema50 = htf.ewm(span=50, adjust=False).mean().iloc[-1]
-        ema200 = htf.ewm(span=200, adjust=False).mean().iloc[-1]
-        return (ema50 >= ema200) if side=='LONG' else (ema50 <= ema200)
-    except Exception:
-        return True
 
 # ============================
 # Trader per-coin
