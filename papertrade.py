@@ -21,14 +21,15 @@ load_dotenv(override=True)
 from binance.client import Client
 from binance.enums import HistoricalKlinesType
 
-# Import core engine dari file yang sudah kamu punya
+# Import core engine dan trader
 try:
-    from newrealtrading import (
-        CoinTrader, floor_to_step, _to_float, _to_bool,
+    from newrealtrading import CoinTrader
+    from engine_core import (
+        floor_to_step, _to_float, _to_bool,
         load_coin_config, merge_config
     )
 except ImportError as e:
-    print(f"[ERROR] Failed to import from newrealtrading: {e}")
+    print(f"[ERROR] Failed to import core modules: {e}")
     sys.exit(1)
 
 # ML plugin opsional
