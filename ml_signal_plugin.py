@@ -22,9 +22,25 @@ class MLParams:
     down_prob_thres: float = 0.45
 
 class MLSignal:
-    def __init__(self, coin_cfg: Dict[str, Any] | None):
+    def __init__(
+        self,
+        coin_cfg: Dict[str, Any] | None = None,
+        thr: float = 1.20,
+        htf: str | None = None,
+        heikin: bool = False,
+        model_path: str | None = None,
+        device: str = "cpu",
+    ):
         cfg = coin_cfg or {}
         env = os.environ
+
+        self.coin_cfg = cfg
+        self.thr = float(thr)
+        self.htf = htf
+        self.heikin = bool(heikin)
+        self.model_path = model_path
+        self.device = device
+
         def _getf(key: str, default: float) -> float:
             v = cfg.get(key, env.get(key))
             try: return float(v)

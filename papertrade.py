@@ -31,6 +31,14 @@ except ImportError as e:
     print(f"[ERROR] Failed to import from newrealtrading: {e}")
     sys.exit(1)
 
+# ML plugin opsional
+try:
+    from ml_signal_plugin import MLSignal  # noqa: F401
+    ML_AVAILABLE = True
+except Exception as e:  # pragma: no cover
+    print(f"[WARN] ML plugin disabled: {e}")
+    ML_AVAILABLE = False
+
 # -----------------------------
 # Util waktu & interval
 # -----------------------------
@@ -59,6 +67,26 @@ def next_close_sleep(interval_s: int, skew: float = 1.0) -> float:
     # tidur sampai boundary bar berikutnya + skew detik
     now = time.time()
     return (math.floor(now / interval_s) + 1) * interval_s + skew - now
+
+
+def last_closed_kline(kl: List[list]) -> list:
+    """Kembalikan bar terakhir yang sudah close dari list klines."""
+    if not kl or len(kl) < 2:
+        raise ValueError("Klines kurang dari 2 bar")
+    return kl[-2]
+
+
+def ml_gate(up_prob: Optional[float], thr: float, eps: float = 1e-9) -> int:
+    """Gate odds berbasis probabilitas."""
+    if up_prob is None:
+        return 0
+    up_odds = up_prob / max(1 - up_prob, eps)
+    dn_odds = (1 - up_prob) / max(up_prob, eps)
+    if up_odds >= thr:
+        return +1
+    if dn_odds >= thr:
+        return -1
+    return 0
 
 # -----------------------------
 # Binance client wrapper (retry)
@@ -270,6 +298,11 @@ def main():
     ap.add_argument("--coin_config", default="coin_config.json")
     ap.add_argument("--logs_dir", default="logs")
     ap.add_argument("--risk_pct", type=float, default=None, help="Override risk_per_trade (contoh: 0.01)")
+    ap.add_argument("--ml-thr", type=float, default=1.20, help="Threshold odds ML")
+    ap.add_argument("--htf", default=None, help="Higher timeframe (contoh: 1h)")
+    ap.add_argument("--heikin", action="store_true", help="Gunakan Heikin-Ashi")
+    ap.add_argument("--fee_bps", type=float, default=10.0, help="Biaya taker per sisi (bps)")
+    ap.add_argument("--slip_bps", type=float, default=0.0, help="Slippage per sisi (bps)")
     ap.add_argument("--limit_bars", type=int, default=600, help="Kline limit pull (<= 1500)")
     ap.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds")
     ap.add_argument("--retries", type=int, default=6, help="HTTP retries")
@@ -282,6 +315,15 @@ def main():
     interval_key = INTERVAL_MAP[args.interval]
     int_s = interval_seconds(args.interval)
 
+    rules = {
+        "risk_pct": args.risk_pct,
+        "ml_thr": args.ml_thr,
+        "htf": args.htf,
+        "heikin": bool(args.heikin),
+        "fee_bps": args.fee_bps,
+        "slip_bps": args.slip_bps,
+    }
+
     bnc = BinanceFutures(requests_timeout=args.timeout, max_retries=args.retries)
     cfg_all = ensure_filters_to_coin_config(bnc, args.coin_config, syms)
 
@@ -290,8 +332,14 @@ def main():
     traders: Dict[str, JournaledCoinTrader] = {}
     for s in syms:
         merged = merge_config(s, cfg_all)
-        if args.risk_pct is not None:
-            merged["risk_per_trade"] = float(args.risk_pct)
+        if rules["risk_pct"] is not None:
+            merged["risk_per_trade"] = float(rules["risk_pct"])
+        merged["ml_thr"] = rules["ml_thr"]
+        if rules["htf"]:
+            merged["htf"] = rules["htf"]
+        merged["heikin"] = rules["heikin"]
+        merged["taker_fee"] = rules["fee_bps"] / 10000.0
+        merged["SLIPPAGE_PCT"] = rules["slip_bps"] * 0.01
         cfg_by_sym[s] = merged
 
     journal = Journal(args.logs_dir, cfg_by_sym, args.balance)
@@ -307,14 +355,14 @@ def main():
         for s in syms:
             try:
                 raw = bnc.klines(s, interval_key, limit=min(max(args.limit_bars, 200), 1500))
-                df = build_df_from_klines(raw)
-                # proses hanya jika ada bar baru
-                last_ts = df["timestamp"].iloc[-1]
-                if last_bar_ts[s] is not None and last_ts <= last_bar_ts[s]:
-                    # belum ada bar close baru, lanjut simbol lain
+                if len(raw) < 2:
                     continue
+                lc = last_closed_kline(raw)
+                last_ts = pd.to_datetime(lc[6], unit="ms", utc=True)
+                if last_bar_ts[s] is not None and last_ts <= last_bar_ts[s]:
+                    continue
+                df = build_df_from_klines(raw[:-1])
                 last_bar_ts[s] = last_ts
-                # kirim ke engine
                 traders[s].check_trading_signals(df, journal.balance[s])
             except Exception as e:
                 print(f"[ERROR] live loop {s}: {e}")
