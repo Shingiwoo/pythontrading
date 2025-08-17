@@ -100,7 +100,7 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
     macd     = MACD(d['close'])
     d['macd'] = macd.macd()
     d['macd_signal'] = macd.macd_signal()
-    rsi = RSIIndicator(d['close'], 14)  # SAMA dengan backtester
+    rsi = RSIIndicator(d['close'], 25)  # SAMA dengan backtester
     d['rsi'] = rsi.rsi()
 
     # ATR (EMA Wilder-ish)
