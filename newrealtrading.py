@@ -302,19 +302,20 @@ class CoinTrader:
         if self.pos.side and self.pos.entry_time and max_hold > 0:
             elapsed = (pd.Timestamp.utcnow() - self.pos.entry_time).total_seconds()
             lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
-            init_margin = (self.pos.entry * self.pos.qty) / max(lev, 1)
-            roi_frac = 0.0
-            if init_margin > 0:
-                if self.pos.side == "LONG":
-                    roi_frac = ((price - self.pos.entry) * self.pos.qty) / init_margin
-                else:
-                    roi_frac = ((self.pos.entry - price) * self.pos.qty) / init_margin
+            if self.pos.entry is not None and self.pos.qty is not None:
+                init_margin = (self.pos.entry * self.pos.qty) / max(lev, 1)
+                roi_frac = 0.0
+                if init_margin > 0:
+                    if self.pos.side == "LONG":
+                        roi_frac = ((price - self.pos.entry) * self.pos.qty) / init_margin
+                    else:
+                        roi_frac = ((self.pos.entry - price) * self.pos.qty) / init_margin
 
-            if elapsed >= max_hold and roi_frac >= min_roi:
-                self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
-                return
-            elif elapsed >= max_hold:
-                self.pos.entry_time = pd.Timestamp.utcnow()
+                if elapsed >= max_hold and roi_frac >= min_roi:
+                    self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
+                    return
+                elif elapsed >= max_hold:
+                    self.pos.entry_time = pd.Timestamp.utcnow()
         # --------------------------------------
 
         # Entry baru

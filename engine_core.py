@@ -114,7 +114,7 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
     d['body_atr']    = d['body_to_atr']  # alias untuk backward compat
 
     # Base signal (sesuai request kamu)
-    d['long_base']  = (d['ema'] > d['ma']) & (d['macd'] > d['macd_signal']) & d['rsi'].between(10, 40)
+    d['long_base']  = (d['ema'] > d['ma']) & (d['macd'] > d['macd_signal']) & d['rsi'].between(10, 45)
     d['short_base'] = (d['ema'] < d['ma']) & (d['macd'] < d['macd_signal']) & d['rsi'].between(70, 90)
     return d
 
