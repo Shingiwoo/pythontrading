@@ -66,6 +66,8 @@ DEFAULTS = {
     "be_trigger_pct": 0.0045,  # fraksi (0.45%)
     "trailing_trigger": 0.7,   # %
     "trailing_step": 0.45,     # %
+    "max_hold_seconds": 3600,
+    "min_roi_to_close_by_time": 0.005,
     # lot size & precision (opsional, jika tersedia dari exchange info)
     "stepSize": 0.0,
     "minQty": 0.0,
@@ -274,8 +276,11 @@ class CoinTrader:
         if self.ml.use_ml:
             self.ml.fit_if_needed(df)
             up_prob = self.ml.predict_up_prob(df)
-        score_thr = _to_float(self.config.get('ml', {}).get('score_threshold', self.config.get('SCORE_THRESHOLD', ENV_DEFAULTS['SCORE_THRESHOLD'])), ENV_DEFAULTS['SCORE_THRESHOLD'])
-        self.ml.params.score_threshold = score_thr
+        ml_cfg = self.config.get("ml", {}) if isinstance(self.config.get("ml"), dict) else {}
+        if "score_threshold" in ml_cfg:
+            self.ml.params.score_threshold = _to_float(ml_cfg.get("score_threshold"), ENV_DEFAULTS["SCORE_THRESHOLD"])
+        else:
+            self.ml.params.score_threshold = _to_float(self.config.get("SCORE_THRESHOLD", ENV_DEFAULTS["SCORE_THRESHOLD"]), ENV_DEFAULTS["SCORE_THRESHOLD"])
         long_sig, short_sig = self.ml.score_and_decide(long_base, short_base, up_prob)
 
         # Kelola posisi
@@ -289,6 +294,28 @@ class CoinTrader:
             if ex:
                 self._exit_position(price, reason or 'Exit')
                 return
+
+        # ---- Time-stop (selaras backtest) ----
+        max_hold = _to_int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)), 3600)
+        min_roi  = _to_float(self.config.get("min_roi_to_close_by_time", DEFAULTS.get("min_roi_to_close_by_time", 0.005)), 0.005)
+
+        if self.pos.side and self.pos.entry_time and max_hold > 0:
+            elapsed = (pd.Timestamp.utcnow() - self.pos.entry_time).total_seconds()
+            lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
+            init_margin = (self.pos.entry * self.pos.qty) / max(lev, 1)
+            roi_frac = 0.0
+            if init_margin > 0:
+                if self.pos.side == "LONG":
+                    roi_frac = ((price - self.pos.entry) * self.pos.qty) / init_margin
+                else:
+                    roi_frac = ((self.pos.entry - price) * self.pos.qty) / init_margin
+
+            if elapsed >= max_hold and roi_frac >= min_roi:
+                self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
+                return
+            elif elapsed >= max_hold:
+                self.pos.entry_time = pd.Timestamp.utcnow()
+        # --------------------------------------
 
         # Entry baru
         if not self.pos.side and not self._cooldown_active():
@@ -317,7 +344,7 @@ class TradingManager:
         safe_keys = {
             "risk_per_trade","leverage","trailing_trigger","trailing_step","taker_fee",
             "min_atr_pct","max_atr_pct","max_body_atr","use_htf_filter","cooldown_seconds",
-            "allow_sar","reverse_confirm_bars","min_hold_seconds",
+            "allow_sar","reverse_confirm_bars","min_hold_seconds","max_hold_seconds","min_roi_to_close_by_time",
             # ML & scoring
             "USE_ML","SCORE_THRESHOLD","ML_MIN_TRAIN_BARS","ML_LOOKAHEAD",
             "ML_RETRAIN_EVERY","ML_UP_PROB","ML_DOWN_PROB",
@@ -337,7 +364,11 @@ class TradingManager:
                             if k in safe_keys:
                                 trader.config[k] = v
                         # sinkron threshold ke plugin
-                        trader.ml.params.score_threshold = _to_float(trader.config.get('SCORE_THRESHOLD', ENV_DEFAULTS['SCORE_THRESHOLD']), ENV_DEFAULTS['SCORE_THRESHOLD'])
+                        ml_cfg = trader.config.get("ml", {}) if isinstance(trader.config.get("ml"), dict) else {}
+                        if "score_threshold" in ml_cfg:
+                            trader.ml.params.score_threshold = _to_float(ml_cfg.get("score_threshold"), ENV_DEFAULTS["SCORE_THRESHOLD"])
+                        else:
+                            trader.ml.params.score_threshold = _to_float(trader.config.get("SCORE_THRESHOLD", ENV_DEFAULTS["SCORE_THRESHOLD"]), ENV_DEFAULTS["SCORE_THRESHOLD"])
                 time.sleep(1.0)
             except Exception:
                 time.sleep(2.0)
