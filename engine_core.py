@@ -94,34 +94,28 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
         ha['ha_low']   = ha[['low','ha_open','ha_close']].min(axis=1)
         d[['open','high','low','close']] = ha[['ha_open','ha_high','ha_low','ha_close']]
 
-    # TA utama
+    # EMA/MA, MACD, RSI(14)
     d['ema'] = EMAIndicator(d['close'], 22).ema_indicator()
     d['ma']  = SMAIndicator(d['close'], 20).sma_indicator()
-    macd     = MACD(d['close'])
+    macd = MACD(d['close'])
     d['macd'] = macd.macd()
     d['macd_signal'] = macd.macd_signal()
-    rsi = RSIIndicator(d['close'], 25)  # SAMA dengan backtester
-    d['rsi'] = rsi.rsi()
+    d['rsi'] = RSIIndicator(d['close'], 14).rsi()
 
-    # ATR (EMA Wilder-ish)
+    # ATR (EMA Wilder-ish) & normalisasi
     prev_close = d['close'].shift(1)
-    tr = pd.DataFrame({
-        'a': (d['high'] - d['low']).abs(),
-        'b': (d['high'] - prev_close).abs(),
-        'c': (d['low']  - prev_close).abs()
-    }).max(axis=1)
+    tr = pd.concat([(d['high']-d['low']).abs(), (d['high']-prev_close).abs(), (d['low']-prev_close).abs()], axis=1).max(axis=1)
     d['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     d['atr_pct'] = d['atr'] / d['close']
 
-    # Body / ATR
+    # body/ATR + alias
     d['body'] = (d['close'] - d['open']).abs()
     d['body_to_atr'] = d['body'] / d['atr']
-    d['body_atr']    = d['body_to_atr']  # alias, untuk backward compatibility
+    d['body_atr']    = d['body_to_atr']  # alias untuk backward compat
 
-    # Base signals (SAMA dengan backtester_scalping)
+    # Base signal (sesuai request kamu)
     d['long_base']  = (d['ema'] > d['ma']) & (d['macd'] > d['macd_signal']) & d['rsi'].between(10, 40)
     d['short_base'] = (d['ema'] < d['ma']) & (d['macd'] < d['macd_signal']) & d['rsi'].between(70, 90)
-
     return d
 
 def htf_trend_ok(side: str, base_df: pd.DataFrame) -> bool:

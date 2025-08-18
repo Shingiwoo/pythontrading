@@ -25,7 +25,7 @@ from binance.enums import HistoricalKlinesType
 try:
     from newrealtrading import CoinTrader
     from engine_core import (
-        floor_to_step, _to_float, _to_bool,
+        floor_to_step, _to_float, _to_bool, _to_int,
         load_coin_config, merge_config
     )
 except ImportError as e:
@@ -190,8 +190,8 @@ class Journal:
         if not os.path.exists(path) or os.path.getsize(path) == 0:
             with open(path, 'w', newline='') as f:
                 w = csv.writer(f)
-                w.writerow(["timestamp","symbol","side","entry","qty","sl_init","tsl_init",
-                            "exit_price","exit_reason","pnl_usdt","roi_pct","balance_after"])
+                w.writerow(["timestamp","exit_timestamp","symbol","side","entry","qty","sl_init","tsl_init",
+                            "exit_price","exit_reason","pnl_usdt","roi_on_margin","balance_after"])
 
     def on_entry(self, symbol: str, side: str, entry: float, qty: float, sl_init: Optional[float], tsl_init: Optional[float]):
         self.open[symbol] = {
@@ -222,17 +222,20 @@ class Journal:
         pnl = gross - fees - slipp
 
         bal_after = bal_before + pnl
-        roi_pct = (pnl / bal_before * 100.0) if bal_before > 0 else 0.0
+        lev = _to_int(self.cfg[symbol].get("leverage", 1), 1)
+        init_margin = (entry * qty) / max(lev, 1)
+        roi_on_margin = (pnl / init_margin) if init_margin > 0 else 0.0
         self.balance[symbol] = bal_after
 
         path = self._csv_path(symbol)
         self._ensure_header(path)
+        exit_ts_iso = pd.Timestamp.utcnow().isoformat()
         with open(path, 'a', newline='') as f:
             w = csv.writer(f)
             w.writerow([
-                o["ts"], symbol, side, f"{entry:.6f}", f"{qty:.6f}",
+                o["ts"], exit_ts_iso, symbol, side, f"{entry:.6f}", f"{qty:.6f}",
                 o["sl_init"], o["tsl_init"], f"{exit_price:.6f}",
-                reason, f"{pnl:.4f}", f"{roi_pct:.2f}", f"{bal_after:.4f}"
+                reason, f"{pnl:.6f}", f"{roi_on_margin:.6f}", f"{bal_after:.6f}"
             ])
 
 # -----------------------------
@@ -335,7 +338,7 @@ def main():
         merged = merge_config(s, cfg_all)
         if rules["risk_pct"] is not None:
             merged["risk_per_trade"] = float(rules["risk_pct"])
-        merged["ml_thr"] = rules["ml_thr"]
+        merged.setdefault("ml", {})["score_threshold"] = rules["ml_thr"]
         if rules["htf"]:
             merged["htf"] = rules["htf"]
         merged["heikin"] = rules["heikin"]
