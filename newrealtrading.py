@@ -33,7 +33,103 @@ from engine_core import (
     htf_trend_ok
 )
 
+from binance.client import Client
+
+
+class ExecutionClient:
+    def __init__(self, api_key: str, api_secret: str, testnet: bool=False, verbose: bool=False):
+        self.client = Client(api_key, api_secret, testnet=testnet)
+        if testnet:
+            self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+        self.verbose = verbose
+        self._exinfo_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _get_symbol_filters(self, symbol: str) -> Dict[str, Any]:
+        if symbol not in self._exinfo_cache:
+            info = self.client.futures_exchange_info()
+            m = next((s for s in info["symbols"] if s["symbol"] == symbol), None)
+            if not m:
+                raise ValueError(f"Symbol {symbol} tidak ditemukan di futures exchange info.")
+            self._exinfo_cache[symbol] = m
+        return self._exinfo_cache[symbol]
+
+    def _tick_size(self, symbol: str) -> float:
+        f = self._get_symbol_filters(symbol)
+        pfilter = next(x for x in f["filters"] if x["filterType"] == "PRICE_FILTER")
+        return float(pfilter["tickSize"])
+
+    def _step_size(self, symbol: str) -> float:
+        f = self._get_symbol_filters(symbol)
+        lot = next(x for x in f["filters"] if x["filterType"] == "LOT_SIZE")
+        return float(lot["stepSize"])
+
+    def round_price(self, symbol: str, price: float) -> float:
+        ts = self._tick_size(symbol)
+        return math.floor(price / ts) * ts
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        ss = self._step_size(symbol)
+        return math.floor(qty / ss) * ss
+
+    def set_leverage(self, symbol: str, leverage: int):
+        try:
+            self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+        except Exception as e:
+            if self.verbose:
+                print(f"[EXEC] set_leverage fail: {e}")
+
+    def market_entry(self, symbol: str, side: str, qty: float) -> Dict[str, Any]:
+        o = self.client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=self.round_qty(symbol, qty),
+            reduceOnly=False
+        )
+        if self.verbose:
+            print(f"[EXEC] MARKET ENTRY {symbol} {side} {qty} -> orderId={o.get('orderId')}")
+        return o
+
+    def stop_market(self, symbol: str, side: str, stop_price: float, qty: float, reduce_only: bool=True) -> Dict[str, Any]:
+        sp = self.round_price(symbol, stop_price)
+        o = self.client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="STOP_MARKET",
+            stopPrice=f"{sp:.8f}",
+            closePosition=False,
+            quantity=self.round_qty(symbol, qty),
+            reduceOnly=reduce_only,
+            workingType="MARK_PRICE",
+            timeInForce="GTC"
+        )
+        if self.verbose:
+            print(f"[EXEC] STOP_MARKET {symbol} {side} stop={sp} qty={qty} -> orderId={o.get('orderId')}")
+        return o
+
+    def cancel_all(self, symbol: str):
+        try:
+            self.client.futures_cancel_all_open_orders(symbol=symbol)
+            if self.verbose:
+                print(f"[EXEC] Cancel all {symbol}")
+        except Exception as e:
+            if self.verbose:
+                print(f"[EXEC] cancel_all fail: {e}")
+
+    def market_close(self, symbol: str, side: str, qty: float) -> Dict[str, Any]:
+        o = self.client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=self.round_qty(symbol, qty),
+            reduceOnly=True
+        )
+        if self.verbose:
+            print(f"[EXEC] MARKET CLOSE {symbol} {side} {qty} -> orderId={o.get('orderId')}")
+        return o
+
 __all__ = [
+    "ExecutionClient",
     "CoinTrader",
     "TradingManager",
     "floor_to_step",
@@ -97,13 +193,14 @@ class Position:
 
 
 class CoinTrader:
-    def __init__(self, symbol: str, config: Dict[str, Any]):
+    def __init__(self, symbol: str, config: Dict[str, Any], *, verbose: bool=False, exec_client: Optional[ExecutionClient]=None):
         self.symbol = symbol.upper()
         self.config = config
         self.ml = MLSignal(self.config)
         self.pos = Position()
         self.cooldown_until_ts: Optional[float] = None
-        self.verbose = _to_bool(self.config.get('VERBOSE', os.getenv('VERBOSE','0')), False)
+        self.verbose = verbose or _to_bool(self.config.get('VERBOSE', os.getenv('VERBOSE','0')), False)
+        self.exec = exec_client
 
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
@@ -125,19 +222,24 @@ class CoinTrader:
         safe_trigger = max(trailing_trigger, safe_buffer_pct + trailing_step)
         return safe_trigger, trailing_step
 
-    def _size_position(self, price: float, balance: float) -> float:
-        risk = _to_float(self.config.get('risk_per_trade', DEFAULTS['risk_per_trade']), DEFAULTS['risk_per_trade'])
-        lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
-        raw_qty = (balance * risk * lev) / max(price, 1e-12)
-        step = _to_float(self.config.get('stepSize', 0.0), 0.0)
-        q = floor_to_step(raw_qty, step) if step>0 else raw_qty
-        prec = _to_int(self.config.get('quantityPrecision', 0), 0)
-        try:
-            q = float(f"{q:.{prec}f}")
-        except Exception:
-            q = float(q)
+    def _size_position(self, price: float, sl: float, balance: float) -> float:
+        risk_usdt = float(balance) * _to_float(self.config.get('risk_per_trade', DEFAULTS['risk_per_trade']), DEFAULTS['risk_per_trade'])
+        dist = abs(price - sl)
+        if dist <= 0:
+            return 0.0
+        qty = risk_usdt / dist
+        if self.exec:
+            qty = self.exec.round_qty(self.symbol, qty)
+        else:
+            step = _to_float(self.config.get('stepSize', 0.0), 0.0)
+            qty = floor_to_step(qty, step) if step>0 else qty
+            prec = _to_int(self.config.get('quantityPrecision', 0), 0)
+            try:
+                qty = float(f"{qty:.{prec}f}")
+            except Exception:
+                qty = float(qty)
         minq = _to_float(self.config.get('minQty', 0.0), 0.0)
-        return q if q >= minq else 0.0
+        return qty if qty >= minq else 0.0
 
     def _hard_sl_price(self, entry: float, atr: float, side: str) -> float:
         mode = str(self.config.get('sl_mode', DEFAULTS['sl_mode'])).upper()
@@ -174,6 +276,13 @@ class CoinTrader:
                 self.pos.trailing_sl = max(self.pos.trailing_sl or self.pos.sl or 0.0, new_ts)
                 if self.pos.trailing_sl != prev:
                     self._log(f"TRAIL LONG -> {self.pos.trailing_sl:.6f} (prev={prev})")
+                    if self.exec and self.pos.side and self.pos.qty and self.pos.trailing_sl:
+                        try:
+                            self.exec.cancel_all(self.symbol)
+                        except Exception:
+                            pass
+                        stop_side = "SELL"
+                        self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True)
         else:
             profit_pct = (self.pos.entry - price)/self.pos.entry*100.0
             if profit_pct >= safe_trigger:
@@ -182,6 +291,13 @@ class CoinTrader:
                 self.pos.trailing_sl = min(self.pos.trailing_sl or self.pos.sl or 1e18, new_ts)
                 if self.pos.trailing_sl != prev:
                     self._log(f"TRAIL SHORT -> {self.pos.trailing_sl:.6f} (prev={prev})")
+                    if self.exec and self.pos.side and self.pos.qty and self.pos.trailing_sl:
+                        try:
+                            self.exec.cancel_all(self.symbol)
+                        except Exception:
+                            pass
+                        stop_side = "BUY"
+                        self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True)
 
     def _cooldown_active(self) -> bool:
         return bool(self.cooldown_until_ts and time.time() < self.cooldown_until_ts)
@@ -189,14 +305,25 @@ class CoinTrader:
     def _enter_position(self, side: str, price: float, atr: float, balance: float) -> None:
         if self._cooldown_active():
             return
-        qty = self._size_position(price, balance)
+        sl = self._hard_sl_price(price, atr, side)
+        qty = self._size_position(price, sl, balance)
         if qty <= 0:
             return
-        sl = self._hard_sl_price(price, atr, side)
         self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=pd.Timestamp.utcnow())
         self._log(f"ENTRY {side} price={price:.6f} qty={qty:.6f} sl={sl:.6f}")
-        # TODO: place order ke exchange di sini
-        # self.exchange.open_market_order(self.symbol, side, qty)
+        if self.exec:
+            lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
+            try:
+                self.exec.set_leverage(self.symbol, lev)
+            except Exception:
+                pass
+            side_binance = 'BUY' if side == 'LONG' else 'SELL'
+            od = self.exec.market_entry(self.symbol, side_binance, qty)
+            fill_price = float(od.get('avgPrice') or od.get('price') or price)
+            self.pos.entry = fill_price
+            stop_side = 'SELL' if side == 'LONG' else 'BUY'
+            if sl:
+                self.exec.stop_market(self.symbol, stop_side, sl, qty, reduce_only=True)
 
     def _should_exit(self, price: float) -> Tuple[bool, Optional[str]]:
         if not self.pos.side:
@@ -215,8 +342,13 @@ class CoinTrader:
         return False, None
 
     def _exit_position(self, price: float, reason: str) -> None:
-        # TODO: close position ke exchange
-        # self.exchange.close_market_order(self.symbol, self.pos.side, self.pos.qty)
+        if self.exec and self.pos.side and self.pos.qty:
+            try:
+                self.exec.cancel_all(self.symbol)
+            except Exception:
+                pass
+            close_side = 'SELL' if self.pos.side == 'LONG' else 'BUY'
+            self.exec.market_close(self.symbol, close_side, self.pos.qty)
         self._log(f"EXIT {reason} price={price:.6f}")
         self.pos = Position()  # reset
         # cooldown
@@ -336,13 +468,17 @@ class CoinTrader:
 # Manager (contoh sederhana)
 # ============================
 class TradingManager:
-    def __init__(self, coin_config_path: str, symbols: List[str]):
+    def __init__(self, coin_config_path: str, symbols: List[str], *, exec_client: Optional[ExecutionClient]=None, verbose: bool=False):
         self.coin_config_path = coin_config_path
         self.symbols = [s.upper() for s in symbols]
         self._cfg = load_coin_config(coin_config_path)
-        self.traders: Dict[str, CoinTrader] = {s: CoinTrader(s, merge_config(s, self._cfg)) for s in self.symbols}
+        self.exec_client = exec_client
+        self.verbose = verbose
+        self.traders: Dict[str, CoinTrader] = {}
+        for s in self.symbols:
+            merged_cfg = merge_config(s, self._cfg)
+            self.traders[s] = CoinTrader(s, merged_cfg, verbose=self.verbose, exec_client=self.exec_client)
         self._stop = False
-        # watcher config pada thread terpisah
         t = threading.Thread(target=self._watch_config, daemon=True)
         t.start()
 
@@ -410,12 +546,20 @@ if __name__ == "__main__":
     ap.add_argument("--dry-run-loop", action="store_true", help="Replay CSV bar-by-bar (simulasi real-time)")
     ap.add_argument("--sleep", type=float, default=0.0, help="Delay per step (detik) saat dry-run")
     ap.add_argument("--limit", type=int, default=0, help="Batasi jumlah langkah dry-run (0 = semua)")
+    ap.add_argument("--real-exec", action="store_true", help="Jika true, submit order ke Binance Futures (USDT-M). Default off untuk safety.")
+    ap.add_argument("--testnet", action="store_true", help="Gunakan Binance Futures Testnet (disarankan uji dulu).")
     args = ap.parse_args()
     if args.verbose:
         os.environ["VERBOSE"] = "1"
 
     cfg_all = load_coin_config(args.coin_config) if os.path.exists(args.coin_config) else {}
     cfg = merge_config(args.symbol.upper(), cfg_all)
+
+    exec_client = None
+    if args.real_exec:
+        api_key = os.getenv("BINANCE_API_KEY","")
+        api_sec = os.getenv("BINANCE_API_SECRET","")
+        exec_client = ExecutionClient(api_key, api_sec, testnet=args.testnet, verbose=args.verbose)
 
     if args.csv and os.path.exists(args.csv):
         df = pd.read_csv(args.csv)
@@ -437,7 +581,7 @@ if __name__ == "__main__":
             warmup = max(300, min_train + 10)
             start_i = min(warmup, len(df)-1)
             steps = 0
-            mgr = TradingManager(args.coin_config, [sym])  # <-- PAKAI MANAGER YANG SAMA (state posisi tersimpan)
+            mgr = TradingManager(args.coin_config, [sym], exec_client=exec_client, verbose=args.verbose)  # <-- PAKAI MANAGER YANG SAMA (state posisi tersimpan)
             for i in range(start_i, len(df)):
                 data_map = {sym: df.iloc[:i+1].copy()}
                 mgr.run_once(data_map, {sym: args.balance})
@@ -450,7 +594,7 @@ if __name__ == "__main__":
             print(f"Dry-run completed: {steps} steps (start={start_i}, total_bars={len(df)}). Last position: {last_side}")
         else:
             data_map = {sym: df}
-            TradingManager(args.coin_config, [sym]).run_once(data_map, {sym: args.balance})
+            TradingManager(args.coin_config, [sym], exec_client=exec_client, verbose=args.verbose).run_once(data_map, {sym: args.balance})
             print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
     else:
         if args.live:
@@ -468,13 +612,15 @@ if __name__ == "__main__":
 
             api_key = os.getenv("BINANCE_API_KEY","")
             api_sec = os.getenv("BINANCE_API_SECRET","")
-            client = Client(api_key, api_sec)
+            client = exec_client.client if exec_client else Client(api_key, api_sec, testnet=args.testnet)
+            if args.testnet and not exec_client:
+                client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
             syms = [s.strip().upper() for s in (args.symbols.split(",") if args.symbols else [args.symbol])]
             interval = args.interval
             step = _sec(interval)
 
-            mgr = TradingManager(args.coin_config, syms)
+            mgr = TradingManager(args.coin_config, syms, exec_client=exec_client, verbose=args.verbose)
             balances = {s: args.balance for s in syms}
 
             print(f"[LIVE] start symbols={','.join(syms)} interval={interval}")
