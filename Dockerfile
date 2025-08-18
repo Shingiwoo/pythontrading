@@ -18,7 +18,7 @@ WORKDIR /app
 # Install deps dari requirements.txt (gunakan cache layer)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
-RUN pip install --no-cache-dir "python-binance>=1.0.19,<2"
+RUN pip install --no-cache-dir "python-binance"
 
 # Copy project
 COPY newrealtrading.py coin_config.json ml_signal_plugin.py engine_core.py /app/
