@@ -233,6 +233,16 @@ class CoinTrader:
         heikin = _to_bool(self.config.get('heikin', False), False)
         df = calculate_indicators(df_raw, heikin=heikin)
         last = df.iloc[-1]
+        price = float(last['close'])
+
+        # Update trailing/exit terlebih dahulu
+        if self.pos.side:
+            self._apply_breakeven(price)
+            self._update_trailing(price)
+            ex, rs = self._should_exit(price)
+            if ex:
+                self._exit_position(price, rs or 'Exit')
+                return
 
         # Filter ATR & body/ATR
         atr_ok = (last['atr_pct'] >= _to_float(self.config.get('min_atr_pct', DEFAULTS['min_atr_pct']), DEFAULTS['min_atr_pct'])) \
@@ -242,17 +252,13 @@ class CoinTrader:
         body_val = last.get('body_to_atr', last.get('body_atr'))
         body_ok = (float(body_val) <= _to_float(self.config.get('max_body_atr', DEFAULTS['max_body_atr']), DEFAULTS['max_body_atr'])) if body_val is not None else False
 
+        # Filter ATR & body: bila gagal dan belum ada posisi → stop saja
         if not (atr_ok and body_ok):
-            # kelola exit jika sudah di posisi
-            if self.pos.side:
-                self._apply_breakeven(last['close'])
-                self._update_trailing(last['close'])
-                ex, rs = self._should_exit(last['close'])
-                if ex:
-                    self._exit_position(last['close'], rs or 'Filter Fail')
-            # log kenapa diblok (supaya --verbose selalu ada output)
-            self._log(f"FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={float(last['close']):.6f} pos={self.pos.side}")
-            return
+            if self.verbose:
+                print(f"[{self.symbol}] FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
+            # kalau posisi sedang terbuka, tetap lanjut ke trailing/exit di atas; sampai sini berarti pos None → keluar
+            if not self.pos.side:
+                return
 
         # HTF filter (opsional)
         if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
@@ -284,7 +290,7 @@ class CoinTrader:
         long_sig, short_sig = self.ml.score_and_decide(long_base, short_base, up_prob)
 
         # Kelola posisi
-        price = float(last['close']); atr = float(last['atr']) if not pd.isna(last['atr']) else 0.0
+        atr = float(last['atr']) if not pd.isna(last['atr']) else 0.0
         self._log(f"DECISION price={price:.6f} base(L={long_base},S={short_base}) up_prob={(up_prob if up_prob is not None else 'n/a')} thr={self.ml.params.score_threshold} -> {('LONG' if long_sig else ('SHORT' if short_sig else '-'))} pos={self.pos.side}")
         # Update SL/TS saat pegang posisi
         if self.pos.side:
@@ -398,6 +404,9 @@ if __name__ == "__main__":
     ap.add_argument("--symbol", default="ADAUSDT")
     ap.add_argument("--balance", type=float, default=20.0)
     ap.add_argument("--verbose", action="store_true", help="Print log keputusan & aksi")
+    ap.add_argument("--live", action="store_true", help="Jalankan real-trading live (REST polling)")
+    ap.add_argument("--symbols", default=None, help="Comma-separated symbols; default = --symbol")
+    ap.add_argument("--interval", default=os.getenv("INTERVAL","15m"))
     ap.add_argument("--dry-run-loop", action="store_true", help="Replay CSV bar-by-bar (simulasi real-time)")
     ap.add_argument("--sleep", type=float, default=0.0, help="Delay per step (detik) saat dry-run")
     ap.add_argument("--limit", type=int, default=0, help="Batasi jumlah langkah dry-run (0 = semua)")
@@ -407,8 +416,6 @@ if __name__ == "__main__":
 
     cfg_all = load_coin_config(args.coin_config) if os.path.exists(args.coin_config) else {}
     cfg = merge_config(args.symbol.upper(), cfg_all)
-
-    mgr = TradingManager(args.coin_config, [args.symbol])
 
     if args.csv and os.path.exists(args.csv):
         df = pd.read_csv(args.csv)
@@ -446,4 +453,52 @@ if __name__ == "__main__":
             TradingManager(args.coin_config, [sym]).run_once(data_map, {sym: args.balance})
             print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
     else:
-        print("Tidak ada CSV. Mode dummy selesai.")
+        if args.live:
+            # ==== LIVE MODE (python-binance) ====
+            from binance.client import Client
+            import time, pandas as pd
+
+            def _sec(tf: str) -> int:
+                tf = tf.strip().lower()
+                if tf.endswith("min"): return int(tf[:-3]) * 60
+                if tf.endswith("m"):   return int(tf[:-1]) * 60
+                if tf.endswith("h"):   return int(tf[:-1]) * 3600
+                if tf.endswith("d"):   return int(tf[:-1]) * 86400
+                return 900
+
+            api_key = os.getenv("BINANCE_API_KEY","")
+            api_sec = os.getenv("BINANCE_API_SECRET","")
+            client = Client(api_key, api_sec)
+
+            syms = [s.strip().upper() for s in (args.symbols.split(",") if args.symbols else [args.symbol])]
+            interval = args.interval
+            step = _sec(interval)
+
+            mgr = TradingManager(args.coin_config, syms)
+            balances = {s: args.balance for s in syms}
+
+            print(f"[LIVE] start symbols={','.join(syms)} interval={interval}")
+            while True:
+                data_map = {}
+                for s in syms:
+                    # Ambil 600 bar futures
+                    kl = client.futures_klines(symbol=s, interval=interval, limit=600)
+                    # Format ke DataFrame
+                    df = pd.DataFrame(kl, columns=[
+                        "open_time","open","high","low","close","volume","close_time",
+                        "qav","num_trades","taker_base","taker_quote","ignore"
+                    ])
+                    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+                    for c in ["open","high","low","close","volume"]:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    df = df[["timestamp","open","high","low","close","volume"]].dropna()
+                    data_map[s] = df
+
+                mgr.run_once(data_map, balances)
+
+                # tidur sampai candle berikutnya + buffer 1s
+                now = time.time()
+                sleep_for = step - (int(now) % step) + 1
+                time.sleep(max(5, sleep_for))
+        else:
+            print("Tidak ada CSV. Mode dummy selesai.")

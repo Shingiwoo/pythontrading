@@ -6,6 +6,6 @@ streamlit
 matplotlib
 plotly
 scikit-learn
-python-binance
+python-binance>=1.0.19,<2
 python-dotenv
 ujson

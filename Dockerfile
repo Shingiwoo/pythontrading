@@ -18,6 +18,7 @@ WORKDIR /app
 # Install deps dari requirements.txt (gunakan cache layer)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir "python-binance>=1.0.19,<2"
 
 # Copy project
 COPY newrealtrading.py coin_config.json ml_signal_plugin.py engine_core.py /app/
@@ -46,9 +47,9 @@ RUN printf '%s\n' '#!/usr/bin/env bash' \
  '  echo "[entrypoint] Starting papertrade.py (live-paper=$LIVE_PAPER)";' \
  '  python -u /app/papertrade.py ${LIVE_PAPER:+--live-paper} --symbols "${SYMBOLS:-ADAUSDT}" --interval "${INTERVAL:-15m}" --balance "${BALANCE:-20}" --risk_pct "${RISK_PCT:-0.01}" --verbose --coin_config "${COIN_CONFIG:-/data/coin_config.json}" --logs_dir "${LOGS_DIR:-/app/logs}" --ml-thr "${ML_THR:-1.0}" --fee_bps "${FEE_BPS:-10}" --slip_bps "${SLIP_BPS:-0}" & BOT_PID=$!' \
  'else' \
- '  echo "[entrypoint] Starting newrealtrading.py";' \
- '  python -u /app/newrealtrading.py --coin_config "${COIN_CONFIG:-/data/coin_config.json}" --symbol "${SYMBOLS:-ADAUSDT}" --verbose & BOT_PID=$!' \
- 'fi' \
+'  echo "[entrypoint] Starting newrealtrading.py";' \
+'  python -u /app/newrealtrading.py --live --symbols "${SYMBOLS:-ADAUSDT}" --interval "${INTERVAL:-15m}" --coin_config "${COIN_CONFIG:-/data/coin_config.json}" --balance "${BALANCE:-20}" ${VERBOSE:+--verbose} & BOT_PID=$!' \
+'fi' \
  'python -m http.server "$PORT" --directory /app & HTTP_PID=$!' \
  'wait -n' \
  'kill -TERM "$BOT_PID" "$HTTP_PID" 2>/dev/null || true' \
