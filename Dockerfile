@@ -20,7 +20,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy project
-COPY newrealtrading.py coin_config.json ml_signal_plugin.py /app/
+COPY newrealtrading.py coin_config.json ml_signal_plugin.py engine_core.py /app/
 
 # (Opsional) kalau MAU copy .env ke container, uncomment baris ini.
 # Namun lebih aman pakai --env-file atau docker-compose.
