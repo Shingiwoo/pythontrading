@@ -1,10 +1,4 @@
 services:
-tmpfs:
-- /tmp
-- /run
-security_opt:
-- no-new-privileges:true
-cap_drop:
 - ALL
 pids_limit: 256
 mem_limit: 512m
@@ -12,10 +6,7 @@ restart: unless-stopped
 volumes:
 - ./coin_config.json:/data/coin_config.json:ro
 - ./logs:/app/logs
-# mount project ke image hasil build; tidak perlu expose port
 
-
-# Opsi uji di TESTNET (aman sebelum real)
 newrealtrading_testnet:
 container_name: newrealtrading_testnet
 build:
@@ -25,15 +16,23 @@ env_file:
 - .env
 environment:
 - TZ=${TZ:-Asia/Jakarta}
-command: >-
-python -u /app/newrealtrading.py
---live --real-exec --testnet
---symbols "DOGEUSDT,XRPUSDT"
---interval 15m
---coin_config /data/coin_config.json
---instance-id ${INSTANCE_ID:-botTEST}
---account-guard
---verbose
+command:
+- python
+- -u
+- /app/newrealtrading.py
+- --live
+- --real-exec
+- --testnet
+- --symbols
+- DOGEUSDT,XRPUSDT
+- --interval
+- 15m
+- --coin_config
+- /data/coin_config.json
+- --instance-id
+- ${INSTANCE_ID:-botTEST}
+- --account-guard
+- --verbose
 read_only: true
 tmpfs:
 - /tmp
