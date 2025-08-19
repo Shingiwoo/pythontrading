@@ -6,9 +6,10 @@
 # - Struktur modular: CoinTrader, TradingManager, utils, indikator, loader config, ML plugin hook
 # =============================================================
 from __future__ import annotations
-import os, json, time, math, threading
+import os, json, time, math, threading, random, string
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
+from uuid import uuid4
 
 import pandas as pd
 import numpy as np
@@ -34,6 +35,28 @@ from engine_core import (
 )
 
 from binance.client import Client
+
+
+class RateLimiter:
+    def __init__(self, rate: float, per: float = 1.0):
+        self.rate = rate
+        self.per = per
+        self.allowance = rate
+        self.last_check = time.monotonic()
+
+    def wait(self):
+        now = time.monotonic()
+        time_passed = now - self.last_check
+        self.last_check = now
+        self.allowance += time_passed * (self.rate / self.per)
+        if self.allowance > self.rate:
+            self.allowance = self.rate
+        if self.allowance < 1.0:
+            sleep_for = (1.0 - self.allowance) * (self.per / self.rate)
+            time.sleep(sleep_for)
+            self.allowance = 0.0
+        else:
+            self.allowance -= 1.0
 
 
 class ExecutionClient:
@@ -78,19 +101,35 @@ class ExecutionClient:
             if self.verbose:
                 print(f"[EXEC] set_leverage fail: {e}")
 
-    def market_entry(self, symbol: str, side: str, qty: float) -> Dict[str, Any]:
+    def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED"):
+        try:
+            self.client.futures_change_margin_type(symbol=symbol, marginType=margin_type)
+        except Exception as e:
+            if self.verbose:
+                print(f"[EXEC] set_margin_type fail: {e}")
+
+    def has_position(self, symbol: str) -> bool:
+        try:
+            pos = self.client.futures_position_information(symbol=symbol)
+            qty = float(pos[0].get("positionAmt", 0.0))
+            return abs(qty) > 0.0
+        except Exception:
+            return False
+
+    def market_entry(self, symbol: str, side: str, qty: float, client_id: Optional[str]=None) -> Dict[str, Any]:
         o = self.client.futures_create_order(
             symbol=symbol,
             side=side,
             type="MARKET",
             quantity=self.round_qty(symbol, qty),
-            reduceOnly=False
+            reduceOnly=False,
+            newClientOrderId=client_id
         )
         if self.verbose:
             print(f"[EXEC] MARKET ENTRY {symbol} {side} {qty} -> orderId={o.get('orderId')}")
         return o
 
-    def stop_market(self, symbol: str, side: str, stop_price: float, qty: float, reduce_only: bool=True) -> Dict[str, Any]:
+    def stop_market(self, symbol: str, side: str, stop_price: float, qty: float, reduce_only: bool=True, client_id: Optional[str]=None) -> Dict[str, Any]:
         sp = self.round_price(symbol, stop_price)
         o = self.client.futures_create_order(
             symbol=symbol,
@@ -101,7 +140,8 @@ class ExecutionClient:
             quantity=self.round_qty(symbol, qty),
             reduceOnly=reduce_only,
             workingType="MARK_PRICE",
-            timeInForce="GTC"
+            timeInForce="GTC",
+            newClientOrderId=client_id
         )
         if self.verbose:
             print(f"[EXEC] STOP_MARKET {symbol} {side} stop={sp} qty={qty} -> orderId={o.get('orderId')}")
@@ -116,13 +156,14 @@ class ExecutionClient:
             if self.verbose:
                 print(f"[EXEC] cancel_all fail: {e}")
 
-    def market_close(self, symbol: str, side: str, qty: float) -> Dict[str, Any]:
+    def market_close(self, symbol: str, side: str, qty: float, client_id: Optional[str]=None) -> Dict[str, Any]:
         o = self.client.futures_create_order(
             symbol=symbol,
             side=side,
             type="MARKET",
             quantity=self.round_qty(symbol, qty),
-            reduceOnly=True
+            reduceOnly=True,
+            newClientOrderId=client_id
         )
         if self.verbose:
             print(f"[EXEC] MARKET CLOSE {symbol} {side} {qty} -> orderId={o.get('orderId')}")
@@ -193,18 +234,20 @@ class Position:
 
 
 class CoinTrader:
-    def __init__(self, symbol: str, config: Dict[str, Any], *, verbose: bool=False, exec_client: Optional[ExecutionClient]=None):
+    def __init__(self, symbol: str, config: Dict[str, Any], *, instance_id: str="bot", account_guard: bool=False, verbose: bool=False, exec_client: Optional[ExecutionClient]=None):
         self.symbol = symbol.upper()
         self.config = config
         self.ml = MLSignal(self.config)
         self.pos = Position()
         self.cooldown_until_ts: Optional[float] = None
+        self.instance_id = instance_id
+        self.account_guard = account_guard
         self.verbose = verbose or _to_bool(self.config.get('VERBOSE', os.getenv('VERBOSE','0')), False)
         self.exec = exec_client
 
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
-            print(f"[{self.symbol}] {pd.Timestamp.utcnow().isoformat()} | {msg}")
+            print(f"[{self.instance_id}:{self.symbol}] {pd.Timestamp.utcnow().isoformat()} | {msg}")
 
     # Hook: ganti dengan sumber data live kamu
     def fetch_recent_klines(self) -> pd.DataFrame:
@@ -282,7 +325,8 @@ class CoinTrader:
                         except Exception:
                             pass
                         stop_side = "SELL"
-                        self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True)
+                        cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
+                        self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True, client_id=cid)
         else:
             profit_pct = (self.pos.entry - price)/self.pos.entry*100.0
             if profit_pct >= safe_trigger:
@@ -297,13 +341,17 @@ class CoinTrader:
                         except Exception:
                             pass
                         stop_side = "BUY"
-                        self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True)
+                        cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
+                        self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True, client_id=cid)
 
     def _cooldown_active(self) -> bool:
         return bool(self.cooldown_until_ts and time.time() < self.cooldown_until_ts)
 
     def _enter_position(self, side: str, price: float, atr: float, balance: float) -> None:
         if self._cooldown_active():
+            return
+        if self.exec and self.account_guard and self.exec.has_position(self.symbol):
+            self._log("SKIP entry: posisi masih terbuka di akun")
             return
         sl = self._hard_sl_price(price, atr, side)
         qty = self._size_position(price, sl, balance)
@@ -314,16 +362,18 @@ class CoinTrader:
         if self.exec:
             lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
             try:
+                self.exec.set_margin_type(self.symbol, "ISOLATED")
                 self.exec.set_leverage(self.symbol, lev)
             except Exception:
                 pass
             side_binance = 'BUY' if side == 'LONG' else 'SELL'
-            od = self.exec.market_entry(self.symbol, side_binance, qty)
+            cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
+            od = self.exec.market_entry(self.symbol, side_binance, qty, client_id=cid)
             fill_price = float(od.get('avgPrice') or od.get('price') or price)
             self.pos.entry = fill_price
             stop_side = 'SELL' if side == 'LONG' else 'BUY'
             if sl:
-                self.exec.stop_market(self.symbol, stop_side, sl, qty, reduce_only=True)
+                self.exec.stop_market(self.symbol, stop_side, sl, qty, reduce_only=True, client_id=cid + "-sl")
 
     def _should_exit(self, price: float) -> Tuple[bool, Optional[str]]:
         if not self.pos.side:
@@ -348,7 +398,8 @@ class CoinTrader:
             except Exception:
                 pass
             close_side = 'SELL' if self.pos.side == 'LONG' else 'BUY'
-            self.exec.market_close(self.symbol, close_side, self.pos.qty)
+            cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
+            self.exec.market_close(self.symbol, close_side, self.pos.qty, client_id=cid)
         self._log(f"EXIT {reason} price={price:.6f}")
         self.pos = Position()  # reset
         # cooldown
@@ -468,7 +519,7 @@ class CoinTrader:
 # Manager (contoh sederhana)
 # ============================
 class TradingManager:
-    def __init__(self, coin_config_path: str, symbols: List[str], *, exec_client: Optional[ExecutionClient]=None, verbose: bool=False):
+    def __init__(self, coin_config_path: str, symbols: List[str], *, instance_id: str="bot", account_guard: bool=False, exec_client: Optional[ExecutionClient]=None, verbose: bool=False):
         self.coin_config_path = coin_config_path
         self.symbols = [s.upper() for s in symbols]
         self._cfg = load_coin_config(coin_config_path)
@@ -477,7 +528,7 @@ class TradingManager:
         self.traders: Dict[str, CoinTrader] = {}
         for s in self.symbols:
             merged_cfg = merge_config(s, self._cfg)
-            self.traders[s] = CoinTrader(s, merged_cfg, verbose=self.verbose, exec_client=self.exec_client)
+            self.traders[s] = CoinTrader(s, merged_cfg, instance_id=instance_id, account_guard=account_guard, verbose=self.verbose, exec_client=self.exec_client)
         self._stop = False
         t = threading.Thread(target=self._watch_config, daemon=True)
         t.start()
@@ -548,6 +599,9 @@ if __name__ == "__main__":
     ap.add_argument("--limit", type=int, default=0, help="Batasi jumlah langkah dry-run (0 = semua)")
     ap.add_argument("--real-exec", action="store_true", help="Jika true, submit order ke Binance Futures (USDT-M). Default off untuk safety.")
     ap.add_argument("--testnet", action="store_true", help="Gunakan Binance Futures Testnet (disarankan uji dulu).")
+    ap.add_argument("--instance-id", default=None)
+    ap.add_argument("--logs_dir", default=None)
+    ap.add_argument("--account-guard", action="store_true")
     args = ap.parse_args()
     if args.verbose:
         os.environ["VERBOSE"] = "1"
@@ -560,6 +614,11 @@ if __name__ == "__main__":
         api_key = os.getenv("BINANCE_API_KEY","")
         api_sec = os.getenv("BINANCE_API_SECRET","")
         exec_client = ExecutionClient(api_key, api_sec, testnet=args.testnet, verbose=args.verbose)
+
+    if not args.instance_id:
+        args.instance_id = "bot" + ''.join(random.choices(string.ascii_uppercase, k=2))
+    if not args.logs_dir:
+        args.logs_dir = os.path.join("logs", args.instance_id)
 
     if args.csv and os.path.exists(args.csv):
         df = pd.read_csv(args.csv)
@@ -581,7 +640,7 @@ if __name__ == "__main__":
             warmup = max(300, min_train + 10)
             start_i = min(warmup, len(df)-1)
             steps = 0
-            mgr = TradingManager(args.coin_config, [sym], exec_client=exec_client, verbose=args.verbose)  # <-- PAKAI MANAGER YANG SAMA (state posisi tersimpan)
+            mgr = TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose)
             for i in range(start_i, len(df)):
                 data_map = {sym: df.iloc[:i+1].copy()}
                 mgr.run_once(data_map, {sym: args.balance})
@@ -594,7 +653,7 @@ if __name__ == "__main__":
             print(f"Dry-run completed: {steps} steps (start={start_i}, total_bars={len(df)}). Last position: {last_side}")
         else:
             data_map = {sym: df}
-            TradingManager(args.coin_config, [sym], exec_client=exec_client, verbose=args.verbose).run_once(data_map, {sym: args.balance})
+            TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose).run_once(data_map, {sym: args.balance})
             print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
     else:
         if args.live:
@@ -620,14 +679,16 @@ if __name__ == "__main__":
             interval = args.interval
             step = _sec(interval)
 
-            mgr = TradingManager(args.coin_config, syms, exec_client=exec_client, verbose=args.verbose)
+            mgr = TradingManager(args.coin_config, syms, instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose)
             balances = {s: args.balance for s in syms}
 
             print(f"[LIVE] start symbols={','.join(syms)} interval={interval}")
+            limiter = RateLimiter(rate=5)
             while True:
                 data_map = {}
                 for s in syms:
-                    # Ambil 600 bar futures
+                    limiter.wait()
+                    time.sleep(0.3 + random.random() * 0.5)
                     kl = client.futures_klines(symbol=s, interval=interval, limit=600)
                     # Format ke DataFrame
                     df = pd.DataFrame(kl, columns=[

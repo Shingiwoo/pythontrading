@@ -7,7 +7,7 @@
 #   - Tidak mengirim order; hanya mencatat entry/exit & PnL netto (fees+slippage) ke CSV
 # ==============================================================
 
-import os, sys, time, json, math, csv, argparse
+import os, sys, time, json, math, csv, argparse, random, string
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -16,6 +16,7 @@ import numpy as np
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
+from filelock import FileLock, Timeout
 
 # Binance
 from binance.client import Client
@@ -92,6 +93,27 @@ def ml_gate(up_prob: Optional[float], thr: float, eps: float = 1e-9) -> int:
 # -----------------------------
 # Binance client wrapper (retry)
 # -----------------------------
+class RateLimiter:
+    def __init__(self, rate: float, per: float = 1.0):
+        self.rate = rate
+        self.per = per
+        self.allowance = rate
+        self.last_check = time.monotonic()
+
+    def wait(self):
+        now = time.monotonic()
+        time_passed = now - self.last_check
+        self.last_check = now
+        self.allowance += time_passed * (self.rate / self.per)
+        if self.allowance > self.rate:
+            self.allowance = self.rate
+        if self.allowance < 1.0:
+            sleep_for = (1.0 - self.allowance) * (self.per / self.rate)
+            time.sleep(sleep_for)
+            self.allowance = 0.0
+        else:
+            self.allowance -= 1.0
+
 class BinanceFutures:
     def __init__(self, requests_timeout: int = 20, max_retries: int = 5):
         self.client = Client(requests_params={"timeout": requests_timeout})
@@ -167,8 +189,14 @@ def ensure_filters_to_coin_config(bnc: BinanceFutures, coin_cfg_path: str, symbo
         if 'SLIPPAGE_PCT' not in tgt: tgt['SLIPPAGE_PCT'] = _to_float(os.getenv('SLIPPAGE_PCT', '0.02'), 0.02); changed = True
 
     if changed:
-        with open(coin_cfg_path, 'w') as f:
-            json.dump(cfg_all, f, indent=2)
+        for _ in range(5):
+            try:
+                with FileLock(coin_cfg_path + '.lock', timeout=1):
+                    with open(coin_cfg_path, 'w') as f:
+                        json.dump(cfg_all, f, indent=2)
+                break
+            except Timeout:
+                time.sleep(random.uniform(0.1, 0.3))
         print(f"[INFO] coin_config.json diupdate dengan filter exchange untuk: {', '.join(symbols)}")
     return cfg_all
 
@@ -176,8 +204,8 @@ def ensure_filters_to_coin_config(bnc: BinanceFutures, coin_cfg_path: str, symbo
 # CSV Journal
 # -----------------------------
 class Journal:
-    def __init__(self, logs_dir: str, cfg_by_sym: Dict[str, dict], start_balance: float):
-        self.dir = logs_dir
+    def __init__(self, base_dir: str, instance_id: str, cfg_by_sym: Dict[str, dict], start_balance: float):
+        self.dir = os.path.join(base_dir, instance_id)
         os.makedirs(self.dir, exist_ok=True)
         self.cfg = cfg_by_sym
         self.balance = {s: float(start_balance) for s in cfg_by_sym.keys()}
@@ -300,7 +328,8 @@ def main():
     ap.add_argument("--interval", default="15m", choices=list(INTERVAL_MAP.keys()))
     ap.add_argument("--balance", type=float, default=20.0, help="Start balance per symbol (USDT)")
     ap.add_argument("--coin_config", default="coin_config.json")
-    ap.add_argument("--logs_dir", default="logs")
+    ap.add_argument("--instance-id", default=None)
+    ap.add_argument("--logs_dir", default=None)
     ap.add_argument("--risk_pct", type=float, default=None, help="Override risk_per_trade (contoh: 0.01)")
     ap.add_argument("--ml-thr", type=float, default=1.20, help="Threshold odds ML")
     ap.add_argument("--htf", default=None, help="Higher timeframe (contoh: 1h)")
@@ -313,6 +342,10 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
+    if not args.instance_id:
+        args.instance_id = "bot" + ''.join(random.choices(string.ascii_uppercase, k=2))
+    if not args.logs_dir:
+        args.logs_dir = os.path.join("logs", args.instance_id)
     os.environ.setdefault("VERBOSE", "1" if args.verbose else "0")
 
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -346,18 +379,20 @@ def main():
         merged["SLIPPAGE_PCT"] = rules["slip_bps"] * 0.01
         cfg_by_sym[s] = merged
 
-    journal = Journal(args.logs_dir, cfg_by_sym, args.balance)
+    journal = Journal(os.path.dirname(args.logs_dir), args.instance_id, cfg_by_sym, args.balance)
     for s in syms:
         traders[s] = JournaledCoinTrader(s, cfg_by_sym[s], journal)
 
     print(f"[SYSTEM] Live paper feed start symbols={','.join(syms)} interval={args.interval}")
 
     # Loop live
+    limiter = RateLimiter(rate=5)
     last_bar_ts: Dict[str, Optional[pd.Timestamp]] = {s: None for s in syms}
     while True:
-        # Ambil data per simbol
         for s in syms:
             try:
+                limiter.wait()
+                time.sleep(0.3 + random.random() * 0.5)
                 raw = bnc.klines(s, interval_key, limit=min(max(args.limit_bars, 200), 1500))
                 if len(raw) < 2:
                     continue
@@ -371,7 +406,6 @@ def main():
             except Exception as e:
                 print(f"[ERROR] live loop {s}: {e}")
 
-        # tidur sampai close bar berikutnya
         sleep_s = next_close_sleep(int_s, skew=1.0)
         if sleep_s > 0:
             time.sleep(sleep_s)
