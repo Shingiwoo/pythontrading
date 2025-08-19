@@ -35,6 +35,9 @@ from engine_core import (
 )
 
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+INSTANCE_ID = os.getenv("INSTANCE_ID", "bot")
 
 
 class RateLimiter:
@@ -101,9 +104,13 @@ class ExecutionClient:
             if self.verbose:
                 print(f"[EXEC] set_leverage fail: {e}")
 
-    def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED"):
+    def set_margin_type(self, symbol: str, isolated: bool | str = "ISOLATED"):
         try:
-            self.client.futures_change_margin_type(symbol=symbol, marginType=margin_type)
+            if isinstance(isolated, bool):
+                mtype = "ISOLATED" if isolated else "CROSs"
+            else:
+                mtype = str(isolated)
+            self.client.futures_change_margin_type(symbol=symbol, marginType=mtype)
         except Exception as e:
             if self.verbose:
                 print(f"[EXEC] set_margin_type fail: {e}")
@@ -116,15 +123,32 @@ class ExecutionClient:
         except Exception:
             return False
 
+    def get_available_balance(self) -> float:
+        """
+        Ambil saldo USDT yang available untuk buka posisi baru (Futures USDT-M).
+        """
+        try:
+            bal = self.client.futures_account_balance()
+            usdt = next((b for b in bal if b.get("asset") == "USDT"), None)
+            return float(usdt.get("availableBalance", 0.0)) if usdt else 0.0
+        except Exception:
+            try:
+                acc = self.client.futures_account()
+                return float(acc.get("availableBalance", 0.0))
+            except Exception:
+                return 0.0
+
     def market_entry(self, symbol: str, side: str, qty: float, client_id: Optional[str]=None) -> Dict[str, Any]:
-        o = self.client.futures_create_order(
+        params = dict(
             symbol=symbol,
             side=side,
             type="MARKET",
             quantity=self.round_qty(symbol, qty),
             reduceOnly=False,
-            newClientOrderId=client_id
         )
+        if client_id:
+            params["newClientOrderId"] = client_id
+        o = self.client.futures_create_order(**params)
         if self.verbose:
             print(f"[EXEC] MARKET ENTRY {symbol} {side} {qty} -> orderId={o.get('orderId')}")
         return o
@@ -347,33 +371,83 @@ class CoinTrader:
     def _cooldown_active(self) -> bool:
         return bool(self.cooldown_until_ts and time.time() < self.cooldown_until_ts)
 
-    def _enter_position(self, side: str, price: float, atr: float, balance: float) -> None:
+    def _enter_position(self, side: str, price: float, atr: float, available_balance: float) -> float:
         if self._cooldown_active():
-            return
+            return 0.0
         if self.exec and self.account_guard and self.exec.has_position(self.symbol):
             self._log("SKIP entry: posisi masih terbuka di akun")
-            return
-        sl = self._hard_sl_price(price, atr, side)
-        qty = self._size_position(price, sl, balance)
-        if qty <= 0:
-            return
-        self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=pd.Timestamp.utcnow())
-        self._log(f"ENTRY {side} price={price:.6f} qty={qty:.6f} sl={sl:.6f}")
-        if self.exec:
-            lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
-            try:
-                self.exec.set_margin_type(self.symbol, "ISOLATED")
+            return 0.0
+
+        side_binance = "BUY" if side == "LONG" else "SELL"
+        lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
+        risk = float(self.config.get('risk_per_trade', DEFAULTS['risk_per_trade']))
+        fee_buf = float(self.config.get('fee_buffer_pct', 0.001))
+
+        try:
+            if self.exec:
+                self.exec.set_margin_type(self.symbol, True)
                 self.exec.set_leverage(self.symbol, lev)
-            except Exception:
-                pass
-            side_binance = 'BUY' if side == 'LONG' else 'SELL'
-            cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
-            od = self.exec.market_entry(self.symbol, side_binance, qty, client_id=cid)
-            fill_price = float(od.get('avgPrice') or od.get('price') or price)
-            self.pos.entry = fill_price
-            stop_side = 'SELL' if side == 'LONG' else 'BUY'
-            if sl:
+        except Exception:
+            pass
+
+        margin = max(0.0, available_balance) * max(0.0, risk)
+        if margin <= 0.0:
+            self._log(f"SKIP entry: available={available_balance:.4f}, margin=0")
+            return 0.0
+
+        raw_qty = (margin * lev) / max(price, 1e-9)
+        if self.exec:
+            qty = self.exec.round_qty(self.symbol, raw_qty)
+        else:
+            step = _to_float(self.config.get('stepSize', 0.0), 0.0)
+            qty = floor_to_step(raw_qty, step) if step > 0 else raw_qty
+        if qty <= 0.0:
+            self._log(f"SKIP entry: qty setelah pembulatan LOT_SIZE = 0 (raw={raw_qty:.8f})")
+            return 0.0
+
+        need = (price * qty / max(lev, 1)) * (1.0 + fee_buf)
+        try:
+            live_avail = self.exec.get_available_balance() if self.exec else available_balance
+        except Exception:
+            live_avail = available_balance
+        if need > max(live_avail, 0.0):
+            max_qty_by_margin = ((live_avail / max(lev, 1)) / max(price, 1e-9)) * 0.95
+            if self.exec:
+                shrunk = self.exec.round_qty(self.symbol, max(0.0, max_qty_by_margin))
+            else:
+                step = _to_float(self.config.get('stepSize', 0.0), 0.0)
+                shrunk = floor_to_step(max(0.0, max_qty_by_margin), step) if step > 0 else max(0.0, max_qty_by_margin)
+            if shrunk <= 0:
+                self._log(f"SKIP entry: need={need:.4f} > available={live_avail:.4f}")
+                return 0.0
+            self._log(f"SHRINK qty {qty:.6f} -> {shrunk:.6f} (avail={live_avail:.4f}, need={need:.4f})")
+            qty = shrunk
+            need = (price * qty / max(lev, 1)) * (1.0 + fee_buf)
+
+        sl = self._hard_sl_price(price, atr, side)
+        self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=pd.Timestamp.utcnow())
+
+        try:
+            cid = f"x-{os.getenv('INSTANCE_ID', 'bot')}-{self.symbol}-{uuid4().hex[:8]}"
+            od = self.exec.market_entry(self.symbol, side_binance, qty, client_id=cid) if self.exec else {}
+            if od:
+                fill_price = float(od.get('avgPrice') or od.get('price') or price)
+                self.pos.entry = fill_price
+            self._log(f"ENTRY {side} price={price} qty={qty:.6f}")
+            if sl and self.exec:
+                stop_side = 'SELL' if side == 'LONG' else 'BUY'
                 self.exec.stop_market(self.symbol, stop_side, sl, qty, reduce_only=True, client_id=cid + "-sl")
+            return (price * qty) / max(lev, 1)
+        except BinanceAPIException as e:
+            if getattr(e, "code", None) == -2019:
+                self._log("WARN: Margin insufficient. Cooldown & skip.")
+                self.cooldown_until_ts = time.time() + int(self.config.get("cooldown_seconds", DEFAULTS.get("cooldown_seconds", 60)))
+                return 0.0
+            self._log(f"error MARKET ENTRY: {e}")
+            return 0.0
+        except Exception as e:
+            self._log(f"error MARKET ENTRY: {e}")
+            return 0.0
 
     def _should_exit(self, price: float) -> Tuple[bool, Optional[str]]:
         if not self.pos.side:
@@ -410,9 +484,9 @@ class CoinTrader:
         except Exception:
             pass
 
-    def check_trading_signals(self, df_raw: pd.DataFrame, balance: float) -> None:
+    def check_trading_signals(self, df_raw: pd.DataFrame, available_balance: float) -> float:
         if df_raw is None or df_raw.empty:
-            return
+            return 0.0
         heikin = _to_bool(self.config.get('heikin', False), False)
         df = calculate_indicators(df_raw, heikin=heikin)
         last = df.iloc[-1]
@@ -425,7 +499,7 @@ class CoinTrader:
             ex, rs = self._should_exit(price)
             if ex:
                 self._exit_position(price, rs or 'Exit')
-                return
+                return 0.0
 
         # Filter ATR & body/ATR
         atr_ok = (last['atr_pct'] >= _to_float(self.config.get('min_atr_pct', DEFAULTS['min_atr_pct']), DEFAULTS['min_atr_pct'])) \
@@ -441,7 +515,7 @@ class CoinTrader:
                 print(f"[{self.symbol}] FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
             # kalau posisi sedang terbuka, tetap lanjut ke trailing/exit di atas; sampai sini berarti pos None → keluar
             if not self.pos.side:
-                return
+                return 0.0
 
         # HTF filter (opsional)
         if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
@@ -482,7 +556,7 @@ class CoinTrader:
             ex, reason = self._should_exit(price)
             if ex:
                 self._exit_position(price, reason or 'Exit')
-                return
+                return 0.0
 
         # ---- Time-stop (selaras backtest) ----
         max_hold = _to_int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)), 3600)
@@ -502,17 +576,18 @@ class CoinTrader:
 
                 if elapsed >= max_hold and roi_frac >= min_roi:
                     self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
-                    return
+                    return 0.0
                 elif elapsed >= max_hold:
                     self.pos.entry_time = pd.Timestamp.utcnow()
         # --------------------------------------
-
+        used = 0.0
         # Entry baru
         if not self.pos.side and not self._cooldown_active():
             if long_sig:
-                self._enter_position('LONG', price, atr, balance)
+                used = self._enter_position('LONG', price, atr, available_balance)
             elif short_sig:
-                self._enter_position('SHORT', price, atr, balance)
+                used = self._enter_position('SHORT', price, atr, available_balance)
+        return used or 0.0
 
 
 # ============================
@@ -568,12 +643,24 @@ class TradingManager:
                 time.sleep(2.0)
 
     # Hook: implement loop fetch + dispatch ke trader
-    def run_once(self, data_map: Dict[str, pd.DataFrame], balance_by_sym: Dict[str, float]):
-        for sym, trader in self.traders.items():
+    def run_once(self, data_map: Dict[str, pd.DataFrame], _balances_unused=None):
+        any_trader = next(iter(self.traders.values()))
+        try:
+            step_available = any_trader.exec.get_available_balance()
+        except Exception:
+            step_available = 0.0
+        for sym in self.symbols:
+            trader = self.traders.get(sym)
             df = data_map.get(sym)
-            bal = balance_by_sym.get(sym, 20.0)
-            if isinstance(df, pd.DataFrame) and len(df)>0:
-                trader.check_trading_signals(df, bal)
+            if trader is None or df is None or len(df) == 0:
+                continue
+            try:
+                used_margin = trader.check_trading_signals(df, step_available)
+                if used_margin and used_margin > 0:
+                    step_available = max(0.0, step_available - used_margin)
+            except Exception as e:
+                print(f"[{sym}] error: {e}")
+                continue
 
     def stop(self):
         self._stop = True
@@ -599,12 +686,14 @@ if __name__ == "__main__":
     ap.add_argument("--limit", type=int, default=0, help="Batasi jumlah langkah dry-run (0 = semua)")
     ap.add_argument("--real-exec", action="store_true", help="Jika true, submit order ke Binance Futures (USDT-M). Default off untuk safety.")
     ap.add_argument("--testnet", action="store_true", help="Gunakan Binance Futures Testnet (disarankan uji dulu).")
-    ap.add_argument("--instance-id", default=None)
+    ap.add_argument("--instance-id", default="bot", help="ID instance unik (untuk penamaan order/log)")
     ap.add_argument("--logs_dir", default=None)
     ap.add_argument("--account-guard", action="store_true")
     args = ap.parse_args()
     if args.verbose:
         os.environ["VERBOSE"] = "1"
+    os.environ["INSTANCE_ID"] = args.instance_id
+    INSTANCE_ID = args.instance_id
 
     cfg_all = load_coin_config(args.coin_config) if os.path.exists(args.coin_config) else {}
     cfg = merge_config(args.symbol.upper(), cfg_all)
@@ -615,8 +704,6 @@ if __name__ == "__main__":
         api_sec = os.getenv("BINANCE_API_SECRET","")
         exec_client = ExecutionClient(api_key, api_sec, testnet=args.testnet, verbose=args.verbose)
 
-    if not args.instance_id:
-        args.instance_id = "bot" + ''.join(random.choices(string.ascii_uppercase, k=2))
     if not args.logs_dir:
         args.logs_dir = os.path.join("logs", args.instance_id)
 
@@ -680,8 +767,8 @@ if __name__ == "__main__":
             step = _sec(interval)
 
             mgr = TradingManager(args.coin_config, syms, instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose)
-            balances = {s: args.balance for s in syms}
 
+            print(f"[LIVE] balance sumber: account availableBalance (bukan arg --balance)")
             print(f"[LIVE] start symbols={','.join(syms)} interval={interval}")
             limiter = RateLimiter(rate=5)
             while True:
@@ -701,7 +788,7 @@ if __name__ == "__main__":
                     df = df[["timestamp","open","high","low","close","volume"]].dropna()
                     data_map[s] = df
 
-                mgr.run_once(data_map, balances)
+                mgr.run_once(data_map)
 
                 # tidur sampai candle berikutnya + buffer 1s
                 now = time.time()

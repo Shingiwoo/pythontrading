@@ -289,15 +289,16 @@ class JournaledCoinTrader(CoinTrader):
             pass
         return qty
 
-    def _enter_position(self, side: str, price: float, atr: float, balance: float) -> None:
+    def _enter_position(self, side: str, price: float, atr: float, available_balance: float) -> float:
         before_qty = getattr(self.pos, "qty", 0.0) or 0.0
-        super()._enter_position(side, price, atr, balance)
+        used = super()._enter_position(side, price, atr, available_balance)
         # Jika benar-benar masuk (qty > 0 & ada side)
         if self.pos.side and self.pos.qty > 0 and self.pos.qty != before_qty:
             self.journal.on_entry(
                 self.symbol, self.pos.side, self.pos.entry if self.pos.entry is not None else 0.0, self.pos.qty,
                 self.pos.sl, self.pos.trailing_sl
             )
+        return used
 
     def _exit_position(self, price: float, reason: str) -> None:
         # simpan dulu utk CSV
@@ -402,7 +403,9 @@ def main():
                     continue
                 df = build_df_from_klines(raw[:-1])
                 last_bar_ts[s] = last_ts
-                traders[s].check_trading_signals(df, journal.balance[s])
+                used = traders[s].check_trading_signals(df, journal.balance[s])
+                if used and used > 0:
+                    journal.balance[s] = max(0.0, journal.balance[s] - used)
             except Exception as e:
                 print(f"[ERROR] live loop {s}: {e}")
 
