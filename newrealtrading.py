@@ -657,11 +657,14 @@ class TradingManager:
 
     # Hook: implement loop fetch + dispatch ke trader
     def run_once(self, data_map: Dict[str, pd.DataFrame], _balances_unused=None):
+        step_available = 0.0
         any_trader = next(iter(self.traders.values()))
-        try:
-            step_available = any_trader.exec.get_available_balance()
-        except Exception:
-            step_available = 0.0
+        exec_client = getattr(any_trader, "exec", None)
+        if exec_client is not None:
+            try:
+                step_available = exec_client.get_available_balance()
+            except Exception:
+                step_available = 0.0
         for sym in self.symbols:
             trader = self.traders.get(sym)
             df = data_map.get(sym)

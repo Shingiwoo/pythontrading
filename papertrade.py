@@ -274,8 +274,9 @@ class JournaledCoinTrader(CoinTrader):
         super().__init__(symbol, config)
         self.journal = journal
 
-    def _size_position(self, price: float, balance: float) -> float:
-        qty = super()._size_position(price, balance)
+    def _size_position(self, price: float, sl: float, balance: float) -> float:
+        # panggil base method dengan signature yang sama
+        qty = super()._size_position(price, sl, balance)
         # Enforce minNotional bila ada
         try:
             min_not = _to_float(self.config.get("minNotional", 0.0), 0.0)
