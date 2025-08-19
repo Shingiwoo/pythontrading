@@ -1,106 +1,86 @@
-# Bot Trading — Binance Futures (Scalping & Swing)
+# Bot Trading — Scalping & Swing (Binance Futures)
 
-> **Tujuan:** Build bot trading modular untuk Binance Futures dengan jalur kerja: **Backtest → Dry‑Run → Papertrade (live data, tanpa order) → Real Trading**. Target strategi: WR ≥ 75% dan Profit Factor > 2 (dicapai lewat iterasi parameter & filter). File utama: `backtester_scalping.py`, `papertrade.py`, `newrealtrading.py`, `ml_signal_plugin.py`.
+Repo ini berisi:
 
----
+* **backtester\_scalping.py** (selaras real-trading)
+* **backtester\_swing.py**
+* **papertrade.py** (live data tanpa order)
+* **newrealtrading.py** (real trading ke Binance)
+* **engine\_core.py** (helper indikator & money management)
+* **ml\_signal\_plugin.py** (opsional)
+* **coin\_config.json** (per‑symbol tuning, lot/precision)
 
-## 1) Struktur Proyek
-
-```
-.
-├── backtester_scalping.py     # Streamlit backtester (scalping) — sejalan logic real-trading
-├── backtester_swing.py        # Streamlit backtester (swing)
-├── tools_dryrun_summary.py    # Dry‑run bar-by-bar pakai logic real (ringkasan WR/PF)
-├── papertrade.py              # Live data Binance — jurnal CSV — TANPA order
-├── newrealtrading.py          # Real trading ke Binance Futures (order nyata)
-├── ml_signal_plugin.py        # Plugin ML (RandomForest)
-├── engine_core.py             # Helper indikator, sizing/pnl util, filter & journaling
-├── coin_config.json           # Konfigurasi per‑symbol (MM, filter, SL/TS/BE, presisi)
-├── requirements.txt
-├── Dockerfile
-└── data/                      # (opsional) CSV OHLCV untuk backtest/dry‑run
-```
+> Target strategi: WR ≥ 75%, PF > 2 untuk mode scalping/swing (dicapai lewat kombinasi filter ATR, body/ATR, ML gate, trailing, BE, time stop, dll.).
 
 ---
 
-## 2) Instalasi (Local)
+## 1) Persiapan
 
-### Python
+### Requirements
 
-* **Python 3.10+** disarankan (3.11 OK).
-* Install deps terbaru:
+* Python **3.10–3.12** (disarankan 3.11)
+* Paket (lihat `requirements.txt`): `pandas numpy ta scikit-learn python-binance streamlit matplotlib plotly python-dotenv ujson filelock websockets`
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -U pip
-pip install -U -r requirements.txt
+pip install -r requirements.txt
 ```
 
-### Environment (.env)
+### ENV (contoh `.env`)
 
-Buat `.env` dari contoh berikut (gunakan API testnet dulu untuk uji real‑trading aman):
-
-```env
-# --- Binance ---
-BINANCE_API_KEY=your_key
-BINANCE_API_SECRET=your_secret
-# set TRUE untuk testnet saat real trading (opsi --testnet)
-# INSTANCE_ID unik per bot utk newClientOrderId
-INSTANCE_ID=BOT_A
-
-# --- ML default ---
+```
+BINANCE_API_KEY=YOUR_KEY
+BINANCE_API_SECRET=YOUR_SECRET
+INSTANCE_ID=botA
+# Opsional ML & scoring
 USE_ML=1
 SCORE_THRESHOLD=1.2
 ML_MIN_TRAIN_BARS=400
 ML_RETRAIN_EVERY=5000
-ML_UP_PROB=0.55
-ML_DOWN_PROB=0.45
-
-# --- Lainnya ---
-VERBOSE=1
 ```
 
-> **Catatan:** Di **papertrade**, kline public API tidak membutuhkan API key. Kunci diperlukan saat **real trading**.
+> **Catatan**: `INSTANCE_ID` dipakai untuk `newClientOrderId` supaya aman multi‑bot di satu server/IP.
 
 ---
 
-## 3) Jalur Kerja — Backtest → Dry‑Run → Papertrade → Real
+## 2) Backtester
 
-### 3.1 Backtest (Scalping)
-
-1. Taruh CSV ke folder `data/`. Contoh file: `data/trades_scalping_ADAUSDT_15M_2025-06-01_TO_2025-08-14.csv`.
-2. Jalankan Streamlit:
+### Scalping
 
 ```bash
 streamlit run backtester_scalping.py --server.port 8501
 ```
 
-3. Pilih file CSV → Atur parameter:
+* Pilih file CSV OHLCV di sidebar (kolom wajib: timestamp/open/high/low/close/volume).
+* **use\_htf\_filter** default **OFF** untuk eksplorasi awal.
+* Mode **Debug** tersedia untuk melihat alasan suatu bar terblokir.
 
-   * **use\_htf\_filter = OFF**, **ML = ON** (uji baseline)
-   * Lalu uji **use\_htf\_filter = ON + ML = ON**
-4. Unduh hasil trades CSV jika perlu.
+### Swing
 
-> Backtester sudah selaras logic real‑trading: SL/BE/Trailing, cooldown, clamp min/max SL, dan money management berbasis **balance × risk × leverage / price** + normalisasi LOT\_SIZE.
+```bash
+streamlit run backtester_swing.py --server.port 8502
+```
 
-### 3.2 Dry‑Run (CLI, cepat)
+---
 
-Jalankan replay bar‑by‑bar menggunakan logic `newrealtrading.py` (tanpa order):
+## 3) Dry‑run (replay CSV seperti live)
 
 ```bash
 python tools_dryrun_summary.py \
   --symbol ADAUSDT \
-  --csv data/trades_scalping_ADAUSDT_15M_2025-06-01_TO_2025-08-14.csv \
+  --csv data/ADAUSDT_15m_2025-06-01_to_2025-08-09.csv \
   --coin_config coin_config.json \
-  --steps 800 --balance 20 \
-  --out ADA_dryrun_trades_800.csv
+  --steps 500 --balance 20 \
+  --out ADA_dryrun_trades_500.csv
 ```
 
-Output akan menampilkan **WinRate**, **ProfitFactor**, **avg PnL**, serta menyimpan CSV trade detail jika `--out` digunakan.
+Output: ringkasan WR, PF, avg PnL, dan CSV trade detail.
 
-### 3.3 Papertrade (live data, TANPA order)
+---
 
-* Menarik kline futures USDⓈ‑M via public endpoint, lalu men‑drive `CoinTrader` & menyimpan jurnal CSV per simbol.
+## 4) Papertrade (live data, tanpa order)
 
 ```bash
 python papertrade.py \
@@ -109,202 +89,134 @@ python papertrade.py \
   --interval 15m \
   --balance 20 \
   --coin_config coin_config.json \
-  --instance-id PT_A \
+  --instance-id PAPER01 \
   --verbose
 ```
 
-Jurnal tersimpan di folder `logs/<INSTANCE_ID>/<SYMBOL>_paper_trades.csv`.
+* Bot menarik **klines futures** via REST, memproses sinyal, **mencatat entry/exit & PnL** ke CSV di folder `logs/<INSTANCE_ID>`.
+* Ukuran posisi memperhitungkan `stepSize`, `minQty`, `minNotional` (otomatis di‑inject bila perlu).
 
-### 3.4 Real Trading (order nyata)
+---
 
-> **Disarankan:** Mulai di **testnet** sampai alur terverifikasi.
+## 5) Real Trading (Binance Futures USDT‑M)
+
+> **Uji di testnet lebih dulu!**
 
 ```bash
-# TESTNET (aman)
 python newrealtrading.py \
   --live \
   --symbols ADAUSDT,DOGEUSDT,XRPUSDT \
-  --interval 15m \
   --real-exec \
   --testnet \
-  --instance-id REAL_A \
+  --instance-id botA \
   --account-guard \
   --verbose
-
-# MAINNET (modal asli, hati-hati!) — hapus --testnet
 ```
 
-**Money Management multi‑coin (global balance gate)**
-
-* Pada satu langkah pemindaian, bot menarik `availableBalance` akun futures, lalu **mengalokasikan entry berturut‑turut** per simbol.
-* Contoh (balance awal \$20, risk 8%, 3 simbol):
-
-  * DOGE: 20×0.08 = 1.60
-  * XRP: (20−1.60)×0.08 = 1.49
-  * ADA: (20−1.60−1.49)×0.08 ≈ 1.49 → *balance akhir ≈ 15.42*
-* Jika **-2019 Margin is insufficient**, bot **mengecilkan qty** (hingga batas) atau **skip & cooldown**.
+* **Sumber balance**: `availableBalance` dari akun futures, **bukan** argumen `--balance`.
+* Jika **margin tidak cukup**, bot otomatis **shrink qty** sesuai saldo & `minNotional`.
+* **Account Guard**: bila posisi masih ada di akun, bot **skip entry baru** untuk simbol yang sama.
+* **Time Stop** dan **ROI minimal** sesuai `coin_config.json` (`max_hold_seconds`, `min_roi_to_close_by_time`).
 
 ---
 
-## 4) Menjalankan 2 Bot pada 1 Server/IP
+## 6) Multi‑Bot dalam 1 Server/IP
 
-**Direktori terpisah + ENV terpisah**:
+Jalankan dua kontainer/proses dengan **AKUN/APIKEY berbeda** atau sama (asal `INSTANCE_ID` beda). Pastikan direktori kerja/log terpisah.
+
+**Contoh** (dua folder):
 
 ```
-/var/www/realtrading     # BOT A
-/var/www/realtradingb    # BOT B
+/var/www/realtrading   -> INSTANCE_ID=botA, logs: logsA/
+/var/www/realtradingb  -> INSTANCE_ID=botB, logs: logsB/
 ```
 
-Langkah:
-
-1. Duplikasi project ke dua folder di atas.
-2. Masing‑masing folder punya `.env`, `coin_config.json`, `logs/`, dan **INSTANCE\_ID unik** (mis. `REAL_A`, `REAL_B`).
-3. Gunakan **API key & akun Binance berbeda** (tidak akan saling bentrok). Jika **akun sama**, risiko balapan `availableBalance` tetap ada; pertimbangkan **akun terpisah** atau kurangi risk.
-4. Jalankan masing‑masing:
+**Contoh Docker**:
 
 ```bash
-# BOT A
-cd /var/www/realtrading
-python newrealtrading.py --live --symbols ADAUSDT,DOGEUSDT,XRPUSDT --interval 15m --real-exec --instance-id REAL_A --verbose
+# Build
+docker build -t analisa-bot:latest .
 
-# BOT B
-cd /var/www/realtradingb
-python newrealtrading.py --live --symbols ADAUSDT,DOGEUSDT,XRPUSDT --interval 15m --real-exec --instance-id REAL_B --verbose
+# Bot A
+docker run -d --name realtradingA \
+  -e BINANCE_API_KEY=KEY_A -e BINANCE_API_SECRET=SEC_A \
+  -e INSTANCE_ID=botA -e USE_ML=1 -e SCORE_THRESHOLD=1.2 \
+  -v $(pwd)/logsA:/app/logs \
+  --restart unless-stopped \
+  analisa-bot:latest \
+  python newrealtrading.py --live --symbols ADAUSDT,DOGEUSDT,XRPUSDT --real-exec --account-guard --verbose
+
+# Bot B
+docker run -d --name realtradingB \
+  -e BINANCE_API_KEY=KEY_B -e BINANCE_API_SECRET=SEC_B \
+  -e INSTANCE_ID=botB -e USE_ML=1 -e SCORE_THRESHOLD=1.2 \
+  -v $(pwd)/logsB:/app/logs \
+  --restart unless-stopped \
+  analisa-bot:latest \
+  python newrealtrading.py --live --symbols ADAUSDT,DOGEUSDT,XRPUSDT --real-exec --account-guard --verbose
 ```
 
-**Monitoring (Docker contoh):**
-
-```bash
-docker logs -f realtradingb | egrep "LIVE|DECISION|ENTRY|EXIT|COOLDOWN|Hit|FILTER BLOCK|error|WARN"
-```
-
-> **Anti‑bentrok:** Order ID memakai prefix `x-<INSTANCE_ID>-<SYMBOL>-<rand8>`. Pastikan **INSTANCE\_ID berbeda** per bot.
+> Dengan mekanisme **shared `availableBalance`** di `TradingManager.run_once`, ketika menjalankan multi‑symbol, porsi modal akan **berkurang berantai** per entry: contoh saldo \$20, risk 8% → entry1 \$1.6, sisa \$18.4; entry2 \$1.47, sisa \$16.93; entry3 \$1.35, dst.
 
 ---
 
-## 5) Docker (opsional)
+## 7) Tuning coin\_config.json
 
-### Build
+* **Lot/precision**: `stepSize`, `minQty`, `quantityPrecision`, `minNotional` → wajib sesuai exchange. `papertrade.py` dapat **meng‑inject otomatis** via `futures_exchange_info`.
+* **Risk & Leverage**: `risk_per_trade`, `leverage`.
+* **Filter**: `min_atr_pct`, `max_atr_pct`, `max_body_atr`, `use_htf_filter`.
+* **Exit**: `sl_mode`, `sl_pct`/`sl_atr_mult`, `sl_min_pct`, `sl_max_pct`, `use_breakeven`, `be_trigger_pct`, `trailing_trigger`, `trailing_step`, `max_hold_seconds`, `min_roi_to_close_by_time`.
+* **ML**: `ml.score_threshold` atau ENV `SCORE_THRESHOLD`.
 
-```bash
-docker build -t bot-trading:latest .
-```
+---
 
-### Jalankan Backtester (web)
+## 8) Troubleshooting
 
-```bash
-docker run --rm -it -p 8501:8501 \
-  -v $PWD:/app \
-  --name bt-scap \
-  bot-trading:latest \
-  streamlit run backtester_scalping.py --server.port 8501 --server.address 0.0.0.0
-```
+* **APIError -2019 (Margin is insufficient)**: bot akan mengecilkan qty otomatis. Pastikan `minNotional` tercapai; naikkan leverage atau saldo.
+* **Pylance override error**: pastikan signature override sama persis (lihat patch di bawah).
+* **Duplikat orderId**: bedakan `INSTANCE_ID` tiap bot.
+* **Koneksi/testnet**: set `--testnet` dan cek `FUTURES_URL` diarahkan ke testnet.
 
-### Jalankan Papertrade
+---
 
-```bash
-docker run --rm -it --name paperA \
-  -v $PWD:/app \
-  -e INSTANCE_ID=PT_A \
-  bot-trading:latest \
-  python papertrade.py --live-paper --symbols ADAUSDT,DOGEUSDT --interval 15m --balance 20 --verbose
-```
+## 9) Dockerfile
 
-### Jalankan Real Trading (testnet)
+```dockerfile
+# Dockerfile (Python 3.11, slim)
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+WORKDIR /app
 
-```bash
-docker run -d --name realA \
-  -v $PWD:/app \
-  --env-file .env \
-  -e INSTANCE_ID=REAL_A \
-  bot-trading:latest \
-  python newrealtrading.py --live --symbols ADAUSDT,DOGEUSDT --interval 15m --real-exec --testnet --verbose
-```
+# System deps (opsional: timezone, build tools untuk wheel fallback)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      tzdata build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-### Jalankan Real Trading (Live)
+COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-```bash
-docker run -d --name realA \
-  -v $PWD:/app \
-  --env-file .env \
-  -e INSTANCE_ID=REAL_A \
-  bot-trading:latest \
-  python newrealtrading.py --live --symbols ADAUSDT,DOGEUSDT --interval 15m --real-exec --verbose
+COPY . .
+
+# Default: hanya shell. Jalankan per‑mode via `docker run ... python <script>.py`.
+CMD ["bash"]
 ```
 
 ---
 
-## 6) Konfigurasi per‑Symbol (`coin_config.json`)
+## 10) Patch Ringkas (lihat juga komentar PR)
 
-Contoh (ringkas):
-
-```json
-{
-  "ADAUSDT": {
-    "leverage": 15,
-    "risk_per_trade": 0.08,
-    "taker_fee": 0.0005,
-    "min_atr_pct": 0.003, "max_atr_pct": 0.04, "max_body_atr": 1.75,
-    "use_htf_filter": 0, "cooldown_seconds": 900,
-    "sl_mode": "ATR", "sl_pct": 0.008, "sl_atr_mult": 1.8,
-    "sl_min_pct": 0.012, "sl_max_pct": 0.035,
-    "use_breakeven": 1, "be_trigger_pct": 0.004,
-    "trailing_trigger": 1.0, "trailing_step_min_pct": 0.45,
-    "trailing_step_max_pct": 1.0, "trail_atr_k": 2.0,
-    "max_hold_seconds": 3600,
-    "stepSize": 1.0, "minQty": 1.0, "quantityPrecision": 0,
-    "minNotional": 5.0,
-    "SLIPPAGE_PCT": 0.02
-  }
-}
-```
-
-> **Tip:** `papertrade.py` otomatis **menyuntik** `stepSize/minQty/quantityPrecision/minNotional` dari `exchangeInfo` jika belum ada.
+* **papertrade.JournaledCoinTrader.\_size\_position** → samakan signature dengan `CoinTrader._size_position(price, sl, balance)`.
+* **newrealtrading.TradingManager.run\_once** → cek `exec is not None` sebelum `get_available_balance()`.
+* **engine\_core.py** → alias `body_atr` sudah ada supaya kompatibel kode lama.
 
 ---
 
-## 7) Troubleshooting
+## 11) Keamanan
 
-* **APIError -2019: Margin is insufficient**
+* Simpan API key di `.env`/secret manager, **jangan commit**.
+* Uji dengan `--testnet` sebelum real; aktifkan `--account-guard`.
+* Pasang **cooldown** dan **SL min/max clamp** untuk menghindari sizing ekstrem.
 
-  * Bot mengecilkan qty jika bisa; jika tetap gagal → **skip** & **cooldown**. Naikkan balance/leverage, atau turunkan risk.
-  * Pastikan `minNotional` terpenuhi (`price × qty ≥ minNotional`).
-* **Tidak ada entry**
-
-  * Aktifkan `VERBOSE=1` dan cek: `FILTER BLOCK atr_ok/body_ok/htf`.
-  * Di backtester, aktifkan **Mode Debug** untuk melihat alasan blokir.
-* **Dua bot saling tarik balance (akun sama)**
-
-  * Disarankan **API key/akun berbeda**. Jika harus satu akun, kurangi `risk_per_trade` dan gunakan timeframe berbeda untuk mengurangi balapan.
-
----
-
-## 8) Catatan Patch Penting
-
-* **newrealtrading.py**
-
-  * Gate global `availableBalance` per langkah; mengurangi `used_margin` per simbol.
-  * Penanganan `-2019` → shrink qty (jika bisa) atau cooldown.
-  * Order ID unik: `x-<INSTANCE_ID>-<SYMBOL>-<rand8>` → aman untuk multi‑bot.
-* **papertrade.py**
-
-  * `ensure_filters_to_coin_config`: ambil & simpan `stepSize/minQty/quantityPrecision/minNotional` ke `coin_config.json` dengan file‑lock.
-* **backtester\_scalping.py**
-
-  * Default **HTF OFF** (uji baseline), opsi **ML ON**; Mode Debug untuk melihat blokir.
-* **ml\_signal\_plugin.py**
-
-  * Perbaikan \_build\_latest\_features → kembalikan **DataFrame** agar kompatibel dengan scikit‑learn.
-* **engine\_core.py**
-
-  * Filter ATR & body/ATR seragam; helper precision; time‑stop/TSL.
-
----
-
-## 9) Target Kinerja
-
-* Mulai dari parameter konservatif. Optimasi di backtester (WR & PF). Jangan langsung ke mainnet. Gunakan `tools_dryrun_summary.py` untuk sanity check sebelum papertrade & real trading.
-
----
-
-**Selamat membangun dan iterasi!**
+Selamat membangun & happy trading! 🚀
