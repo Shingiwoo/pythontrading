@@ -9,3 +9,4 @@ scikit-learn
 python-binance
 python-dotenv
 ujson
+filelock
