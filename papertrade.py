@@ -26,7 +26,7 @@ from binance.enums import HistoricalKlinesType
 try:
     from newrealtrading import CoinTrader
     from engine_core import (
-        floor_to_step, _to_float, _to_bool, _to_int,
+        _to_float, _to_bool, _to_int,
         load_coin_config, merge_config
     )
 except ImportError as e:
@@ -265,6 +265,7 @@ class Journal:
                 o["sl_init"], o["tsl_init"], f"{exit_price:.6f}",
                 reason, f"{pnl:.6f}", f"{roi_on_margin:.6f}", f"{bal_after:.6f}"
             ])
+        print(f"[{symbol}] EXIT {reason} pnl={pnl:.4f} roi_margin={roi_on_margin:.4f} balance={bal_before:.4f}->{bal_after:.4f}")
 
 # -----------------------------
 # Trader yg di-journal
@@ -273,22 +274,6 @@ class JournaledCoinTrader(CoinTrader):
     def __init__(self, symbol: str, config: dict, journal: Journal):
         super().__init__(symbol, config)
         self.journal = journal
-
-    def _size_position(self, price: float, sl: float, balance: float) -> float:
-        # panggil base method dengan signature yang sama
-        qty = super()._size_position(price, sl, balance)
-        # Enforce minNotional bila ada
-        try:
-            min_not = _to_float(self.config.get("minNotional", 0.0), 0.0)
-            step = _to_float(self.config.get("stepSize", 0.0), 0.0)
-            if min_not > 0 and price > 0:
-                min_qty_by_notional = min_not / price
-                if qty * price < min_not:
-                    qty = max(qty, min_qty_by_notional)
-                    qty = floor_to_step(qty, step) if step > 0 else qty
-        except Exception:
-            pass
-        return qty
 
     def _enter_position(self, side: str, price: float, atr: float, available_balance: float) -> float:
         before_qty = getattr(self.pos, "qty", 0.0) or 0.0
@@ -338,6 +323,7 @@ def main():
     ap.add_argument("--heikin", action="store_true", help="Gunakan Heikin-Ashi")
     ap.add_argument("--fee_bps", type=float, default=10.0, help="Biaya taker per sisi (bps)")
     ap.add_argument("--slip_bps", type=float, default=0.0, help="Slippage per sisi (bps)")
+    ap.add_argument("--max-concurrent", type=int, default=0, help="Batasi jumlah posisi aktif lintas-simbol (0=tanpa batas)")
     ap.add_argument("--limit_bars", type=int, default=600, help="Kline limit pull (<= 1500)")
     ap.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds")
     ap.add_argument("--retries", type=int, default=6, help="HTTP retries")
@@ -374,6 +360,8 @@ def main():
         if rules["risk_pct"] is not None:
             merged["risk_per_trade"] = float(rules["risk_pct"])
         merged.setdefault("ml", {})["score_threshold"] = rules["ml_thr"]
+        if rules["ml_thr"] is not None:
+            merged["USE_ML"] = 1
         if rules["htf"]:
             merged["htf"] = rules["htf"]
         merged["heikin"] = rules["heikin"]
@@ -404,9 +392,14 @@ def main():
                     continue
                 df = build_df_from_klines(raw[:-1])
                 last_bar_ts[s] = last_ts
+                if args.max_concurrent and len(journal.open) >= args.max_concurrent:
+                    continue
                 used = traders[s].check_trading_signals(df, journal.balance[s])
                 if used and used > 0:
-                    journal.balance[s] = max(0.0, journal.balance[s] - used)
+                    before = journal.balance[s]
+                    after = max(0.0, before - used)
+                    print(f"[{s}] used_margin={used:.4f} balance_before={before:.4f} -> after={after:.4f}")
+                    journal.balance[s] = after
             except Exception as e:
                 print(f"[ERROR] live loop {s}: {e}")
 

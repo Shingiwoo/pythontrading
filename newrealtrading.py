@@ -31,7 +31,7 @@ except Exception:
 from engine_core import (
     _to_float, _to_int, _to_bool, floor_to_step,
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
-    htf_trend_ok
+    htf_trend_ok, r_multiple
 )
 
 from binance.client import Client
@@ -323,12 +323,22 @@ class CoinTrader:
     def _apply_breakeven(self, price: float) -> None:
         if not _to_bool(self.config.get('use_breakeven', DEFAULTS['use_breakeven']), DEFAULTS['use_breakeven']):
             return
+        if self.pos.side and self.pos.entry is not None and self.pos.sl is not None:
+            be_r = _to_float(self.config.get('be_trigger_r', 0.0), 0.0)
+            if be_r > 0:
+                rnow = r_multiple(self.pos.entry, self.pos.sl, price)
+                if rnow >= be_r:
+                    if self.pos.side == 'LONG':
+                        self.pos.sl = max(self.pos.sl, self.pos.entry)
+                    else:
+                        self.pos.sl = min(self.pos.sl, self.pos.entry)
+                return
         be = _to_float(self.config.get('be_trigger_pct', DEFAULTS['be_trigger_pct']), DEFAULTS['be_trigger_pct'])
-        if self.pos.side=='LONG' and self.pos.entry:
-            if (price - self.pos.entry)/self.pos.entry >= be:
+        if self.pos.side == 'LONG' and self.pos.entry:
+            if (price - self.pos.entry) / self.pos.entry >= be:
                 self.pos.sl = max(self.pos.sl or 0.0, self.pos.entry)
-        elif self.pos.side=='SHORT' and self.pos.entry:
-            if (self.pos.entry - price)/self.pos.entry >= be:
+        elif self.pos.side == 'SHORT' and self.pos.entry:
+            if (self.pos.entry - price) / self.pos.entry >= be:
                 self.pos.sl = min(self.pos.sl or 1e18, self.pos.entry)
 
     def _update_trailing(self, price: float) -> None:
@@ -489,9 +499,16 @@ class CoinTrader:
             self.exec.market_close(self.symbol, close_side, self.pos.qty, client_id=cid)
         self._log(f"EXIT {reason} price={price:.6f}")
         self.pos = Position()  # reset
-        # cooldown
-        cd = _to_int(self.config.get('cooldown_seconds', DEFAULTS['cooldown_seconds']), DEFAULTS['cooldown_seconds'])
-        self.cooldown_until_ts = time.time() + max(cd, 0)
+        base_cd = _to_int(self.config.get('cooldown_seconds', DEFAULTS['cooldown_seconds']), DEFAULTS['cooldown_seconds'])
+        mul = 1.0
+        if 'Hard SL' in (reason or ''):
+            mul = _to_float(self.config.get('cooldown_mul_hard_sl', 1.0), 1.0)
+        elif 'Trailing' in (reason or ''):
+            mul = _to_float(self.config.get('cooldown_mul_trailing', 1.0), 1.0)
+        elif 'Max hold' in (reason or '') or 'early' in (reason or '').lower():
+            mul = _to_float(self.config.get('cooldown_mul_early_stop', 1.0), 1.0)
+        cd = max(0, int(base_cd * mul))
+        self.cooldown_until_ts = time.time() + cd
         try:
             self._log(f"COOLDOWN until {pd.Timestamp.utcfromtimestamp(self.cooldown_until_ts).isoformat()}")
         except Exception:
@@ -504,6 +521,7 @@ class CoinTrader:
         df = calculate_indicators(df_raw, heikin=heikin)
         last = df.iloc[-1]
         price = float(last['close'])
+        htf = str(self.config.get('htf', '1h'))
 
         # Update trailing/exit terlebih dahulu
         if self.pos.side:
@@ -532,11 +550,11 @@ class CoinTrader:
 
         # HTF filter (opsional)
         if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
-            if last['ema']>last['ma'] and not htf_trend_ok('LONG', df):
+            if last['ema'] > last['ma'] and not htf_trend_ok('LONG', df, htf=htf):
                 long_htf_ok = False
             else:
                 long_htf_ok = True
-            if last['ema']<last['ma'] and not htf_trend_ok('SHORT', df):
+            if last['ema'] < last['ma'] and not htf_trend_ok('SHORT', df, htf=htf):
                 short_htf_ok = False
             else:
                 short_htf_ok = True
@@ -587,11 +605,20 @@ class CoinTrader:
                     else:
                         roi_frac = ((self.pos.entry - price) * self.pos.qty) / init_margin
 
-                if elapsed >= max_hold and roi_frac >= min_roi:
-                    self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
-                    return 0.0
-                elif elapsed >= max_hold:
-                    self.pos.entry_time = pd.Timestamp.utcnow()
+                only_if_loss = _to_bool(self.config.get('time_stop_only_if_loss', 0), False)
+                if elapsed >= max_hold:
+                    if only_if_loss:
+                        if roi_frac <= 0:
+                            self._exit_position(price, f"Max hold reached (loss, ROI {roi_frac*100:.2f}%)")
+                            return 0.0
+                        else:
+                            self.pos.entry_time = pd.Timestamp.utcnow()
+                    else:
+                        if roi_frac >= min_roi:
+                            self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
+                            return 0.0
+                        else:
+                            self.pos.entry_time = pd.Timestamp.utcnow()
         # --------------------------------------
         used = 0.0
         # Entry baru

@@ -118,14 +118,16 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
     d['short_base'] = (d['ema'] < d['ma']) & (d['macd'] < d['macd_signal']) & d['rsi'].between(70, 90)
     return d
 
-def htf_trend_ok(side: str, base_df: pd.DataFrame) -> bool:
+def htf_trend_ok(side: str, base_df: pd.DataFrame, htf: str = '1h') -> bool:
     try:
         tmp = base_df.set_index('timestamp')[['close']].copy()
-        htf = tmp['close'].resample('1H').last().dropna()
-        if len(htf) < 210: return True
-        ema50 = htf.ewm(span=50, adjust=False).mean().iloc[-1]
-        ema200 = htf.ewm(span=200, adjust=False).mean().iloc[-1]
-        return (ema50 >= ema200) if side=='LONG' else (ema50 <= ema200)
+        res = str(htf).upper()
+        htf_close = tmp['close'].resample(res).last().dropna()
+        if len(htf_close) < 210:
+            return True
+        ema50 = htf_close.ewm(span=50, adjust=False).mean().iloc[-1]
+        ema200 = htf_close.ewm(span=200, adjust=False).mean().iloc[-1]
+        return (ema50 >= ema200) if side == 'LONG' else (ema50 <= ema200)
     except Exception:
         return True
 def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool, Dict[str, Any]]:
@@ -183,6 +185,10 @@ def pnl_net(side: str, entry: float, exit: float, qty: float,
     pnl = gross - fee - slip
     roi = (pnl / (entry*qty)) if entry*qty>0 else 0.0
     return pnl, roi*100.0
+
+def r_multiple(entry: float, sl: float, price: float) -> float:
+    r = abs(entry - sl)
+    return (abs(price - entry) / r) if r > 0 else 0.0
 
 # -----------------------------------------------------
 # Journaling
