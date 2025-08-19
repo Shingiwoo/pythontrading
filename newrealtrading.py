@@ -107,7 +107,7 @@ class ExecutionClient:
     def set_margin_type(self, symbol: str, isolated: bool | str = "ISOLATED"):
         try:
             if isinstance(isolated, bool):
-                mtype = "ISOLATED" if isolated else "CROSs"
+                mtype = "ISOLATED" if isolated else "CROSSED"
             else:
                 mtype = str(isolated)
             self.client.futures_change_margin_type(symbol=symbol, marginType=mtype)
@@ -423,6 +423,19 @@ class CoinTrader:
             self._log(f"SHRINK qty {qty:.6f} -> {shrunk:.6f} (avail={live_avail:.4f}, need={need:.4f})")
             qty = shrunk
             need = (price * qty / max(lev, 1)) * (1.0 + fee_buf)
+
+        min_not = float(self.config.get("minNotional", 0.0) or 0.0)
+        if min_not > 0 and price * qty < min_not:
+            step = self.exec._step_size(self.symbol) if self.exec else _to_float(self.config.get("stepSize", 0.0), 0.0)
+            need_qty = (min_not / max(price, 1e-12))
+            if step > 0:
+                need_qty = math.ceil(need_qty / step) * step
+            if self.exec:
+                need_qty = self.exec.round_qty(self.symbol, need_qty)
+            if (need_qty * price / max(lev, 1)) * (1.0 + fee_buf) > live_avail:
+                self._log(f"SKIP entry: below MIN_NOTIONAL {min_not}, avail={live_avail:.2f}")
+                return 0.0
+            qty = need_qty
 
         sl = self._hard_sl_price(price, atr, side)
         self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=pd.Timestamp.utcnow())
