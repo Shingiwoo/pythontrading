@@ -41,9 +41,3 @@ security_opt:
 - no-new-privileges:true
 cap_drop:
 - ALL
-pids_limit: 256
-mem_limit: 512m
-restart: unless-stopped
-volumes:
-- ./coin_config.json:/data/coin_config.json:ro
-- ./logs:/app/logs
