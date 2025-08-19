@@ -50,7 +50,7 @@ def ceil_to_step(x: float, step: float) -> float:
     return math.ceil(x / step) * step
 
 def enforce_precision(sym_cfg: Dict[str, Any], price: float, qty: float) -> Tuple[float, float]:
-    p_step = _to_float(sym_cfg.get("tickSize", sym_cfg.get("pricePrecision", 0)), 0)
+    p_step = _to_float(sym_cfg.get("tickSize", 0), 0)
     q_step = _to_float(sym_cfg.get("stepSize", 0), 0)
     price = round_to_step(price, p_step) if p_step > 0 else price
     qty = floor_to_step(qty, q_step) if q_step > 0 else qty
