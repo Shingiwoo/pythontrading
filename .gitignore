@@ -12,6 +12,5 @@ report/Doge117.png
 report/Xrp149.png
 data/strategy_params.json
 
-.env
 *.csv
 logs/*.xt

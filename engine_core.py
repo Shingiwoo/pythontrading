@@ -190,6 +190,57 @@ def r_multiple(entry: float, sl: float, price: float) -> float:
     r = abs(entry - sl)
     return (abs(price - entry) / r) if r > 0 else 0.0
 
+def r_multiple_signed(entry: float, sl: float, price: float, side: str) -> float:
+    """R multiple bertanda; positif hanya jika bergerak sesuai arah profit."""
+    R = abs(entry - sl)
+    if R <= 0:
+        return 0.0
+    move = (price - entry) if side == 'LONG' else (entry - price)
+    return move / R
+
+def apply_breakeven_sl(side: str,
+                       entry: float,
+                       price: float,
+                       sl: float | None,
+                       tick_size: float = 0.0,
+                       min_gap_pct: float = 0.0001,
+                       be_trigger_r: float = 0.0,
+                       be_trigger_pct: float = 0.0) -> float | None:
+    """
+    Hitung SL BE baru bila trigger terpenuhi. Mengembalikan SL baru atau sl lama.
+    - BE R-multiple: aktif hanya jika posisi sudah profit sesuai arah.
+    - BE %: fallback jika R=0 atau be_trigger_r=0.
+    - SL tidak ditempatkan menempel pada harga: beri gap min(max(tick, price*min_gap_pct)).
+    """
+    if entry is None or side not in ('LONG', 'SHORT'):
+        return sl
+    gap = max(tick_size or 0.0, abs(price) * (min_gap_pct or 0.0))
+
+    # 1) R-based (prioritas jika > 0)
+    if be_trigger_r and be_trigger_r > 0:
+        rnow = r_multiple_signed(entry, sl if sl is not None else entry, price, side)
+        if side == 'LONG':
+            if price > entry and rnow >= be_trigger_r:
+                target = max(sl or 0.0, entry)
+                return min(target, price - gap)
+        else:  # SHORT
+            if price < entry and rnow >= be_trigger_r:
+                target = min(sl or 1e18, entry)
+                return max(target, price + gap)
+
+    # 2) % fallback
+    if be_trigger_pct and be_trigger_pct > 0:
+        if side == 'LONG':
+            if (price - entry) / entry >= be_trigger_pct:
+                target = max(sl or 0.0, entry)
+                return min(target, price - gap)
+        else:
+            if (entry - price) / entry >= be_trigger_pct:
+                target = min(sl or 1e18, entry)
+                return max(target, price + gap)
+
+    return sl
+
 # -----------------------------------------------------
 # Journaling
 # -----------------------------------------------------

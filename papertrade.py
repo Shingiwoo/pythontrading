@@ -18,6 +18,9 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 from filelock import FileLock, Timeout
 
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
+
 # Binance
 from binance.client import Client
 from binance.enums import HistoricalKlinesType
@@ -115,21 +118,21 @@ class RateLimiter:
             self.allowance -= 1.0
 
 class BinanceFutures:
-    def __init__(self, requests_timeout: int = 20, max_retries: int = 5):
+    def __init__(self, requests_timeout: int = REQUEST_TIMEOUT, max_retries: int = REQUEST_RETRIES):
         self.client = Client(requests_params={"timeout": requests_timeout})
         self.max_retries = max_retries
 
     def _retry(self, fn, *args, **kwargs):
-        delay = 0.75
+        delay = 1.0
         last_ex = None
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(max(1, self.max_retries)):
             try:
                 return fn(*args, **kwargs)
             except Exception as e:
                 last_ex = e
-                print(f"[WARN] Binance call failed (attempt {attempt}/{self.max_retries}): {e}")
+                print(f"[WARN] Binance call failed (attempt {attempt + 1}/{self.max_retries}): {e}")
                 time.sleep(delay)
-                delay = min(delay * 1.7, 8.0)
+                delay = min(delay * 2, 8.0)
         raise last_ex if last_ex else RuntimeError("Unknown error occurred during Binance call retries.")
 
     def exchange_info(self) -> dict:
@@ -274,6 +277,9 @@ class JournaledCoinTrader(CoinTrader):
     def __init__(self, symbol: str, config: dict, journal: Journal):
         super().__init__(symbol, config)
         self.journal = journal
+
+    def _apply_breakeven(self, price: float) -> None:
+        return super()._apply_breakeven(price)
 
     def _enter_position(self, side: str, price: float, atr: float, available_balance: float) -> float:
         before_qty = getattr(self.pos, "qty", 0.0) or 0.0
