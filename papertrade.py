@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import numpy as np
-from decimal import Decimal, ROUND_DOWN, getcontext
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -33,7 +32,8 @@ try:
     from engine_core import (
         _to_float, _to_bool, _to_int,
         load_coin_config, merge_config,
-        apply_breakeven_sl, roi_frac_now, base_supports_side
+        apply_breakeven_sl, roi_frac_now, base_supports_side,
+        floor_to_step, to_scalar
     )
 except ImportError as e:
     print(f"[ERROR] Failed to import core modules: {e}")
@@ -96,39 +96,29 @@ def ml_gate(up_prob: Optional[float], thr: float, eps: float = 1e-9) -> int:
         return -1
     return 0
 
-getcontext().prec = 28
-
-def _floor_to_step(x: Decimal, step: Decimal) -> Decimal:
-    if step is None or step == 0:
-        return x
-    q = (x / step).to_integral_value(rounding=ROUND_DOWN)
-    return (q * step).normalize()
 
 def round_qty(flt: dict, qty: float) -> float:
-    step = Decimal(str(flt.get("stepSize") or "0"))
-    min_qty = Decimal(str(flt.get("minQty") or "0"))
-    q = Decimal(str(qty))
-    if step > 0:
-        q = _floor_to_step(q, step)
+    step = _to_float(flt.get("stepSize", 0.0), 0.0)
+    min_qty = _to_float(flt.get("minQty", 0.0), 0.0)
+    q = floor_to_step(to_scalar(qty), step) if step > 0 else to_scalar(qty)
     qp = flt.get("quantityPrecision")
     if qp is not None:
-        q = q.quantize(Decimal(10) ** -int(qp), rounding=ROUND_DOWN)
+        q = float(f"{q:.{int(qp)}f}")
     if q < min_qty:
         return 0.0
-    return float(q)
+    return q
 
 def round_price(flt: dict, price: float) -> float:
-    tick = Decimal(str(flt.get("tickSize") or "0"))
-    minp = Decimal(str(flt.get("minPrice") or "0"))
-    p = Decimal(str(price))
+    tick = _to_float(flt.get("tickSize", 0.0), 0.0)
+    minp = _to_float(flt.get("minPrice", 0.0), 0.0)
+    p = to_scalar(price)
     if p < minp:
         p = minp
-    if tick > 0:
-        p = _floor_to_step(p, tick)
+    p = floor_to_step(p, tick) if tick > 0 else p
     pp = flt.get("pricePrecision")
     if pp is not None:
-        p = p.quantize(Decimal(10) ** -int(pp), rounding=ROUND_DOWN)
-    return float(p)
+        p = float(f"{p:.{int(pp)}f}")
+    return p
 
 # -----------------------------
 # Binance client wrapper (retry)
@@ -385,8 +375,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds")
     ap.add_argument("--retries", type=int, default=6, help="HTTP retries")
     ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--no-atr-filter", action="store_true", help="Disable ATR/body candle filter (ML always allowed)")
-    ap.add_argument("--ml-override", action="store_true", help="Allow ML to bypass ATR/body filter when triggered")
+    ap.add_argument("--no-atr-filter", action="store_true", help="Disable ATR filter")
+    ap.add_argument("--no-body-filter", action="store_true", help="Disable body candle filter")
+    ap.add_argument("--ml-override", action="store_true", help="Allow ML to bypass filters when triggered")
     args = ap.parse_args()
 
     if not args.instance_id:
@@ -434,9 +425,9 @@ def main():
         merged["taker_fee"] = rules["fee_bps"] / 10000.0
         merged["SLIPPAGE_PCT"] = rules["slip_bps"] * 0.01
         if args.no_atr_filter:
-            merged.setdefault('filters', {})['enable_atr_body_filter'] = False
-        if args.ml_override:
-            merged.setdefault('filters', {})['allow_ml_override'] = True
+            merged.setdefault('filters', {})['atr_filter_enabled'] = False
+        if args.no_body_filter:
+            merged.setdefault('filters', {})['body_filter_enabled'] = False
         cfg_by_sym[s] = merged
 
     journal = Journal(os.path.dirname(args.logs_dir), args.instance_id, cfg_by_sym, args.balance)
