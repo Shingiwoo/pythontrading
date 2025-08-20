@@ -385,6 +385,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds")
     ap.add_argument("--retries", type=int, default=6, help="HTTP retries")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--no-atr-filter", action="store_true", help="Disable ATR/body candle filter (ML always allowed)")
+    ap.add_argument("--ml-override", action="store_true", help="Allow ML to bypass ATR/body filter when triggered")
     args = ap.parse_args()
 
     if not args.instance_id:
@@ -431,6 +433,10 @@ def main():
         merged["heikin"] = rules["heikin"]
         merged["taker_fee"] = rules["fee_bps"] / 10000.0
         merged["SLIPPAGE_PCT"] = rules["slip_bps"] * 0.01
+        if args.no_atr_filter:
+            merged.setdefault('filters', {})['enable_atr_body_filter'] = False
+        if args.ml_override:
+            merged.setdefault('filters', {})['allow_ml_override'] = True
         cfg_by_sym[s] = merged
 
     journal = Journal(os.path.dirname(args.logs_dir), args.instance_id, cfg_by_sym, args.balance)

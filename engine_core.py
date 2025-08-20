@@ -1,15 +1,55 @@
 import os, json, math
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, Union
 
+import numpy as np
 import pandas as pd
 from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.momentum import RSIIndicator
 
+Series = pd.Series
+NDArray = np.ndarray
+Numeric = Union[int, float]
+ArrayLike = Union[Series, NDArray]
+SafeNum = Union[Numeric, ArrayLike]
+
 SAFE_EPS = float(os.getenv("SAFE_EPS", "1e-9"))
 
-def safe_div(a: float, b: float, eps: float = SAFE_EPS) -> float:
-    d = b if (isinstance(b, (int, float)) and abs(b) > eps) else (eps if isinstance(b, (int, float)) else eps)
-    return a / d
+
+def _as_array(x: SafeNum) -> Tuple[np.ndarray, Optional[pd.Index]]:
+    if isinstance(x, pd.Series):
+        return x.to_numpy(copy=False).astype(float, copy=False), x.index
+    if isinstance(x, np.ndarray):
+        return x.astype(float, copy=False), None
+    return np.array([float(x)]), None
+
+
+def safe_div(a: SafeNum, b: SafeNum, default: float = 0.0) -> SafeNum:
+    a_arr, a_idx = _as_array(a)
+    b_arr, b_idx = _as_array(b)
+
+    shape = np.broadcast_shapes(a_arr.shape, b_arr.shape)
+    a_b = np.broadcast_to(a_arr, shape)
+    b_b = np.broadcast_to(b_arr, shape)
+
+    out = np.divide(
+        a_b,
+        b_b,
+        out=np.full(shape, default, dtype=float),
+        where=(b_b != 0)
+    )
+
+    if a_idx is not None:
+        return pd.Series(out, index=a_idx)
+    if b_idx is not None:
+        return pd.Series(out, index=b_idx)
+    return float(out[0]) if out.size == 1 else out
+
+
+def as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x) if x is not None else default
+    except (TypeError, ValueError):
+        return default
 
 # -----------------------------------------------------
 # Konversi tipe sederhana
@@ -168,7 +208,7 @@ def apply_ml_gate(up_prob: Optional[float], ml_thr: float, eps: float = SAFE_EPS
     if up_prob is None:
         return True
     p = min(max(up_prob, eps), 1 - eps)
-    up_odds = safe_div(p, 1 - p, eps)
+    up_odds = safe_div(p, 1 - p, default=eps)
     return up_odds >= ml_thr
 
 # -----------------------------------------------------
