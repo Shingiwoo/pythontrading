@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pandas as pd
 import numpy as np
+from decimal import Decimal, ROUND_DOWN, getcontext
 
 # --- TA
 from ta.trend import EMAIndicator, SMAIndicator, MACD
@@ -83,41 +84,82 @@ class ExecutionClient:
         if testnet:
             self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
         self.verbose = verbose
-        self._exinfo_cache: Dict[str, Dict[str, Any]] = {}
+        self.symbol_filters: Dict[str, Dict[str, Any]] = {}
+        getcontext().prec = 28
+        self._load_filters(log=True)
 
-    def _get_symbol_filters(self, symbol: str) -> Dict[str, Any]:
-        if symbol not in self._exinfo_cache:
-            info = self.client.futures_exchange_info()
-            m = next((s for s in info["symbols"] if s["symbol"] == symbol), None)
-            if not m:
-                raise ValueError(f"Symbol {symbol} tidak ditemukan di futures exchange info.")
-            self._exinfo_cache[symbol] = m
-        return self._exinfo_cache[symbol]
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"[EXEC] {msg}")
 
-    def _tick_size(self, symbol: str) -> float:
-        f = self._get_symbol_filters(symbol)
-        pfilter = next(x for x in f["filters"] if x["filterType"] == "PRICE_FILTER")
-        return float(pfilter["tickSize"])
+    def _load_filters(self, log: bool = False) -> None:
+        info = self.client.futures_exchange_info()
+        self.futures_info = info
+        self.symbol_filters = {}
+        for s in info.get("symbols", []):
+            sym = s.get("symbol", "").upper()
+            f = {ft.get("filterType"): ft for ft in s.get("filters", [])}
+            price_filter = f.get("PRICE_FILTER", {})
+            lot = f.get("MARKET_LOT_SIZE") or f.get("LOT_SIZE") or {}
+            self.symbol_filters[sym] = {
+                "tickSize": price_filter.get("tickSize", "0"),
+                "minPrice": price_filter.get("minPrice", "0"),
+                "stepSize": lot.get("stepSize", "0"),
+                "minQty": lot.get("minQty", "0"),
+                "quantityPrecision": s.get("quantityPrecision"),
+                "pricePrecision": s.get("pricePrecision"),
+            }
+        if log:
+            for sym, flt in self.symbol_filters.items():
+                print(f"[FILTER:{sym}] step={flt['stepSize']} tick={flt['tickSize']} minQty={flt['minQty']} qPrec={flt['quantityPrecision']} pPrec={flt['pricePrecision']}")
 
-    def _step_size(self, symbol: str) -> float:
-        f = self._get_symbol_filters(symbol)
-        lot = next(x for x in f["filters"] if x["filterType"] == "LOT_SIZE")
-        return float(lot["stepSize"])
+    @staticmethod
+    def _floor_to_step(x: Decimal, step: Decimal) -> Decimal:
+        if step is None or step == 0:
+            return x
+        q = (x / step).to_integral_value(rounding=ROUND_DOWN)
+        return (q * step).normalize()
 
-    def round_price(self, symbol: str, price: float) -> float:
-        ts = self._tick_size(symbol)
-        return math.floor(price / ts) * ts
+    def has_symbol(self, symbol: str) -> bool:
+        return symbol.upper() in self.symbol_filters
 
     def round_qty(self, symbol: str, qty: float) -> float:
-        ss = self._step_size(symbol)
-        return math.floor(qty / ss) * ss
+        flt = self.symbol_filters.get(symbol.upper())
+        if not flt:
+            return 0.0
+        step = Decimal(str(flt.get("stepSize") or "0"))
+        min_qty = Decimal(str(flt.get("minQty") or "0"))
+        q = Decimal(str(qty))
+        if step > 0:
+            q = self._floor_to_step(q, step)
+        qp = flt.get("quantityPrecision")
+        if qp is not None:
+            q = q.quantize(Decimal(10) ** -int(qp), rounding=ROUND_DOWN)
+        if q < min_qty:
+            return 0.0
+        return float(q)
+
+    def round_price(self, symbol: str, price: float) -> float:
+        flt = self.symbol_filters.get(symbol.upper())
+        if not flt:
+            return float(price)
+        tick = Decimal(str(flt.get("tickSize") or "0"))
+        minp = Decimal(str(flt.get("minPrice") or "0"))
+        p = Decimal(str(price))
+        if p < minp:
+            p = minp
+        if tick > 0:
+            p = self._floor_to_step(p, tick)
+        pp = flt.get("pricePrecision")
+        if pp is not None:
+            p = p.quantize(Decimal(10) ** -int(pp), rounding=ROUND_DOWN)
+        return float(p)
 
     def set_leverage(self, symbol: str, leverage: int):
         try:
             self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
         except Exception as e:
-            if self.verbose:
-                print(f"[EXEC] set_leverage fail: {e}")
+            self._log(f"set_leverage fail: {e}")
 
     def set_margin_type(self, symbol: str, isolated: bool | str = "ISOLATED"):
         try:
@@ -128,13 +170,11 @@ class ExecutionClient:
             self.client.futures_change_margin_type(symbol=symbol, marginType=mtype)
         except BinanceAPIException as e:
             if e.code == -4046:
-                if self.verbose:
-                    print(f"[EXEC] set_margin_type fail: {e}")
+                self._log(f"set_margin_type fail: {e}")
                 return None
             raise
         except Exception as e:
-            if self.verbose:
-                print(f"[EXEC] set_margin_type fail: {e}")
+            self._log(f"set_margin_type fail: {e}")
 
     def has_position(self, symbol: str) -> bool:
         try:
@@ -159,37 +199,59 @@ class ExecutionClient:
             except Exception:
                 return 0.0
 
+    def _order_with_retry(self, params: Dict[str, Any], raw_qty: float, raw_price: Optional[float] = None) -> Dict[str, Any]:
+        symbol = params.get("symbol")
+        try:
+            return self.client.futures_create_order(**params)
+        except BinanceAPIException as e:
+            if e.code == -1111:
+                flt = self.symbol_filters.get(symbol.upper(), {})
+                self._log(f"[ROUND-RETRY] {symbol}: raw_qty={raw_qty} step={flt.get('stepSize')} qPrec={flt.get('quantityPrecision')} -> retry")
+                self._load_filters(log=False)
+                params["quantity"] = self.round_qty(symbol, raw_qty)
+                if raw_price is not None:
+                    params["stopPrice"] = f"{self.round_price(symbol, raw_price):.8f}"
+                try:
+                    return self.client.futures_create_order(**params)
+                except Exception as e2:
+                    self._log(f"order retry fail: {e2}")
+                    raise
+            raise
+
     def market_entry(self, symbol: str, side: str, qty: float, client_id: Optional[str]=None) -> Dict[str, Any]:
-        params = dict(
-            symbol=symbol,
-            side=side,
-            type="MARKET",
-            quantity=self.round_qty(symbol, qty),
-            reduceOnly=False,
-        )
+        r_qty = self.round_qty(symbol, qty)
+        if r_qty <= 0:
+            self._log(f"SKIP entry: qty<minQty (raw={qty})")
+            return {}
+        params = dict(symbol=symbol, side=side, type="MARKET", quantity=r_qty, reduceOnly=False)
         if client_id:
             params["newClientOrderId"] = client_id
-        o = self.client.futures_create_order(**params)
-        if self.verbose:
-            print(f"[EXEC] MARKET ENTRY {symbol} {side} {qty} -> orderId={o.get('orderId')}")
+        o = self._order_with_retry(params, qty)
+        if self.verbose and o:
+            print(f"[EXEC] MARKET ENTRY {symbol} {side} {r_qty} -> orderId={o.get('orderId')}")
         return o
 
     def stop_market(self, symbol: str, side: str, stop_price: float, qty: float, reduce_only: bool=True, client_id: Optional[str]=None) -> Dict[str, Any]:
+        r_qty = self.round_qty(symbol, qty)
+        if r_qty <= 0:
+            self._log(f"SKIP stop: qty<minQty (raw={qty})")
+            return {}
         sp = self.round_price(symbol, stop_price)
-        o = self.client.futures_create_order(
+        params = dict(
             symbol=symbol,
             side=side,
             type="STOP_MARKET",
             stopPrice=f"{sp:.8f}",
             closePosition=False,
-            quantity=self.round_qty(symbol, qty),
+            quantity=r_qty,
             reduceOnly=reduce_only,
             workingType="MARK_PRICE",
             timeInForce="GTC",
-            newClientOrderId=client_id
+            newClientOrderId=client_id,
         )
-        if self.verbose:
-            print(f"[EXEC] STOP_MARKET {symbol} {side} stop={sp} qty={qty} -> orderId={o.get('orderId')}")
+        o = self._order_with_retry(params, qty, stop_price)
+        if self.verbose and o:
+            print(f"[EXEC] STOP_MARKET {symbol} {side} stop={sp} qty={r_qty} -> orderId={o.get('orderId')}")
         return o
 
     def cancel_all(self, symbol: str):
@@ -209,16 +271,14 @@ class ExecutionClient:
         return self.client.futures_get_open_orders(symbol=symbol)
 
     def market_close(self, symbol: str, side: str, qty: float, client_id: Optional[str]=None) -> Dict[str, Any]:
-        o = self.client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type="MARKET",
-            quantity=self.round_qty(symbol, qty),
-            reduceOnly=True,
-            newClientOrderId=client_id
-        )
-        if self.verbose:
-            print(f"[EXEC] MARKET CLOSE {symbol} {side} {qty} -> orderId={o.get('orderId')}")
+        r_qty = self.round_qty(symbol, qty)
+        if r_qty <= 0:
+            self._log(f"SKIP close: qty<minQty (raw={qty})")
+            return {}
+        params = dict(symbol=symbol, side=side, type="MARKET", quantity=r_qty, reduceOnly=True, newClientOrderId=client_id)
+        o = self._order_with_retry(params, qty)
+        if self.verbose and o:
+            print(f"[EXEC] MARKET CLOSE {symbol} {side} {r_qty} -> orderId={o.get('orderId')}")
         return o
 
 __all__ = [
@@ -741,10 +801,16 @@ class CoinTrader:
 class TradingManager:
     def __init__(self, coin_config_path: str, symbols: List[str], *, instance_id: str="bot", account_guard: bool=False, exec_client: Optional[ExecutionClient]=None, verbose: bool=False):
         self.coin_config_path = coin_config_path
-        self.symbols = [s.upper() for s in symbols]
-        self._cfg = load_coin_config(coin_config_path)
+        raw_syms = [s.upper() for s in symbols]
         self.exec_client = exec_client
         self.verbose = verbose
+        self.symbols: List[str] = []
+        for s in raw_syms:
+            if self.exec_client and not self.exec_client.has_symbol(s):
+                print(f"[WARN] {s} tidak ada di USDM Futures → di-skip")
+                continue
+            self.symbols.append(s)
+        self._cfg = load_coin_config(coin_config_path)
         self.traders: Dict[str, CoinTrader] = {}
         for s in self.symbols:
             merged_cfg = merge_config(s, self._cfg)
