@@ -122,7 +122,7 @@ max_body_atr = st.sidebar.number_input("max_body_atr", value=cfgf("max_body_atr"
 use_htf_filter = st.sidebar.checkbox("use_htf_filter (EMA50 vs EMA200, 1h)", value=False, help="Default OFF untuk test awal. Aktifkan manual bila ingin sinkron tren HTF.")
 if sym_cfg:
     st.caption(f"Rekomendasi dari config: {'ON' if cfgb('use_htf_filter', False) else 'OFF'}")
-cooldown_seconds = st.sidebar.number_input("cooldown_seconds", value=cfgi("cooldown_seconds", 1200))
+cooldown_seconds = st.sidebar.number_input("cooldown_seconds", value=cfgi("cooldown_seconds", 900))
 
 with st.sidebar.expander("🛡️ Exit Guards (Time-based)"):
     max_hold_seconds = st.number_input("MAX_HOLD_SECONDS", value=DEFAULT_MAX_HOLD_SECONDS, step=60)
@@ -149,7 +149,7 @@ tp2_p = st.sidebar.number_input("TP2 % (tutup 30%)", value=3.2)
 tp3_p = st.sidebar.number_input("TP3 % (tutup 20%)", value=4.5)
 
 st.sidebar.subheader("🧪 ML Signal (opsional)")
-use_ml = st.sidebar.checkbox("Aktifkan ML signal", False)
+use_ml = st.sidebar.checkbox("Aktifkan ML signal", True)
 score_threshold = st.sidebar.slider("Minimal Skor Sinyal (non-ML)", 1.0, 5.0, 1.0, step=0.01)
 
 # NEW: Mode Debug
