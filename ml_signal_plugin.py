@@ -116,7 +116,7 @@ class MLSignal:
         d = df.copy()
         req = {'close','rsi','macd','atr'}
         if not req.issubset(d.columns): return None, None
-        d['bb_width'] = safe_div((d['close'].rolling(20).std() * 4.0), d['close'])
+        d['bb_width'] = safe_div((d['close'].rolling(20).std() * 4.0), d['close'], default=0.0)
         d['lag_ret'] = d['close'].pct_change().shift(1)
         d['vol'] = d['close'].rolling(20).std().shift(1)
         la = int(self.params.lookahead)
@@ -132,7 +132,7 @@ class MLSignal:
         if df is None or df.empty: return None
         d = df.copy()
         if not {'close','rsi','macd','atr'}.issubset(d.columns): return None
-        d['bb_width'] = safe_div((d['close'].rolling(20).std() * 4.0), d['close'])
+        d['bb_width'] = safe_div((d['close'].rolling(20).std() * 4.0), d['close'], default=0.0)
         d['lag_ret'] = d['close'].pct_change().shift(1)
         d['vol'] = d['close'].rolling(20).std().shift(1)
         feat_cols = ['rsi','macd','atr','bb_width','lag_ret','vol']

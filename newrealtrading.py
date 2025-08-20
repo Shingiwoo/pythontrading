@@ -33,7 +33,7 @@ from engine_core import (
     _to_float, _to_int, _to_bool, floor_to_step,
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
     htf_trend_ok, r_multiple, apply_breakeven_sl, roi_frac_now, base_supports_side,
-    safe_div
+    safe_div, as_float
 )
 
 from binance.client import Client
@@ -76,6 +76,24 @@ def safe_fetch_klines(client, symbol: str, interval: str, limit: int):
             if attempt == HTTP_RETRIES - 1:
                 raise
             time.sleep(HTTP_BACKOFF * (attempt + 1))
+
+
+def get_step_size(client, symbol: str, default: float = 1.0) -> float:
+    if client is None or not symbol:
+        return float(default)
+    try:
+        if hasattr(client, "symbol_filters"):
+            f = client.symbol_filters.get(symbol.upper()) if isinstance(symbol, str) else None
+            step = None
+            if f:
+                step = f.get("step") or f.get("stepSize")
+            if step:
+                return float(step)
+        if hasattr(client, "step_size"):
+            return float(client.step_size(symbol))
+    except Exception:
+        pass
+    return float(default)
 
 
 class ExecutionClient:
@@ -122,9 +140,13 @@ class ExecutionClient:
         return (q * step).normalize()
 
     def has_symbol(self, symbol: str) -> bool:
+        if not isinstance(symbol, str) or not symbol:
+            return False
         return symbol.upper() in self.symbol_filters
 
     def round_qty(self, symbol: str, qty: float) -> float:
+        if not isinstance(symbol, str) or not symbol:
+            return 0.0
         flt = self.symbol_filters.get(symbol.upper())
         if not flt:
             return 0.0
@@ -141,6 +163,8 @@ class ExecutionClient:
         return float(q)
 
     def round_price(self, symbol: str, price: float) -> float:
+        if not isinstance(symbol, str) or not symbol:
+            return float(price)
         flt = self.symbol_filters.get(symbol.upper())
         if not flt:
             return float(price)
@@ -201,6 +225,9 @@ class ExecutionClient:
 
     def _order_with_retry(self, params: Dict[str, Any], raw_qty: float, raw_price: Optional[float] = None) -> Dict[str, Any]:
         symbol = params.get("symbol")
+        if not isinstance(symbol, str) or not symbol:
+            self._log("order retry skipped: invalid symbol")
+            return {}
         try:
             return self.client.futures_create_order(**params)
         except BinanceAPIException as e:
@@ -215,7 +242,11 @@ class ExecutionClient:
                     return self.client.futures_create_order(**params)
                 except Exception as e2:
                     self._log(f"order retry fail: {e2}")
-                    raise
+            else:
+                self._log(f"order fail: {e}")
+        except Exception as e:
+            self._log(f"order fail: {e}")
+        return {}
 
     # --- Helper: clamp qty & side untuk reduce-only ----
     def _clamp_reduceonly_qty(self, symbol: str, side: str, req_qty: float) -> Tuple[str, float]:
@@ -628,7 +659,7 @@ class CoinTrader:
 
         min_not = float(self.config.get("minNotional", 0.0) or 0.0)
         if min_not > 0 and price * qty < min_not:
-            step = self.exec._step_size(self.symbol) if self.exec else _to_float(self.config.get("stepSize", 0.0), 0.0)
+            step = get_step_size(self.exec, self.symbol, _to_float(self.config.get("stepSize", 0.0), 0.0))
             need_qty = safe_div(min_not, price)
             if step > 0:
                 need_qty = math.ceil(safe_div(need_qty, step)) * step
@@ -729,6 +760,12 @@ class CoinTrader:
         if not math.isfinite(price):
             raise ValueError("Non-finite price")
         atr = float(last['atr']) if not pd.isna(last['atr']) else 0.0
+
+        up_prob = None
+        if self.ml.use_ml:
+            self.ml.fit_if_needed(df)
+            up_prob = self.ml.predict_up_prob(df)
+
         try:
             if self.pending_skip_entries > 0:
                 self._apply_breakeven(price)
@@ -743,20 +780,33 @@ class CoinTrader:
                     self._exit_position(price, rs or 'Exit')
                     return 0.0
 
-            # Filter ATR & body/ATR
-            atr_ok = (last['atr_pct'] >= _to_float(self.config.get('min_atr_pct', DEFAULTS['min_atr_pct']), DEFAULTS['min_atr_pct'])) \
-                     and (last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct']))
+            filters_cfg = (self.config.get('filters') if isinstance(self.config.get('filters'), dict) else {}) or {}
+            atr_body_enabled = filters_cfg.get('enable_atr_body_filter', True)
+            allow_ml_override = filters_cfg.get('allow_ml_override', True)
+            min_atr_threshold = _to_float(filters_cfg.get('min_atr_threshold', self.config.get('min_atr_pct', DEFAULTS['min_atr_pct'])), DEFAULTS['min_atr_pct'])
+            max_body_over_atr = _to_float(filters_cfg.get('max_body_over_atr', self.config.get('max_body_atr', DEFAULTS['max_body_atr'])), DEFAULTS['max_body_atr'])
 
-            # GUARD: pakai body_to_atr kalau ada, kalau tidak fallback ke body_atr
+            atr_ok = True if not atr_body_enabled else (
+                (last['atr_pct'] >= min_atr_threshold) and (
+                    last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct'])
+                )
+            )
             body_val = last.get('body_to_atr', last.get('body_atr'))
-            body_ok = (float(body_val) <= _to_float(self.config.get('max_body_atr', DEFAULTS['max_body_atr']), DEFAULTS['max_body_atr'])) if body_val is not None else False
+            body_ok = True if not atr_body_enabled else (as_float(body_val) <= max_body_over_atr)
 
-            # Filter ATR & body: bila gagal dan belum ada posisi → stop saja
-            if not (atr_ok and body_ok):
-                if self.verbose:
-                    print(f"[{self.symbol}] FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
-                if not self.pos.side:
-                    return 0.0
+            ml_triggered = False
+            if up_prob is not None:
+                ml_triggered = (up_prob >= self.ml.params.up_prob_thres) or ((1 - up_prob) >= self.ml.params.down_prob_thres)
+
+            if atr_body_enabled and not (atr_ok and body_ok):
+                if allow_ml_override and ml_triggered:
+                    if self.verbose:
+                        print(f"[{self.symbol}] FILTER BYPASSED (ML override) atr_ok={atr_ok} body_ok={body_ok} up_prob={up_prob if up_prob is not None else float('nan'):.3f}")
+                else:
+                    if self.verbose:
+                        print(f"[{self.symbol}] FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
+                    if not self.pos.side:
+                        return 0.0
 
             # HTF filter (opsional)
             if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
@@ -777,7 +827,13 @@ class CoinTrader:
 
             if self.rehydrated and self.pos.side:
                 lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
-                roi = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
+                entry_safe = as_float(self.pos.entry, 0.0)
+                price_safe = as_float(price, 0.0)
+                qty_safe = as_float(self.pos.qty, 0.0)
+                if entry_safe == 0.0 or qty_safe == 0.0:
+                    roi = 0.0
+                else:
+                    roi = roi_frac_now(self.pos.side, entry_safe, price_safe, qty_safe, lev)
                 if roi >= self.rehydrate_profit_min_pct and self.rehydrate_protect_profit:
                     if base_supports_side(long_base, short_base, self.pos.side):
                         self._log("REHYDRATE PROTECT: profit & signal searah → tahan posisi (skip close by-signal)")
@@ -793,10 +849,6 @@ class CoinTrader:
                 return 0.0
 
             # ML
-            up_prob = None
-            if self.ml.use_ml:
-                self.ml.fit_if_needed(df)
-                up_prob = self.ml.predict_up_prob(df)
             ml_cfg = self.config.get("ml", {}) if isinstance(self.config.get("ml"), dict) else {}
             if "score_threshold" in ml_cfg:
                 self.ml.params.score_threshold = _to_float(ml_cfg.get("score_threshold"), ENV_DEFAULTS["SCORE_THRESHOLD"])
@@ -861,7 +913,7 @@ class CoinTrader:
 # Manager (contoh sederhana)
 # ============================
 class TradingManager:
-    def __init__(self, coin_config_path: str, symbols: List[str], *, instance_id: str="bot", account_guard: bool=False, exec_client: Optional[ExecutionClient]=None, verbose: bool=False):
+    def __init__(self, coin_config_path: str, symbols: List[str], *, instance_id: str="bot", account_guard: bool=False, exec_client: Optional[ExecutionClient]=None, verbose: bool=False, no_atr_filter: bool=False, ml_override: bool=False):
         self.coin_config_path = coin_config_path
         raw_syms = [s.upper() for s in symbols]
         self.exec_client = exec_client
@@ -876,6 +928,10 @@ class TradingManager:
         self.traders: Dict[str, CoinTrader] = {}
         for s in self.symbols:
             merged_cfg = merge_config(s, self._cfg)
+            if no_atr_filter:
+                merged_cfg.setdefault('filters', {})['enable_atr_body_filter'] = False
+            if ml_override:
+                merged_cfg.setdefault('filters', {})['allow_ml_override'] = True
             self.traders[s] = CoinTrader(s, merged_cfg, instance_id=instance_id, account_guard=account_guard, verbose=self.verbose, exec_client=self.exec_client)
         self.boot_time = pd.Timestamp.utcnow()
         self._stop = False
@@ -1003,6 +1059,8 @@ if __name__ == "__main__":
     ap.add_argument("--instance-id", default="bot", help="ID instance unik (untuk penamaan order/log)")
     ap.add_argument("--logs_dir", default=None)
     ap.add_argument("--account-guard", action="store_true")
+    ap.add_argument("--no-atr-filter", action="store_true", help="Disable ATR/body candle filter (ML always allowed)")
+    ap.add_argument("--ml-override", action="store_true", help="Allow ML to bypass ATR/body filter when triggered")
     args = ap.parse_args()
     if args.verbose:
         os.environ["VERBOSE"] = "1"
@@ -1011,6 +1069,10 @@ if __name__ == "__main__":
 
     cfg_all = load_coin_config(args.coin_config) if os.path.exists(args.coin_config) else {}
     cfg = merge_config(args.symbol.upper(), cfg_all)
+    if args.no_atr_filter:
+        cfg.setdefault('filters', {})['enable_atr_body_filter'] = False
+    if args.ml_override:
+        cfg.setdefault('filters', {})['allow_ml_override'] = True
 
     exec_client = None
     if args.real_exec:
@@ -1041,7 +1103,7 @@ if __name__ == "__main__":
             warmup = max(300, min_train + 10)
             start_i = min(warmup, len(df)-1)
             steps = 0
-            mgr = TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose)
+            mgr = TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose, no_atr_filter=args.no_atr_filter, ml_override=args.ml_override)
             for i in range(start_i, len(df)):
                 data_map = {sym: df.iloc[:i+1].copy()}
                 mgr.run_once(data_map, {sym: args.balance})
@@ -1054,7 +1116,7 @@ if __name__ == "__main__":
             print(f"Dry-run completed: {steps} steps (start={start_i}, total_bars={len(df)}). Last position: {last_side}")
         else:
             data_map = {sym: df}
-            TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose).run_once(data_map, {sym: args.balance})
+            TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose, no_atr_filter=args.no_atr_filter, ml_override=args.ml_override).run_once(data_map, {sym: args.balance})
             print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
     else:
         if args.live:
@@ -1080,7 +1142,7 @@ if __name__ == "__main__":
             interval = args.interval
             step = _sec(interval)
 
-            mgr = TradingManager(args.coin_config, syms, instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose)
+            mgr = TradingManager(args.coin_config, syms, instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose, no_atr_filter=args.no_atr_filter, ml_override=args.ml_override)
 
             print(f"[LIVE] balance sumber: account availableBalance (bukan arg --balance)")
             print(f"[LIVE] start symbols={','.join(syms)} interval={interval}")

@@ -1,4 +1,12 @@
 {
+  "SYMBOL_DEFAULTS": {
+    "filters": {
+      "enable_atr_body_filter": false,
+      "allow_ml_override": true,
+      "min_atr_threshold": 0.0,
+      "max_body_over_atr": 9.99
+    }
+  },
   "ADAUSDT": {
     "leverage": 15,
     "risk_per_trade": 0.08,
