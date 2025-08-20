@@ -100,7 +100,7 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
     macd = MACD(d['close'])
     d['macd'] = macd.macd()
     d['macd_signal'] = macd.macd_signal()
-    d['rsi'] = RSIIndicator(d['close'], 14).rsi()
+    d['rsi'] = RSIIndicator(d['close'], 25).rsi()
 
     # ATR (EMA Wilder-ish) & normalisasi
     prev_close = d['close'].shift(1)
