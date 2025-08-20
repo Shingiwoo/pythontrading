@@ -173,7 +173,6 @@ class ExecutionClient:
             if e.code == -4046:
                 self._log(f"set_margin_type fail: {e}")
                 return None
-            raise
         except Exception as e:
             self._log(f"set_margin_type fail: {e}")
 
@@ -217,7 +216,28 @@ class ExecutionClient:
                 except Exception as e2:
                     self._log(f"order retry fail: {e2}")
                     raise
-            raise
+
+    # --- Helper: clamp qty & side untuk reduce-only ----
+    def _clamp_reduceonly_qty(self, symbol: str, side: str, req_qty: float) -> Tuple[str, float]:
+        """
+        Samakan side penutupan dengan arah posisi aktual dan batasi qty <= abs(positionAmt).
+        Return: (side_close, allowed_qty_rounded)
+        """
+        try:
+            info = self.position_info(symbol) or {}
+        except Exception:
+            info = {}
+        pos_amt = float(info.get("positionAmt") or 0.0)
+        if abs(pos_amt) < 1e-12:
+            if self.verbose:
+                print(f"[EXEC] SKIP close: no open position for {symbol}")
+            return side, 0.0
+        expected_side = "SELL" if pos_amt > 0 else "BUY"
+        if side != expected_side:
+            side = expected_side
+        allowed = min(abs(pos_amt), float(req_qty or 0.0))
+        allowed = self.round_qty(symbol, allowed)
+        return side, allowed
 
     def market_entry(self, symbol: str, side: str, qty: float, client_id: Optional[str]=None) -> Dict[str, Any]:
         r_qty = self.round_qty(symbol, qty)
@@ -233,9 +253,14 @@ class ExecutionClient:
         return o
 
     def stop_market(self, symbol: str, side: str, stop_price: float, qty: float, reduce_only: bool=True, client_id: Optional[str]=None) -> Dict[str, Any]:
-        r_qty = self.round_qty(symbol, qty)
+        raw_qty = qty
+        raw_price = stop_price
+        if reduce_only:
+            side, r_qty = self._clamp_reduceonly_qty(symbol, side, qty)
+        else:
+            r_qty = self.round_qty(symbol, qty)
         if r_qty <= 0:
-            self._log(f"SKIP stop: qty<minQty (raw={qty})")
+            self._log(f"SKIP stop: qty<minQty (raw={raw_qty})")
             return {}
         sp = self.round_price(symbol, stop_price)
         params = dict(
@@ -248,12 +273,20 @@ class ExecutionClient:
             reduceOnly=reduce_only,
             workingType="MARK_PRICE",
             timeInForce="GTC",
-            newClientOrderId=client_id,
         )
-        o = self._order_with_retry(params, qty, stop_price)
-        if self.verbose and o:
-            print(f"[EXEC] STOP_MARKET {symbol} {side} stop={sp} qty={r_qty} -> orderId={o.get('orderId')}")
-        return o
+        if client_id:
+            params["newClientOrderId"] = client_id
+        try:
+            o = self._order_with_retry(params, r_qty, raw_price)
+            if self.verbose and o:
+                print(f"[EXEC] STOP_MARKET {symbol} {side} stop={sp} qty={r_qty} -> orderId={o.get('orderId')}")
+            return o
+        except BinanceAPIException as e:
+            if getattr(e, "code", None) == -2022 and "ReduceOnly" in str(e):
+                if self.verbose:
+                    print(f"[EXEC] STOP_MARKET ignore -2022 (no position to reduce) {symbol}")
+                return {}
+            raise
 
     def cancel_all(self, symbol: str):
         try:
@@ -272,15 +305,31 @@ class ExecutionClient:
         return self.client.futures_get_open_orders(symbol=symbol)
 
     def market_close(self, symbol: str, side: str, qty: float, client_id: Optional[str]=None) -> Dict[str, Any]:
-        r_qty = self.round_qty(symbol, qty)
+        raw_qty = qty
+        side, r_qty = self._clamp_reduceonly_qty(symbol, side, qty)
         if r_qty <= 0:
-            self._log(f"SKIP close: qty<minQty (raw={qty})")
+            self._log(f"SKIP close: qty<=0 after clamp (raw={raw_qty})")
             return {}
-        params = dict(symbol=symbol, side=side, type="MARKET", quantity=r_qty, reduceOnly=True, newClientOrderId=client_id)
-        o = self._order_with_retry(params, qty)
-        if self.verbose and o:
-            print(f"[EXEC] MARKET CLOSE {symbol} {side} {r_qty} -> orderId={o.get('orderId')}")
-        return o
+        params = dict(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=r_qty,
+            reduceOnly=True,
+        )
+        if client_id:
+            params["newClientOrderId"] = client_id
+        try:
+            o = self._order_with_retry(params, r_qty)
+            if self.verbose and o:
+                print(f"[EXEC] MARKET CLOSE {symbol} {side} {r_qty} -> orderId={o.get('orderId')}")
+            return o
+        except BinanceAPIException as e:
+            if getattr(e, "code", None) == -2022 and "ReduceOnly" in str(e):
+                if self.verbose:
+                    print(f"[EXEC] MARKET CLOSE ignore -2022 (no position to reduce) {symbol}")
+                return {}
+            raise
 
 __all__ = [
     "ExecutionClient",
