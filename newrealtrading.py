@@ -318,17 +318,29 @@ class CoinTrader:
 
     def _on_new_bar(self, last_close_ts):
         """
-        Panggil fungsi ini dengan 'last_close_ts' (pd.Timestamp/np.int64) bar TERAKHIR (CLOSED).
-        Bila timestamp berubah, berarti 1 bar baru selesai terbentuk.
+        Dipanggil tiap loop dengan timestamp CLOSE bar terbaru (sudah close).
+        last_close_ts bisa int epoch ms atau pd.Timestamp.
         """
+        # Normalisasi ke int epoch ms agar perbandingan konsisten
+        try:
+            if hasattr(last_close_ts, "value"):  # pd.Timestamp
+                last_ts = int(last_close_ts.value // 1_000_000)  # ns -> ms
+            else:
+                last_ts = int(last_close_ts)
+        except Exception:
+            # fallback: biarkan apa adanya
+            last_ts = last_close_ts
+
         if self.last_bar_close_ts is None:
-            self.last_bar_close_ts = last_close_ts
+            self.last_bar_close_ts = last_ts
             return
-        if last_close_ts != self.last_bar_close_ts:
-            # minimal 1 bar baru; untuk kesederhanaan, kurangi 1 (umumnya loop per 1 bar)
-            self.last_bar_close_ts = last_close_ts
+
+        if last_ts > self.last_bar_close_ts:
+            # terdeteksi bar baru yang SUDAH tutup
+            self.last_bar_close_ts = last_ts
             if self.pending_skip_entries > 0:
                 self.pending_skip_entries = max(0, self.pending_skip_entries - 1)
+                self._log(f"STARTUP SKIP: tunda entry {self.pending_skip_entries} bar lagi")
             if self.signal_flip_confirm_left > 0:
                 self.signal_flip_confirm_left = max(0, self.signal_flip_confirm_left - 1)
 
@@ -346,8 +358,8 @@ class CoinTrader:
     def _size_position(self, price: float, sl: float, balance: float) -> float:
         risk_usdt = float(balance) * _to_float(self.config.get('risk_per_trade', DEFAULTS['risk_per_trade']), DEFAULTS['risk_per_trade'])
         dist = abs(price - sl)
-        if dist <= 0:
-            return 0.0
+        # gunakan nilai minimal agar tidak nol
+        dist = max(dist, max(_to_float(self.config.get('tickSize', 0.0), 0.0), 1e-12))
         qty = risk_usdt / dist
         if self.exec:
             qty = self.exec.round_qty(self.symbol, qty)
@@ -404,7 +416,8 @@ class CoinTrader:
         if not (self.pos.entry and self.pos.side):
             return
         if self.pos.side=='LONG':
-            profit_pct = (price - self.pos.entry)/self.pos.entry*100.0
+            den = max(self.pos.entry, 1e-12)
+            profit_pct = (price - self.pos.entry)/den*100.0
             if profit_pct >= safe_trigger:
                 new_ts = price * (1 - step/100.0)
                 prev = self.pos.trailing_sl
@@ -420,7 +433,8 @@ class CoinTrader:
                         cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
                         self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True, client_id=cid)
         else:
-            profit_pct = (self.pos.entry - price)/self.pos.entry*100.0
+            den = max(self.pos.entry, 1e-12)
+            profit_pct = (self.pos.entry - price)/den*100.0
             if profit_pct >= safe_trigger:
                 new_ts = price * (1 + step/100.0)
                 prev = self.pos.trailing_sl
@@ -584,15 +598,17 @@ class CoinTrader:
             return 0.0
         heikin = _to_bool(self.config.get('heikin', False), False)
         df = calculate_indicators(df_raw, heikin=heikin)
-        # Ambil CLOSE timestamp terakhir (sudah jadi bar, bukan tick berjalan)
-        last_ts = int(df.index[-1]) if hasattr(df.index[-1], '__int__') else df.index[-1]
+        # Ambil CLOSE timestamp terakhir dari kolom 'timestamp' bila tersedia
+        if 'timestamp' in df.columns:
+            last_ts = df['timestamp'].iloc[-1]
+        else:
+            last_ts = df.index[-1]
         self._on_new_bar(last_ts)
         last = df.iloc[-1]
         price = float(last['close'])
         htf = str(self.config.get('htf', '1h'))
 
         if self.pending_skip_entries > 0:
-            self._log(f"STARTUP SKIP: tunda entry {self.pending_skip_entries} bar lagi")
             self._apply_breakeven(price)
             self._update_trailing(price)
             return 0.0
@@ -688,12 +704,11 @@ class CoinTrader:
             lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
             if self.pos.entry is not None and self.pos.qty is not None:
                 init_margin = (self.pos.entry * self.pos.qty) / max(lev, 1)
-                roi_frac = 0.0
-                if init_margin > 0:
-                    if self.pos.side == "LONG":
-                        roi_frac = ((price - self.pos.entry) * self.pos.qty) / init_margin
-                    else:
-                        roi_frac = ((self.pos.entry - price) * self.pos.qty) / init_margin
+                init_margin = max(init_margin, 1e-12)
+                if self.pos.side == "LONG":
+                    roi_frac = ((price - self.pos.entry) * self.pos.qty) / init_margin
+                else:
+                    roi_frac = ((self.pos.entry - price) * self.pos.qty) / init_margin
 
                 only_if_loss = _to_bool(self.config.get('time_stop_only_if_loss', 0), False)
                 if elapsed >= max_hold:
@@ -957,6 +972,8 @@ if __name__ == "__main__":
                     for c in ["open","high","low","close","volume"]:
                         df[c] = pd.to_numeric(df[c], errors="coerce")
                     df = df[["timestamp","open","high","low","close","volume"]].dropna()
+                    if len(df) > 0:
+                        df = df.iloc[:-1].copy()
                     data_map[s] = df
 
                 mgr.run_once(data_map)
