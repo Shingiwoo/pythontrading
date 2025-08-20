@@ -241,6 +241,21 @@ def apply_breakeven_sl(side: str,
 
     return sl
 
+def roi_frac_now(side: str, entry: float, price: float, qty: float, leverage: int) -> float:
+    if not entry or not qty or leverage <= 0:
+        return 0.0
+    init_margin = (entry * abs(qty)) / max(leverage, 1)
+    if init_margin <= 0:
+        return 0.0
+    if side == 'LONG':
+        pnl = (price - entry) * qty
+    else:
+        pnl = (entry - price) * qty
+    return pnl / init_margin
+
+def base_supports_side(base_long: bool, base_short: bool, side: str) -> bool:
+    return (side == 'LONG' and base_long and not base_short) or (side == 'SHORT' and base_short and not base_long)
+
 # -----------------------------------------------------
 # Journaling
 # -----------------------------------------------------
