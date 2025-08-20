@@ -410,8 +410,16 @@ class CoinTrader:
         roundtrip_fee_pct = taker_fee * 2.0 * 100.0
         roundtrip_slip_pct = slippage_pct * 2.0
         safe_buffer_pct = roundtrip_fee_pct + roundtrip_slip_pct + 0.05
-        trailing_trigger = _to_float(self.config.get('trailing_trigger', DEFAULTS['trailing_trigger']), DEFAULTS['trailing_trigger'])
-        trailing_step = _to_float(self.config.get('trailing_step', DEFAULTS['trailing_step']), DEFAULTS['trailing_step'])
+        trailing_trigger = _to_float(
+            self.config.get('trailing_trigger', DEFAULTS['trailing_trigger']),
+            DEFAULTS['trailing_trigger']
+        )
+        if 'trailing_step' in self.config:
+            trailing_step_val = self.config.get('trailing_step')
+        else:
+            fallback_ts = self.config.get('trailing_step_min_pct', self.config.get('trail', {}).get('min_step_pct'))
+            trailing_step_val = fallback_ts if fallback_ts is not None else DEFAULTS['trailing_step']
+        trailing_step = _to_float(trailing_step_val, DEFAULTS['trailing_step'])
         safe_trigger = max(trailing_trigger, safe_buffer_pct + trailing_step)
         return safe_trigger, trailing_step
 

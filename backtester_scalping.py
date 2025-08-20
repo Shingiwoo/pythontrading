@@ -41,7 +41,7 @@ def load_coin_config(path: str) -> dict:
 
 # ---------- Defaults ----------
 DEFAULT_TAKER_FEE = float(os.getenv('TAKER_FEE', '0.0005'))
-DEFAULT_MIN_ROI_TO_CLOSE_BY_TIME = float(os.getenv('MIN_ROI_TO_CLOSE_BY_TIME', '0.05'))
+DEFAULT_MIN_ROI_TO_CLOSE_BY_TIME = float(os.getenv('MIN_ROI_TO_CLOSE_BY_TIME', '0.0'))
 DEFAULT_MAX_HOLD_SECONDS = int(os.getenv('MAX_HOLD_SECONDS', '3600'))
 
 # ---------- UI ----------
@@ -125,12 +125,23 @@ if sym_cfg:
 cooldown_seconds = st.sidebar.number_input("cooldown_seconds", value=cfgi("cooldown_seconds", 900))
 
 with st.sidebar.expander("🛡️ Exit Guards (Time-based)"):
-    max_hold_seconds = st.number_input("MAX_HOLD_SECONDS", value=DEFAULT_MAX_HOLD_SECONDS, step=60)
-    min_roi_to_close_by_time = st.number_input("MIN_ROI_TO_CLOSE_BY_TIME (fraction)", value=DEFAULT_MIN_ROI_TO_CLOSE_BY_TIME, format="%.4f")
+    max_hold_seconds = st.number_input(
+        "MAX_HOLD_SECONDS", value=cfgi("max_hold_seconds", DEFAULT_MAX_HOLD_SECONDS), step=60
+    )
+    min_roi_to_close_by_time = st.number_input(
+        "MIN_ROI_TO_CLOSE_BY_TIME (fraction)",
+        value=cfgf("min_roi_to_close_by_time", DEFAULT_MIN_ROI_TO_CLOSE_BY_TIME),
+        format="%.4f",
+    )
+    time_stop_only_if_loss = st.checkbox(
+        "time_stop_only_if_loss", value=cfgb("time_stop_only_if_loss", True)
+    )
 
 st.sidebar.subheader("🏃 Trailing & Breakeven")
-trailing_trigger = st.sidebar.number_input("trailing_trigger (%)", value=cfgf("trailing_trigger", 0.4))
-trailing_step = st.sidebar.number_input("trailing_step (%)", value=cfgf("trailing_step", 0.3))
+trailing_trigger = st.sidebar.number_input("trailing_trigger (%)", value=cfgf("trailing_trigger", 0.7))
+trailing_step = st.sidebar.number_input(
+    "trailing_step (%)", value=cfgf("trailing_step", cfgf("trailing_step_min_pct", 0.45))
+)
 use_breakeven = st.sidebar.checkbox("use_breakeven", value=cfgb("use_breakeven", True))
 be_trigger_pct = st.sidebar.number_input("be_trigger_pct (fraction)", value=cfgf("be_trigger_pct", 0.006), format="%.4f")
 
@@ -486,7 +497,9 @@ if selected_file:
                             roi_frac = ((entry - price) * (qty if qty>0 else 1e-12)) / init_margin
                     else:
                         roi_frac = 0.0
-                    if roi_frac >= float(min_roi_to_close_by_time):
+                    if time_stop_only_if_loss and roi_frac >= 0:
+                        hold_start_ts = row['timestamp']
+                    elif roi_frac >= float(min_roi_to_close_by_time):
                         exit_cond, reason = True, f"Max hold reached (ROI {roi_frac*100:.2f}%)"
                     else:
                         hold_start_ts = row['timestamp']
