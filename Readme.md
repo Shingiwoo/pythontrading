@@ -297,6 +297,477 @@ python newrealtrading.py \
 * Output: **Equity curve**, **Trade history** & **CSV**.
 
 ---
+# Deploy newrealtrading — Satu Perintah Build & Jalan (Docker)
+
+Dokumen ini menyiapkan **sekali klik**: build image + run container **real trading** (atau testnet), serta perintah ringkas untuk **cek log**, **stop**, **restart**, dan **update**.
+
+---
+
+## Struktur folder yang disarankan (host)
+
+```
+/var/www/rajadollarb/
+├── coin_config.json            # konfigurasi per‑koin
+├── .env                        # kunci API & variabel runtime (isi sendiri)
+├── logs/                       # output jurnal & log bot
+├── docker-compose.yml          # file compose (di bawah)
+├── Makefile                    # perintah singkat (opsional, di bawah)
+└── scripts/
+    ├── deploy.sh               # build + up -d sekali jalan
+    ├── logs.sh                 # tail log container
+    ├── stop.sh                 # stop container
+    ├── restart.sh              # restart container
+    └── down.sh                 # stop & remove container
+```
+
+Buat folder jika belum ada:
+
+```bash
+sudo mkdir -p /var/www/rajadollarb/logs /var/www/rajadollarb/scripts
+sudo chown -R $USER:$USER /var/www/rajadollarb
+```
+
+---
+
+## 1) Isi file `.env` (mainnet / real)
+
+Buat `/var/www/rajadollarb/.env`:
+
+```
+# Binance API (MAINNET)
+BINANCE_API_KEY=ISI_KUNCI_KAMU
+BINANCE_API_SECRET=ISI_RAHASIA_KAMU
+
+# Identitas & zona waktu
+INSTANCE_ID=botA
+TZ=Asia/Jakarta
+```
+
+> Catatan: Untuk **testnet**, tetap gunakan .env yang sama — nanti service `newrealtrading_testnet` menambahkan flag `--testnet`.
+
+---
+
+## 2) `docker-compose.yml`
+
+Simpan di `/var/www/rajadollarb/docker-compose.yml`:
+
+```yaml
+version: "3.8"
+
+services:
+  newrealtrading:
+    container_name: newrealtrading
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Asia/Jakarta}
+    command: >-
+      python -u /app/newrealtrading.py
+      --live --real-exec
+      --symbols "DOGEUSDT,XRPUSDT"
+      --interval 15m
+      --coin_config /data/coin_config.json
+      --instance-id ${INSTANCE_ID:-botA}
+      --account-guard
+      --verbose
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 512m
+    restart: unless-stopped
+    volumes:
+      - ./coin_config.json:/data/coin_config.json:ro
+      - ./logs:/app/logs
+      # mount project ke image hasil build; tidak perlu expose port
+
+  # Opsi uji di TESTNET (aman sebelum real)
+  newrealtrading_testnet:
+    container_name: newrealtrading_testnet
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Asia/Jakarta}
+    command: >-
+      python -u /app/newrealtrading.py
+      --live --real-exec --testnet
+      --symbols "DOGEUSDT,XRPUSDT"
+      --interval 15m
+      --coin_config /data/coin_config.json
+      --instance-id ${INSTANCE_ID:-botTEST}
+      --account-guard
+      --verbose
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 512m
+    restart: unless-stopped
+    volumes:
+      - ./coin_config.json:/data/coin_config.json:ro
+      - ./logs:/app/logs
+```
+
+> Ganti daftar simbol & interval di bagian `command` sesuai kebutuhan.
+
+---
+
+## 3) Script sekali jalan — `scripts/deploy.sh`
+
+Simpan di `/var/www/rajadollarb/scripts/deploy.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Pastikan folder ada
+mkdir -p logs
+
+# Build image dan jalankan (REAL)
+docker compose build newrealtrading
+docker compose up -d newrealtrading
+
+echo "\n✅ newrealtrading real mode berjalan. Lihat log: ./scripts/logs.sh"
+```
+
+Lalu beri izin eksekusi:
+
+```bash
+chmod +x /var/www/rajadollarb/scripts/deploy.sh
+```
+
+### Variasi testnet cepat
+
+Jalankan:
+
+```bash
+# testnet
+cd /var/www/rajadollarb
+docker compose build newrealtrading_testnet
+docker compose up -d newrealtrading_testnet
+```
+
+---
+
+## 4) Script util
+
+**`scripts/logs.sh`** — tail log container (REAL):
+
+```bash
+#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+docker compose logs -f --tail=300 newrealtrading
+```
+
+**`scripts/stop.sh`** — stop container (REAL):
+
+```bash
+#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+docker compose stop newrealtrading || true
+```
+
+**`scripts/restart.sh`** — restart cepat (REAL):
+
+```bash
+#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+docker compose restart newrealtrading
+```
+
+**`scripts/down.sh`** — stop & remove (REAL):
+
+```bash
+#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+docker compose down newrealtrading || true
+```
+
+Beri izin eksekusi:
+
+```bash
+chmod +x /var/www/rajadollarb/scripts/{logs.sh,stop.sh,restart.sh,down.sh}
+```
+
+---
+
+## 5) Makefile (opsional, perintah singkat)
+
+Simpan di `/var/www/rajadollarb/Makefile`:
+
+```make
+.PHONY: build up logs stop restart down testnet
+
+build:
+	docker compose build newrealtrading
+
+up:
+	docker compose up -d newrealtrading
+
+logs:
+	docker compose logs -f --tail=300 newrealtrading
+
+stop:
+	docker compose stop newrealtrading || true
+
+restart:
+	docker compose restart newrealtrading
+
+down:
+	docker compose down newrealtrading || true
+
+testnet:
+	docker compose up -d --build newrealtrading_testnet
+```
+
+---
+
+## 6) Cara menjalankan (REAL)
+
+```bash
+# sekali jalan (build + up)
+/var/www/rajadollarb/scripts/deploy.sh
+
+# atau gunakan Makefile
+cd /var/www/rajadollarb && make build && make up
+```
+
+**Cek log (live):**
+
+```bash
+/var/www/rajadollarb/scripts/logs.sh
+# atau
+cd /var/www/rajadollarb && docker compose logs -f --tail=300 newrealtrading
+```
+
+**Stop / Restart / Down:**
+
+```bash
+/var/www/rajadollarb/scripts/stop.sh
+/var/www/rajadollarb/scripts/restart.sh
+/var/www/rajadollarb/scripts/down.sh
+```
+
+**Update ke patch terbaru:**
+
+```bash
+cd /var/www/rajadollarb
+# (opsional) git pull
+docker compose build --no-cache newrealtrading && docker compose up -d newrealtrading
+```
+
+---
+
+## 7) Mode Testnet (disarankan sebelum real)
+
+```bash
+cd /var/www/rajadollarb
+# build + run service testnet
+docker compose up -d --build newrealtrading_testnet
+# lihat log
+docker compose logs -f --tail=300 newrealtrading_testnet
+```
+
+**Berhenti & hapus (testnet):**
+
+```bash
+docker compose down newrealtrading_testnet || true
+```
+
+---
+
+## 8) Catatan keamanan & operasional
+
+* **INSTANCE\_ID** unik jika kamu jalan beberapa bot sekaligus.
+* Pastikan `coin_config.json` telah memuat **LOT\_SIZE/MIN\_NOTIONAL**; papertrade biasa meng‑inject otomatis.
+* Clock server sinkron (NTP) → tanda tangan Binance valid.
+* Gunakan `newrealtrading_testnet` untuk UAT; pindah ke **REAL** hanya ketika hasil papertrade/testnet sudah stabil.
+
+---
+
+Selesai. Dengan file di atas, kamu bisa:
+
+* **Sekali perintah**: `scripts/deploy.sh` → build & run **real**
+* **Cek log**: `scripts/logs.sh`
+* **Stop/Restart/Down**: script terkait atau target `make`
+
+---
+
+## Lampiran — Compose YAML (versi aman tanpa fold)
+
+> Perbaikan untuk error `yaml: line XX: could not find expected ':'`. Gunakan **array form** untuk `command` (lebih tahan salah indent & komentar).
+
+Simpan sebagai `/var/www/rajadollarb/docker-compose.yml` (atau folder proyekmu):
+
+```yaml
+version: "3.8"
+
+services:
+  newrealtrading:
+    container_name: newrealtrading
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Asia/Jakarta}
+    command:
+      - python
+      - -u
+      - /app/newrealtrading.py
+      - --live
+      - --real-exec
+      - --symbols
+      - DOGEUSDT,XRPUSDT
+      - --interval
+      - 15m
+      - --coin_config
+      - /data/coin_config.json
+      - --instance-id
+      - ${INSTANCE_ID:-botA}
+      - --account-guard
+      - --verbose
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 512m
+    restart: unless-stopped
+    volumes:
+      - ./coin_config.json:/data/coin_config.json:ro
+      - ./logs:/app/logs
+
+  newrealtrading_testnet:
+    container_name: newrealtrading_testnet
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Asia/Jakarta}
+    command:
+      - python
+      - -u
+      - /app/newrealtrading.py
+      - --live
+      - --real-exec
+      - --testnet
+      - --symbols
+      - DOGEUSDT,XRPUSDT
+      - --interval
+      - 15m
+      - --coin_config
+      - /data/coin_config.json
+      - --instance-id
+      - ${INSTANCE_ID:-botTEST}
+      - --account-guard
+      - --verbose
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 512m
+    restart: unless-stopped
+    volumes:
+      - ./coin_config.json:/data/coin_config.json:ro
+      - ./logs:/app/logs
+```
+
+### Validasi YAML
+
+Sebelum deploy:
+
+```bash
+cd /var/www/rajadollarb
+docker compose config > /dev/null && echo "YAML OK"
+```
+
+### Deploy cepat
+
+```bash
+cd /var/www/rajadollarb
+# REAL
+docker compose up -d --build newrealtrading
+# atau TESTNET
+# docker compose up -d --build newrealtrading_testnet
+```
+
+> Catatan: Jangan gunakan `//` untuk komentar di YAML (pakai `#`). Semua item di bawah `command:` harus
+> berada dalam satu list atau satu blok fold yang indentasinya benar.
+
+```
+Kalau yang diubah:
+
+Dockerfile, requirements.txt, atau file Python yang dibake ke image (engine_core.py, newrealtrading.py, papertrade.py, backtester_scalping.py, ml_signal_plugin.py) → build ulang image + redeploy.
+
+Hanya .env (mis. REQUEST_TIMEOUT, dsb.) atau startup flags di compose → restart container agar ENV baru terbaca.
+
+coin_config.json (risk/leverage/trailing/threshold, dll.) → sebagian besar auto-reload saat jalan. Namun parameter yang dievaluasi saat entry baru (contoh: margin_type) baru efektif pada entry berikutnya; kalau mau langsung konsisten, restart saja.
+```
+
+Perintah praktis (pakai skrip)
+Build + jalankan (recreate):
+```bash
+sudo scripts/deploy.sh
+```
+(Ini melakukan docker compose up -d --build, cocok setelah ubah Dockerfile/requirements/kode Python yang dibake.)
+
+Restart cepat (ambil ENV baru, terapkan config terbaru):
+```bash
+sudo scripts/restart.sh
+```
+Lihat log:
+```bash
+sudo scripts/logs.sh
+```
+Stop / down seluruh stack:
+```bash
+sudo scripts/stop.sh     # stop container
+sudo scripts/down.sh     # stop + remove container & network (data volume tetap)
+```
+
+```
+## Catatan tambahan
+
+Mengubah margin_type ke CROSSED di coin_config.json akan dipakai saat entry berikutnya. Kalau Anda ingin semua trader langsung konsisten sekarang, lakukan restart.
+
+Mengubah REQUEST_TIMEOUT (atau ENV lain) di .env wajib restart, karena ENV hanya dibaca saat proses start.
+
+Posisi yang sedang terbuka aman saat restart: bot akan membaca ulang posisi dari exchange saat start, lalu melanjutkan trailing/SL sesuai aturan—jadi tidak auto-close hanya karena restart.
+
+👉 Jadi, kalau Anda baru saja mengedit kode atau dependencies → build ulang (scripts/deploy.sh).
+Kalau hanya ubah .env/flag atau ingin memastikan config langsung dipakai → restart (scripts/restart.sh).
+```
+---
 
 ## Troubleshooting & Tips Operasional
 
