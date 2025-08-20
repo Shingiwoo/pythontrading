@@ -277,6 +277,7 @@ class JournaledCoinTrader(CoinTrader):
     def __init__(self, symbol: str, config: dict, journal: Journal):
         super().__init__(symbol, config)
         self.journal = journal
+        self._last_seen_len = None
         self.startup_skip_bars = int(self.config.get('startup_skip_bars', 2))
         self.post_restart_skip_entries_bars = int(self.config.get('post_restart_skip_entries_bars', 1))
         self.pending_skip_entries = self.startup_skip_bars
