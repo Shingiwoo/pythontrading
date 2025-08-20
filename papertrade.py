@@ -18,8 +18,9 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 from filelock import FileLock, Timeout
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
+HTTP_BACKOFF = float(os.getenv("HTTP_BACKOFF", "1.3"))
 
 # Binance
 from binance.client import Client
@@ -30,7 +31,8 @@ try:
     from newrealtrading import CoinTrader
     from engine_core import (
         _to_float, _to_bool, _to_int,
-        load_coin_config, merge_config
+        load_coin_config, merge_config,
+        apply_breakeven_sl, roi_frac_now, base_supports_side
     )
 except ImportError as e:
     print(f"[ERROR] Failed to import core modules: {e}")
@@ -118,12 +120,11 @@ class RateLimiter:
             self.allowance -= 1.0
 
 class BinanceFutures:
-    def __init__(self, requests_timeout: int = REQUEST_TIMEOUT, max_retries: int = REQUEST_RETRIES):
+    def __init__(self, requests_timeout: float = REQUEST_TIMEOUT, max_retries: int = HTTP_RETRIES):
         self.client = Client(requests_params={"timeout": requests_timeout})
         self.max_retries = max_retries
 
     def _retry(self, fn, *args, **kwargs):
-        delay = 1.0
         last_ex = None
         for attempt in range(max(1, self.max_retries)):
             try:
@@ -131,8 +132,7 @@ class BinanceFutures:
             except Exception as e:
                 last_ex = e
                 print(f"[WARN] Binance call failed (attempt {attempt + 1}/{self.max_retries}): {e}")
-                time.sleep(delay)
-                delay = min(delay * 2, 8.0)
+                time.sleep(HTTP_BACKOFF * (attempt + 1))
         raise last_ex if last_ex else RuntimeError("Unknown error occurred during Binance call retries.")
 
     def exchange_info(self) -> dict:
@@ -277,6 +277,14 @@ class JournaledCoinTrader(CoinTrader):
     def __init__(self, symbol: str, config: dict, journal: Journal):
         super().__init__(symbol, config)
         self.journal = journal
+        self.startup_skip_bars = int(self.config.get('startup_skip_bars', 2))
+        self.post_restart_skip_entries_bars = int(self.config.get('post_restart_skip_entries_bars', 1))
+        self.pending_skip_entries = self.startup_skip_bars
+        self.rehydrated = False
+        self.rehydrate_protect_profit = bool(self.config.get('rehydrate_protect_profit', True))
+        self.rehydrate_profit_min_pct = float(self.config.get('rehydrate_profit_min_pct', 0.0005))
+        self.signal_confirm_bars_after_restart = int(self.config.get('signal_confirm_bars_after_restart', 2))
+        self.signal_flip_confirm_left = 0
 
     def _apply_breakeven(self, price: float) -> None:
         return super()._apply_breakeven(price)

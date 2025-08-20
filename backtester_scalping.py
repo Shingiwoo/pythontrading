@@ -342,8 +342,10 @@ if selected_file:
     roundtrip_fee_pct = (taker_fee_val * 2.0) * 100.0
     roundtrip_slip_pct = float(slippage_pct) * 2.0
     safe_buffer_pct = roundtrip_fee_pct + roundtrip_slip_pct + 0.05  # persen
+    startup_skip_bars = int(sym_cfg.get('startup_skip_bars', 0))
+    start_index = max(1, startup_skip_bars)
 
-    for i in range(1, len(df)):
+    for i in range(start_index, len(df)):
         row = df.iloc[i]
         price = float(row['close'])
         ts = row['timestamp'].to_pydatetime().timestamp()

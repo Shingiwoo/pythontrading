@@ -31,7 +31,7 @@ except Exception:
 from engine_core import (
     _to_float, _to_int, _to_bool, floor_to_step,
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
-    htf_trend_ok, r_multiple, apply_breakeven_sl
+    htf_trend_ok, r_multiple, apply_breakeven_sl, roi_frac_now, base_supports_side
 )
 
 from binance.client import Client
@@ -39,8 +39,9 @@ from binance.exceptions import BinanceAPIException
 
 INSTANCE_ID = os.getenv("INSTANCE_ID", "bot")
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
+HTTP_BACKOFF = float(os.getenv("HTTP_BACKOFF", "1.3"))
 
 
 class RateLimiter:
@@ -66,15 +67,13 @@ class RateLimiter:
 
 
 def safe_fetch_klines(client, symbol: str, interval: str, limit: int):
-    delay = 1.0
-    for attempt in range(max(1, REQUEST_RETRIES)):
+    for attempt in range(max(1, HTTP_RETRIES)):
         try:
             return client.futures_klines(symbol=symbol, interval=interval, limit=limit)
         except Exception:
-            if attempt == REQUEST_RETRIES - 1:
+            if attempt == HTTP_RETRIES - 1:
                 raise
-            time.sleep(delay)
-            delay = min(delay * 2, 8.0)
+            time.sleep(HTTP_BACKOFF * (attempt + 1))
 
 
 class ExecutionClient:
@@ -297,6 +296,15 @@ class CoinTrader:
         self.account_guard = account_guard
         self.verbose = verbose or _to_bool(self.config.get('VERBOSE', os.getenv('VERBOSE','0')), False)
         self.exec = exec_client
+        self.last_bar_close_ts = None
+        self.startup_skip_bars = int(self.config.get('startup_skip_bars', 2))
+        self.post_restart_skip_entries_bars = int(self.config.get('post_restart_skip_entries_bars', 1))
+        self.pending_skip_entries = self.startup_skip_bars
+        self.rehydrated = False
+        self.rehydrate_protect_profit = bool(self.config.get('rehydrate_protect_profit', True))
+        self.rehydrate_profit_min_pct = float(self.config.get('rehydrate_profit_min_pct', 0.0005))
+        self.signal_confirm_bars_after_restart = int(self.config.get('signal_confirm_bars_after_restart', 2))
+        self.signal_flip_confirm_left = 0
 
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
@@ -306,6 +314,14 @@ class CoinTrader:
     def fetch_recent_klines(self) -> pd.DataFrame:
         """Return DataFrame dengan kolom: timestamp, open, high, low, close, volume"""
         raise NotImplementedError("Implement fetch_recent_klines() sesuai exchange kamu.")
+
+    def _on_new_bar(self, last_ts):
+        if self.last_bar_close_ts != last_ts:
+            self.last_bar_close_ts = last_ts
+            if self.pending_skip_entries > 0:
+                self.pending_skip_entries -= 1
+            if self.signal_flip_confirm_left > 0:
+                self.signal_flip_confirm_left -= 1
 
     def _safe_trailing_params(self) -> Tuple[float, float]:
         taker_fee = _to_float(self.config.get('taker_fee', DEFAULTS['taker_fee']), DEFAULTS['taker_fee'])
@@ -367,6 +383,12 @@ class CoinTrader:
                                      DEFAULTS['be_trigger_pct'])
         )
         self.pos.sl = new_sl
+        tick = _to_float(self.config.get('tickSize', 0.0), 0.0)
+        if tick > 0 and self.pos.entry is not None and self.pos.sl is not None:
+            if self.pos.side == 'LONG':
+                self.pos.sl = max(self.pos.sl, self.pos.entry + 2.0 * tick)
+            else:
+                self.pos.sl = min(self.pos.sl, self.pos.entry - 2.0 * tick)
 
     def _update_trailing(self, price: float) -> None:
         safe_trigger, step = self._safe_trailing_params()
@@ -476,6 +498,12 @@ class CoinTrader:
             qty = need_qty
 
         sl = self._hard_sl_price(price, atr, side)
+        dist = abs(price - sl)
+        tick = _to_float(self.config.get('tickSize', 0.0), 0.0)
+        eps = tick if tick > 0 else max(price, 1e-9) * 1e-6
+        if not math.isfinite(dist) or dist <= eps:
+            self._log(f"SKIP entry: SL==entry (dist={dist:.12f})")
+            return 0.0
         self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=pd.Timestamp.utcnow())
 
         try:
@@ -550,8 +578,16 @@ class CoinTrader:
         last = df.iloc[-1]
         price = float(last['close'])
         htf = str(self.config.get('htf', '1h'))
+        last_ts = int(df.index[-1]) if hasattr(df.index[-1], '__int__') else df.index[-1]
+        self._on_new_bar(last_ts)
 
-        # Update trailing/exit terlebih dahulu
+        if self.pending_skip_entries > 0:
+            self._log(f"STARTUP SKIP: tunda entry {self.pending_skip_entries} bar lagi")
+            if self.pos.side:
+                self._apply_breakeven(price)
+                self._update_trailing(price)
+            return 0.0
+
         if self.pos.side:
             self._apply_breakeven(price)
             self._update_trailing(price)
@@ -592,6 +628,23 @@ class CoinTrader:
         # Skor base
         long_base = bool(last.get('long_base', False)) and long_htf_ok
         short_base = bool(last.get('short_base', False)) and short_htf_ok
+
+        if self.rehydrated and self.pos.side:
+            lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
+            roi = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
+            if roi >= self.rehydrate_profit_min_pct and self.rehydrate_protect_profit:
+                if base_supports_side(long_base, short_base, self.pos.side):
+                    self._log("REHYDRATE PROTECT: profit & signal searah → tahan posisi (skip close by-signal)")
+                    self.signal_flip_confirm_left = max(self.signal_flip_confirm_left, self.signal_confirm_bars_after_restart)
+                else:
+                    pass
+
+        if self.signal_flip_confirm_left > 0:
+            self._log(f"SIGNAL CONFIRM: menunggu {self.signal_flip_confirm_left} bar utk validasi flip")
+            if self.pos.side:
+                self._apply_breakeven(price)
+                self._update_trailing(price)
+            return 0.0
 
         # ML
         up_prob = None
@@ -672,6 +725,7 @@ class TradingManager:
         for s in self.symbols:
             merged_cfg = merge_config(s, self._cfg)
             self.traders[s] = CoinTrader(s, merged_cfg, instance_id=instance_id, account_guard=account_guard, verbose=self.verbose, exec_client=self.exec_client)
+        self.boot_time = pd.Timestamp.utcnow()
         self._stop = False
         t = threading.Thread(target=self._watch_config, daemon=True)
         t.start()
@@ -705,6 +759,8 @@ class TradingManager:
         trader.pos.entry_time = pd.Timestamp.utcnow()
         trader.pos.sl = sl_price
         trader.pos.trailing_sl = sl_price
+        trader.rehydrated = True
+        trader.pending_skip_entries = max(trader.pending_skip_entries, trader.post_restart_skip_entries_bars)
         trader._log(f"[SYNC] Rehydrate posisi dari exchange side={side} entry={entry_price} qty={qty} sl={sl_price}")
 
     def _watch_config(self):
@@ -760,7 +816,9 @@ class TradingManager:
                 self._rehydrate_from_exchange(trader)
                 used_margin = trader.check_trading_signals(df, step_available)
                 if used_margin and used_margin > 0:
+                    before = step_available
                     step_available = max(0.0, step_available - used_margin)
+                    print(f"[{sym}] used_margin={used_margin:.4f} balance_before={before:.4f} -> after={step_available:.4f}")
             except Exception as e:
                 print(f"[{sym}] error: {e}")
                 continue
