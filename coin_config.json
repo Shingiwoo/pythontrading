@@ -5,6 +5,7 @@
     "taker_fee": 0.0005,
     "min_atr_pct": 0.003,
     "margin_type": "ISOLATED",
+    "startup_skip_bars": 2,
     "max_atr_pct": 0.04,
     "max_body_atr": 1.75,
     "use_htf_filter": 0,
@@ -98,9 +99,9 @@
     },
     "ml": {
       "strict": true,
-      "up_prob_long": 0.55,
-      "down_prob_short": 0.45,
-      "score_threshold": 1.0
+      "up_prob_long": 0.65,
+      "down_prob_short": 0.55,
+      "score_threshold": 1.2
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
@@ -201,6 +202,7 @@
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
     "margin_type": "ISOLATED",
+    "startup_skip_bars": 2,
     "min_atr_pct": 0.003,
     "max_atr_pct": 0.04,
     "max_body_atr": 1.75,
@@ -266,6 +268,7 @@
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
     "margin_type": "ISOLATED",
+    "startup_skip_bars": 2,
     "min_atr_pct": 0.003,
     "max_atr_pct": 0.04,
     "max_body_atr": 1.75,
