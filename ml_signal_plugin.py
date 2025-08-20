@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
+from engine_core import SAFE_EPS, safe_div
+
 @dataclass
 class MLParams:
     use_ml: bool = False
@@ -94,7 +96,8 @@ class MLSignal:
         f = self._build_latest_features(df)
         if f is None: return None
         proba = self.model.predict_proba(f)[0, 1]
-        return float(proba)
+        proba = min(max(float(proba), SAFE_EPS), 1 - SAFE_EPS)
+        return proba
 
     def score_and_decide(self, base_long: bool, base_short: bool, up_prob: Optional[float] = None) -> Tuple[bool, bool]:
         th = float(self.params.score_threshold)
@@ -113,7 +116,7 @@ class MLSignal:
         d = df.copy()
         req = {'close','rsi','macd','atr'}
         if not req.issubset(d.columns): return None, None
-        d['bb_width'] = (d['close'].rolling(20).std() * 4.0) / d['close']
+        d['bb_width'] = safe_div((d['close'].rolling(20).std() * 4.0), d['close'])
         d['lag_ret'] = d['close'].pct_change().shift(1)
         d['vol'] = d['close'].rolling(20).std().shift(1)
         la = int(self.params.lookahead)
@@ -129,7 +132,7 @@ class MLSignal:
         if df is None or df.empty: return None
         d = df.copy()
         if not {'close','rsi','macd','atr'}.issubset(d.columns): return None
-        d['bb_width'] = (d['close'].rolling(20).std() * 4.0) / d['close']
+        d['bb_width'] = safe_div((d['close'].rolling(20).std() * 4.0), d['close'])
         d['lag_ret'] = d['close'].pct_change().shift(1)
         d['vol'] = d['close'].rolling(20).std().shift(1)
         feat_cols = ['rsi','macd','atr','bb_width','lag_ret','vol']
