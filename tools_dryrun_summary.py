@@ -17,7 +17,7 @@ Tips percepat:
 export USE_ML=1; export SCORE_THRESHOLD=1.2; export ML_RETRAIN_EVERY=5000
 """
 from __future__ import annotations
-import os, sys, time, argparse
+import os, sys, time, argparse, json
 import pandas as pd
 import numpy as np
 
@@ -146,6 +146,10 @@ def main():
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--balance", type=float, default=20.0)
     ap.add_argument("--out", default=None, help="Path CSV untuk menyimpan trades")
+    ap.add_argument("--use-ml", type=int, choices=[0,1], default=None)
+    ap.add_argument("--ml-thr", type=float, default=None)
+    ap.add_argument("--trailing-step", type=float, default=None)
+    ap.add_argument("--trailing-trigger", type=float, default=None)
     args = ap.parse_args()
 
     # saran env untuk speed
@@ -154,7 +158,30 @@ def main():
     os.environ.setdefault("ML_MIN_TRAIN_BARS", "400")
     os.environ.setdefault("ML_RETRAIN_EVERY", "5000")
 
-    summary, trades_df = run_dry(args.symbol.upper(), args.csv, args.coin_config, args.steps, args.balance)
+    if args.use_ml is not None:
+        os.environ["USE_ML"] = str(int(args.use_ml))
+    if args.ml_thr is not None:
+        os.environ["SCORE_THRESHOLD"] = str(float(args.ml_thr))
+
+    cfg_path = args.coin_config
+    if args.trailing_step is not None or args.trailing_trigger is not None:
+        try:
+            with open(args.coin_config, "r") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+        sym_cfg = cfg.get(args.symbol.upper(), {})
+        if args.trailing_step is not None:
+            sym_cfg["trailing_step"] = float(args.trailing_step)
+        if args.trailing_trigger is not None:
+            sym_cfg["trailing_trigger"] = float(args.trailing_trigger)
+        cfg[args.symbol.upper()] = sym_cfg
+        tmp_cfg_path = f"_tmp_{args.symbol.upper()}_cfg.json"
+        with open(tmp_cfg_path, "w") as f:
+            json.dump(cfg, f)
+        cfg_path = tmp_cfg_path
+
+    summary, trades_df = run_dry(args.symbol.upper(), args.csv, cfg_path, args.steps, args.balance)
 
     print("\n=== SUMMARY ===")
     for k, v in summary.items():

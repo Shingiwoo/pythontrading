@@ -15,21 +15,15 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
-    "be_trigger_r": 0.006,
+    "be_trigger_r": 0.0,
     "trail": {
-      "use_adx_step": true,
+      "use_adx_step": false,
       "min_step_pct": 0.006,
       "max_step_pct": 0.012,
       "adx_bounds": [
         20,
         60
       ]
-    },
-    "time_stop": {
-      "max_hold_seconds": 3600,
-      "min_roi_to_close": -0.002,
-      "extend_when_adx_gt": 40,
-      "extend_factor": 1.5
     },
     "ml": {
       "strict": true,
@@ -39,10 +33,9 @@
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
-    "be_offset_pct": 0.0008,
+    "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step_min_pct": 0.45,
-    "trailing_step_max_pct": 1.0,
+    "trailing_step": 0.30,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -81,21 +74,15 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
-    "be_trigger_r": 0.5,
+    "be_trigger_r": 0.0,
     "trail": {
-      "use_adx_step": true,
+      "use_adx_step": false,
       "min_step_pct": 0.006,
       "max_step_pct": 0.012,
       "adx_bounds": [
         20,
         60
       ]
-    },
-    "time_stop": {
-      "max_hold_seconds": 3600,
-      "min_roi_to_close": -0.002,
-      "extend_when_adx_gt": 40,
-      "extend_factor": 1.5
     },
     "ml": {
       "strict": true,
@@ -105,10 +92,9 @@
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
-    "be_offset_pct": 0.0008,
+    "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step_min_pct": 0.45,
-    "trailing_step_max_pct": 1.0,
+    "trailing_step": 0.30,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -147,21 +133,15 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
-    "be_trigger_r": 0.5,
+    "be_trigger_r": 0.0,
     "trail": {
-      "use_adx_step": true,
+      "use_adx_step": false,
       "min_step_pct": 0.006,
       "max_step_pct": 0.012,
       "adx_bounds": [
         20,
         60
       ]
-    },
-    "time_stop": {
-      "max_hold_seconds": 3600,
-      "min_roi_to_close": -0.002,
-      "extend_when_adx_gt": 40,
-      "extend_factor": 1.5
     },
     "ml": {
       "strict": true,
@@ -171,10 +151,9 @@
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
-    "be_offset_pct": 0.0008,
+    "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step_min_pct": 0.45,
-    "trailing_step_max_pct": 1.0,
+    "trailing_step": 0.30,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -213,21 +192,15 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
-    "be_trigger_r": 0.5,
+    "be_trigger_r": 0.0,
     "trail": {
-      "use_adx_step": true,
+      "use_adx_step": false,
       "min_step_pct": 0.006,
       "max_step_pct": 0.012,
       "adx_bounds": [
         20,
         60
       ]
-    },
-    "time_stop": {
-      "max_hold_seconds": 3600,
-      "min_roi_to_close": -0.002,
-      "extend_when_adx_gt": 40,
-      "extend_factor": 1.5
     },
     "ml": {
       "strict": true,
@@ -237,10 +210,9 @@
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
-    "be_offset_pct": 0.0008,
+    "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step_min_pct": 0.45,
-    "trailing_step_max_pct": 1.0,
+    "trailing_step": 0.30,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -279,21 +251,15 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
-    "be_trigger_r": 0.006,
+    "be_trigger_r": 0.0,
     "trail": {
-      "use_adx_step": true,
+      "use_adx_step": false,
       "min_step_pct": 0.006,
       "max_step_pct": 0.012,
       "adx_bounds": [
         20,
         60
       ]
-    },
-    "time_stop": {
-      "max_hold_seconds": 3600,
-      "min_roi_to_close": -0.002,
-      "extend_when_adx_gt": 40,
-      "extend_factor": 1.5
     },
     "ml": {
       "strict": true,
@@ -303,10 +269,9 @@
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
-    "be_offset_pct": 0.0008,
+    "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step_min_pct": 0.45,
-    "trailing_step_max_pct": 1.0,
+    "trailing_step": 0.30,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -345,21 +310,15 @@
     "sl_atr_mult": 1.8,
     "sl_min_pct": 0.012,
     "sl_max_pct": 0.035,
-    "be_trigger_r": 0.006,
+    "be_trigger_r": 0.0,
     "trail": {
-      "use_adx_step": true,
+      "use_adx_step": false,
       "min_step_pct": 0.006,
       "max_step_pct": 0.012,
       "adx_bounds": [
         20,
         60
       ]
-    },
-    "time_stop": {
-      "max_hold_seconds": 3600,
-      "min_roi_to_close": -0.002,
-      "extend_when_adx_gt": 40,
-      "extend_factor": 1.5
     },
     "ml": {
       "strict": true,
@@ -369,10 +328,9 @@
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
-    "be_offset_pct": 0.0008,
+    "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step_min_pct": 0.45,
-    "trailing_step_max_pct": 1.0,
+    "trailing_step": 0.30,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
