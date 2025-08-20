@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import numpy as np
+from decimal import Decimal, ROUND_DOWN, getcontext
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -94,6 +95,40 @@ def ml_gate(up_prob: Optional[float], thr: float, eps: float = 1e-9) -> int:
     if dn_odds >= thr:
         return -1
     return 0
+
+getcontext().prec = 28
+
+def _floor_to_step(x: Decimal, step: Decimal) -> Decimal:
+    if step is None or step == 0:
+        return x
+    q = (x / step).to_integral_value(rounding=ROUND_DOWN)
+    return (q * step).normalize()
+
+def round_qty(flt: dict, qty: float) -> float:
+    step = Decimal(str(flt.get("stepSize") or "0"))
+    min_qty = Decimal(str(flt.get("minQty") or "0"))
+    q = Decimal(str(qty))
+    if step > 0:
+        q = _floor_to_step(q, step)
+    qp = flt.get("quantityPrecision")
+    if qp is not None:
+        q = q.quantize(Decimal(10) ** -int(qp), rounding=ROUND_DOWN)
+    if q < min_qty:
+        return 0.0
+    return float(q)
+
+def round_price(flt: dict, price: float) -> float:
+    tick = Decimal(str(flt.get("tickSize") or "0"))
+    minp = Decimal(str(flt.get("minPrice") or "0"))
+    p = Decimal(str(price))
+    if p < minp:
+        p = minp
+    if tick > 0:
+        p = _floor_to_step(p, tick)
+    pp = flt.get("pricePrecision")
+    if pp is not None:
+        p = p.quantize(Decimal(10) ** -int(pp), rounding=ROUND_DOWN)
+    return float(p)
 
 # -----------------------------
 # Binance client wrapper (retry)
@@ -225,11 +260,16 @@ class Journal:
                             "exit_price","exit_reason","pnl_usdt","roi_on_margin","balance_after"])
 
     def on_entry(self, symbol: str, side: str, entry: float, qty: float, sl_init: Optional[float], tsl_init: Optional[float]):
+        cfg = self.cfg[symbol]
+        entry = round_price(cfg, entry)
+        qty = round_qty(cfg, qty)
+        slv = round_price(cfg, sl_init) if sl_init is not None else ""
+        tslv = round_price(cfg, tsl_init) if tsl_init is not None else ""
         self.open[symbol] = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z"),
             "side": side, "entry": float(entry), "qty": float(qty),
-            "sl_init": float(sl_init) if sl_init is not None else "",
-            "tsl_init": float(tsl_init) if tsl_init is not None else ""
+            "sl_init": slv,
+            "tsl_init": tslv
         }
 
     def on_exit(self, symbol: str, exit_price: float, reason: str):
@@ -237,10 +277,12 @@ class Journal:
             return
         o = self.open.pop(symbol)
         bal_before = self.balance.get(symbol, 0.0)
-        taker_fee = _to_float(self.cfg[symbol].get("taker_fee", 0.0005), 0.0005)
-        slip_pct = _to_float(self.cfg[symbol].get("SLIPPAGE_PCT", 0.02), 0.02) / 100.0
+        cfg = self.cfg[symbol]
+        taker_fee = _to_float(cfg.get("taker_fee", 0.0005), 0.0005)
+        slip_pct = _to_float(cfg.get("SLIPPAGE_PCT", 0.02), 0.02) / 100.0
 
         side = o["side"]; qty = o["qty"]; entry = o["entry"]
+        exit_price = round_price(cfg, exit_price)
         # PnL koin USDT-M futures (qty dalam coin):
         if side == "LONG":
             gross = (exit_price - entry) * qty
@@ -253,7 +295,7 @@ class Journal:
         pnl = gross - fees - slipp
 
         bal_after = bal_before + pnl
-        lev = _to_int(self.cfg[symbol].get("leverage", 1), 1)
+        lev = _to_int(cfg.get("leverage", 1), 1)
         init_margin = (entry * qty) / max(lev, 1)
         roi_on_margin = (pnl / init_margin) if init_margin > 0 else 0.0
         self.balance[symbol] = bal_after
@@ -366,6 +408,13 @@ def main():
 
     bnc = BinanceFutures(requests_timeout=args.timeout, max_retries=args.retries)
     cfg_all = ensure_filters_to_coin_config(bnc, args.coin_config, syms)
+    valid_syms = []
+    for s in syms:
+        if s in cfg_all:
+            valid_syms.append(s)
+        else:
+            print(f"[WARN] {s} tidak ada di USDM Futures → di-skip")
+    syms = valid_syms
 
     # Build trader per symbol
     cfg_by_sym = {}
