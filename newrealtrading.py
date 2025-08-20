@@ -32,7 +32,8 @@ except Exception:
 from engine_core import (
     _to_float, _to_int, _to_bool, floor_to_step,
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
-    htf_trend_ok, r_multiple, apply_breakeven_sl, roi_frac_now, base_supports_side
+    htf_trend_ok, r_multiple, apply_breakeven_sl, roi_frac_now, base_supports_side,
+    safe_div
 )
 
 from binance.client import Client
@@ -371,6 +372,9 @@ class CoinTrader:
         if getattr(self, 'verbose', False):
             print(f"[{self.instance_id}:{self.symbol}] {pd.Timestamp.utcnow().isoformat()} | {msg}")
 
+    def _clamp_pos(self, x: float, min_x: float = 1e-9) -> float:
+        return x if (x is not None and x > min_x) else min_x
+
     # Hook: ganti dengan sumber data live kamu
     def fetch_recent_klines(self) -> pd.DataFrame:
         """Return DataFrame dengan kolom: timestamp, open, high, low, close, volume"""
@@ -419,7 +423,7 @@ class CoinTrader:
         else:
             fallback_ts = self.config.get('trailing_step_min_pct', self.config.get('trail', {}).get('min_step_pct'))
             trailing_step_val = fallback_ts if fallback_ts is not None else DEFAULTS['trailing_step']
-        trailing_step = _to_float(trailing_step_val, DEFAULTS['trailing_step'])
+        trailing_step = self._clamp_pos(float(trailing_step_val), float(self.config.get('trailing_step_min', 1e-9)))
         safe_trigger = max(trailing_trigger, safe_buffer_pct + trailing_step)
         return safe_trigger, trailing_step
 
@@ -428,7 +432,7 @@ class CoinTrader:
         dist = abs(price - sl)
         # gunakan nilai minimal agar tidak nol
         dist = max(dist, max(_to_float(self.config.get('tickSize', 0.0), 0.0), 1e-12))
-        qty = risk_usdt / dist
+        qty = safe_div(risk_usdt, dist)
         if self.exec:
             qty = self.exec.round_qty(self.symbol, qty)
         else:
@@ -450,7 +454,7 @@ class CoinTrader:
             sl_pct = _to_float(self.config.get('sl_pct', DEFAULTS['sl_pct']), DEFAULTS['sl_pct'])
         else:
             sl_atr_mult = _to_float(self.config.get('sl_atr_mult', DEFAULTS['sl_atr_mult']), DEFAULTS['sl_atr_mult'])
-            sl_pct = (sl_atr_mult * atr / max(entry, 1e-12)) if atr>0 else _to_float(self.config.get('sl_pct', DEFAULTS['sl_pct']), DEFAULTS['sl_pct'])
+            sl_pct = (sl_atr_mult * safe_div(atr, entry)) if atr>0 else _to_float(self.config.get('sl_pct', DEFAULTS['sl_pct']), DEFAULTS['sl_pct'])
         sl_pct = max(sl_min, min(sl_pct, sl_max))
         return entry * (1 - sl_pct) if side=='LONG' else entry * (1 + sl_pct)
 
@@ -484,8 +488,7 @@ class CoinTrader:
         if not (self.pos.entry and self.pos.side):
             return
         if self.pos.side=='LONG':
-            den = max(self.pos.entry, 1e-12)
-            profit_pct = (price - self.pos.entry)/den*100.0
+            profit_pct = safe_div((price - self.pos.entry), self.pos.entry) * 100.0
             if profit_pct >= safe_trigger:
                 new_ts = price * (1 - step/100.0)
                 prev = self.pos.trailing_sl
@@ -501,8 +504,7 @@ class CoinTrader:
                         cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
                         self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True, client_id=cid)
         else:
-            den = max(self.pos.entry, 1e-12)
-            profit_pct = (self.pos.entry - price)/den*100.0
+            profit_pct = safe_div((self.pos.entry - price), self.pos.entry) * 100.0
             if profit_pct >= safe_trigger:
                 new_ts = price * (1 + step/100.0)
                 prev = self.pos.trailing_sl
@@ -546,7 +548,7 @@ class CoinTrader:
             self._log(f"SKIP entry: available={available_balance:.4f}, margin=0")
             return 0.0
 
-        raw_qty = (margin * lev) / max(price, 1e-9)
+        raw_qty = safe_div((margin * lev), price)
         if self.exec:
             qty = self.exec.round_qty(self.symbol, raw_qty)
         else:
@@ -556,13 +558,13 @@ class CoinTrader:
             self._log(f"SKIP entry: qty setelah pembulatan LOT_SIZE = 0 (raw={raw_qty:.8f})")
             return 0.0
 
-        need = (price * qty / max(lev, 1)) * (1.0 + fee_buf)
+        need = safe_div((price * qty), lev) * (1.0 + fee_buf)
         try:
             live_avail = self.exec.get_available_balance() if self.exec else available_balance
         except Exception:
             live_avail = available_balance
         if need > max(live_avail, 0.0):
-            max_qty_by_margin = ((live_avail / max(lev, 1)) / max(price, 1e-9)) * 0.95
+            max_qty_by_margin = safe_div(safe_div(live_avail, lev), price) * 0.95
             if self.exec:
                 shrunk = self.exec.round_qty(self.symbol, max(0.0, max_qty_by_margin))
             else:
@@ -573,17 +575,17 @@ class CoinTrader:
                 return 0.0
             self._log(f"SHRINK qty {qty:.6f} -> {shrunk:.6f} (avail={live_avail:.4f}, need={need:.4f})")
             qty = shrunk
-            need = (price * qty / max(lev, 1)) * (1.0 + fee_buf)
+            need = safe_div((price * qty), lev) * (1.0 + fee_buf)
 
         min_not = float(self.config.get("minNotional", 0.0) or 0.0)
         if min_not > 0 and price * qty < min_not:
             step = self.exec._step_size(self.symbol) if self.exec else _to_float(self.config.get("stepSize", 0.0), 0.0)
-            need_qty = (min_not / max(price, 1e-12))
+            need_qty = safe_div(min_not, price)
             if step > 0:
-                need_qty = math.ceil(need_qty / step) * step
+                need_qty = math.ceil(safe_div(need_qty, step)) * step
             if self.exec:
                 need_qty = self.exec.round_qty(self.symbol, need_qty)
-            if (need_qty * price / max(lev, 1)) * (1.0 + fee_buf) > live_avail:
+            if safe_div((need_qty * price), lev) * (1.0 + fee_buf) > live_avail:
                 self._log(f"SKIP entry: below MIN_NOTIONAL {min_not}, avail={live_avail:.2f}")
                 return 0.0
             qty = need_qty
@@ -607,7 +609,7 @@ class CoinTrader:
             if sl and self.exec:
                 stop_side = 'SELL' if side == 'LONG' else 'BUY'
                 self.exec.stop_market(self.symbol, stop_side, sl, qty, reduce_only=True, client_id=cid + "-sl")
-            return (price * qty) / max(lev, 1)
+            return safe_div((price * qty), lev)
         except BinanceAPIException as e:
             if getattr(e, "code", None) == -2019:
                 self._log("WARN: Margin insufficient. Cooldown & skip.")
@@ -675,132 +677,135 @@ class CoinTrader:
         last = df.iloc[-1]
         price = float(last['close'])
         htf = str(self.config.get('htf', '1h'))
-
-        if self.pending_skip_entries > 0:
-            self._apply_breakeven(price)
-            self._update_trailing(price)
-            return 0.0
-
-        if self.pos.side:
-            self._apply_breakeven(price)
-            self._update_trailing(price)
-            ex, rs = self._should_exit(price)
-            if ex:
-                self._exit_position(price, rs or 'Exit')
+        if not math.isfinite(price):
+            raise ValueError("Non-finite price")
+        atr = float(last['atr']) if not pd.isna(last['atr']) else 0.0
+        try:
+            if self.pending_skip_entries > 0:
+                self._apply_breakeven(price)
+                self._update_trailing(price)
                 return 0.0
 
-        # Filter ATR & body/ATR
-        atr_ok = (last['atr_pct'] >= _to_float(self.config.get('min_atr_pct', DEFAULTS['min_atr_pct']), DEFAULTS['min_atr_pct'])) \
-                 and (last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct']))
-
-        # GUARD: pakai body_to_atr kalau ada, kalau tidak fallback ke body_atr
-        body_val = last.get('body_to_atr', last.get('body_atr'))
-        body_ok = (float(body_val) <= _to_float(self.config.get('max_body_atr', DEFAULTS['max_body_atr']), DEFAULTS['max_body_atr'])) if body_val is not None else False
-
-        # Filter ATR & body: bila gagal dan belum ada posisi → stop saja
-        if not (atr_ok and body_ok):
-            if self.verbose:
-                print(f"[{self.symbol}] FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
-            # kalau posisi sedang terbuka, tetap lanjut ke trailing/exit di atas; sampai sini berarti pos None → keluar
-            if not self.pos.side:
-                return 0.0
-
-        # HTF filter (opsional)
-        if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
-            if last['ema'] > last['ma'] and not htf_trend_ok('LONG', df, htf=htf):
-                long_htf_ok = False
-            else:
-                long_htf_ok = True
-            if last['ema'] < last['ma'] and not htf_trend_ok('SHORT', df, htf=htf):
-                short_htf_ok = False
-            else:
-                short_htf_ok = True
-        else:
-            long_htf_ok = short_htf_ok = True
-
-        # Skor base
-        long_base = bool(last.get('long_base', False)) and long_htf_ok
-        short_base = bool(last.get('short_base', False)) and short_htf_ok
-
-        if self.rehydrated and self.pos.side:
-            lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
-            roi = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
-            if roi >= self.rehydrate_profit_min_pct and self.rehydrate_protect_profit:
-                if base_supports_side(long_base, short_base, self.pos.side):
-                    self._log("REHYDRATE PROTECT: profit & signal searah → tahan posisi (skip close by-signal)")
-                    self.signal_flip_confirm_left = max(self.signal_flip_confirm_left, self.signal_confirm_bars_after_restart)
-                else:
-                    pass
-
-        if self.signal_flip_confirm_left > 0:
-            self._log(f"SIGNAL CONFIRM: menunggu {self.signal_flip_confirm_left} bar utk validasi flip")
             if self.pos.side:
                 self._apply_breakeven(price)
                 self._update_trailing(price)
-            return 0.0
+                ex, rs = self._should_exit(price)
+                if ex:
+                    self._exit_position(price, rs or 'Exit')
+                    return 0.0
 
-        # ML
-        up_prob = None
-        if self.ml.use_ml:
-            self.ml.fit_if_needed(df)
-            up_prob = self.ml.predict_up_prob(df)
-        ml_cfg = self.config.get("ml", {}) if isinstance(self.config.get("ml"), dict) else {}
-        if "score_threshold" in ml_cfg:
-            self.ml.params.score_threshold = _to_float(ml_cfg.get("score_threshold"), ENV_DEFAULTS["SCORE_THRESHOLD"])
-        else:
-            self.ml.params.score_threshold = _to_float(self.config.get("SCORE_THRESHOLD", ENV_DEFAULTS["SCORE_THRESHOLD"]), ENV_DEFAULTS["SCORE_THRESHOLD"])
-        long_sig, short_sig = self.ml.score_and_decide(long_base, short_base, up_prob)
+            # Filter ATR & body/ATR
+            atr_ok = (last['atr_pct'] >= _to_float(self.config.get('min_atr_pct', DEFAULTS['min_atr_pct']), DEFAULTS['min_atr_pct'])) \
+                     and (last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct']))
 
-        # Kelola posisi
-        atr = float(last['atr']) if not pd.isna(last['atr']) else 0.0
-        self._log(f"DECISION price={price:.6f} base(L={long_base},S={short_base}) up_prob={(up_prob if up_prob is not None else 'n/a')} thr={self.ml.params.score_threshold} -> {('LONG' if long_sig else ('SHORT' if short_sig else '-'))} pos={self.pos.side}")
-        # Update SL/TS saat pegang posisi
-        if self.pos.side:
-            self._apply_breakeven(price)
-            self._update_trailing(price)
-            ex, reason = self._should_exit(price)
-            if ex:
-                self._exit_position(price, reason or 'Exit')
+            # GUARD: pakai body_to_atr kalau ada, kalau tidak fallback ke body_atr
+            body_val = last.get('body_to_atr', last.get('body_atr'))
+            body_ok = (float(body_val) <= _to_float(self.config.get('max_body_atr', DEFAULTS['max_body_atr']), DEFAULTS['max_body_atr'])) if body_val is not None else False
+
+            # Filter ATR & body: bila gagal dan belum ada posisi → stop saja
+            if not (atr_ok and body_ok):
+                if self.verbose:
+                    print(f"[{self.symbol}] FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
+                if not self.pos.side:
+                    return 0.0
+
+            # HTF filter (opsional)
+            if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
+                if last['ema'] > last['ma'] and not htf_trend_ok('LONG', df, htf=htf):
+                    long_htf_ok = False
+                else:
+                    long_htf_ok = True
+                if last['ema'] < last['ma'] and not htf_trend_ok('SHORT', df, htf=htf):
+                    short_htf_ok = False
+                else:
+                    short_htf_ok = True
+            else:
+                long_htf_ok = short_htf_ok = True
+
+            # Skor base
+            long_base = bool(last.get('long_base', False)) and long_htf_ok
+            short_base = bool(last.get('short_base', False)) and short_htf_ok
+
+            if self.rehydrated and self.pos.side:
+                lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
+                roi = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
+                if roi >= self.rehydrate_profit_min_pct and self.rehydrate_protect_profit:
+                    if base_supports_side(long_base, short_base, self.pos.side):
+                        self._log("REHYDRATE PROTECT: profit & signal searah → tahan posisi (skip close by-signal)")
+                        self.signal_flip_confirm_left = max(self.signal_flip_confirm_left, self.signal_confirm_bars_after_restart)
+                    else:
+                        pass
+
+            if self.signal_flip_confirm_left > 0:
+                self._log(f"SIGNAL CONFIRM: menunggu {self.signal_flip_confirm_left} bar utk validasi flip")
+                if self.pos.side:
+                    self._apply_breakeven(price)
+                    self._update_trailing(price)
                 return 0.0
 
-        # ---- Time-stop (selaras backtest) ----
-        max_hold = _to_int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)), 3600)
-        min_roi  = _to_float(self.config.get("min_roi_to_close_by_time", DEFAULTS.get("min_roi_to_close_by_time", 0.005)), 0.005)
+            # ML
+            up_prob = None
+            if self.ml.use_ml:
+                self.ml.fit_if_needed(df)
+                up_prob = self.ml.predict_up_prob(df)
+            ml_cfg = self.config.get("ml", {}) if isinstance(self.config.get("ml"), dict) else {}
+            if "score_threshold" in ml_cfg:
+                self.ml.params.score_threshold = _to_float(ml_cfg.get("score_threshold"), ENV_DEFAULTS["SCORE_THRESHOLD"])
+            else:
+                self.ml.params.score_threshold = _to_float(self.config.get("SCORE_THRESHOLD", ENV_DEFAULTS["SCORE_THRESHOLD"]), ENV_DEFAULTS["SCORE_THRESHOLD"])
+            long_sig, short_sig = self.ml.score_and_decide(long_base, short_base, up_prob)
 
-        if self.pos.side and self.pos.entry_time and max_hold > 0:
-            elapsed = (pd.Timestamp.utcnow() - self.pos.entry_time).total_seconds()
-            lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
-            if self.pos.entry is not None and self.pos.qty is not None:
-                init_margin = (self.pos.entry * self.pos.qty) / max(lev, 1)
-                init_margin = max(init_margin, 1e-12)
-                if self.pos.side == "LONG":
-                    roi_frac = ((price - self.pos.entry) * self.pos.qty) / init_margin
-                else:
-                    roi_frac = ((self.pos.entry - price) * self.pos.qty) / init_margin
+            # Kelola posisi
+            self._log(f"DECISION price={price:.6f} base(L={long_base},S={short_base}) up_prob={(up_prob if up_prob is not None else 'n/a')} thr={self.ml.params.score_threshold} -> {('LONG' if long_sig else ('SHORT' if short_sig else '-'))} pos={self.pos.side}")
+            # Update SL/TS saat pegang posisi
+            if self.pos.side:
+                self._apply_breakeven(price)
+                self._update_trailing(price)
+                ex, reason = self._should_exit(price)
+                if ex:
+                    self._exit_position(price, reason or 'Exit')
+                    return 0.0
 
-                only_if_loss = _to_bool(self.config.get('time_stop_only_if_loss', 0), False)
-                if elapsed >= max_hold:
-                    if only_if_loss:
-                        if roi_frac <= 0:
-                            self._exit_position(price, f"Max hold reached (loss, ROI {roi_frac*100:.2f}%)")
-                            return 0.0
-                        else:
-                            self.pos.entry_time = pd.Timestamp.utcnow()
+            # ---- Time-stop (selaras backtest) ----
+            max_hold = _to_int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)), 3600)
+            min_roi  = _to_float(self.config.get("min_roi_to_close_by_time", DEFAULTS.get("min_roi_to_close_by_time", 0.005)), 0.005)
+
+            if self.pos.side and self.pos.entry_time and max_hold > 0:
+                elapsed = (pd.Timestamp.utcnow() - self.pos.entry_time).total_seconds()
+                lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
+                if self.pos.entry is not None and self.pos.qty is not None:
+                    init_margin = safe_div((self.pos.entry * self.pos.qty), lev)
+                    if self.pos.side == "LONG":
+                        roi_frac = safe_div(((price - self.pos.entry) * self.pos.qty), init_margin)
                     else:
-                        if roi_frac >= min_roi:
-                            self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
-                            return 0.0
+                        roi_frac = safe_div(((self.pos.entry - price) * self.pos.qty), init_margin)
+
+                    only_if_loss = _to_bool(self.config.get('time_stop_only_if_loss', 0), False)
+                    if elapsed >= max_hold:
+                        if only_if_loss:
+                            if roi_frac <= 0:
+                                self._exit_position(price, f"Max hold reached (loss, ROI {roi_frac*100:.2f}%)")
+                                return 0.0
+                            else:
+                                self.pos.entry_time = pd.Timestamp.utcnow()
                         else:
-                            self.pos.entry_time = pd.Timestamp.utcnow()
-        # --------------------------------------
-        used = 0.0
-        # Entry baru
-        if not self.pos.side and not self._cooldown_active():
-            if long_sig:
-                used = self._enter_position('LONG', price, atr, available_balance)
-            elif short_sig:
-                used = self._enter_position('SHORT', price, atr, available_balance)
-        return used or 0.0
+                            if roi_frac >= min_roi:
+                                self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
+                                return 0.0
+                            else:
+                                self.pos.entry_time = pd.Timestamp.utcnow()
+            # --------------------------------------
+            used = 0.0
+            # Entry baru
+            if not self.pos.side and not self._cooldown_active():
+                if long_sig:
+                    used = self._enter_position('LONG', price, atr, available_balance)
+                elif short_sig:
+                    used = self._enter_position('SHORT', price, atr, available_balance)
+            return used or 0.0
+        except ZeroDivisionError as e:
+            self._log(f"[{self.symbol}] ZDIV DIAG: price={price} atr={atr} entry={getattr(self.pos,'entry',None)} step={self.config.get('trailing_step')}")
+            raise
 
 
 # ============================

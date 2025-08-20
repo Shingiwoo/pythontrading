@@ -5,6 +5,12 @@ import pandas as pd
 from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.momentum import RSIIndicator
 
+SAFE_EPS = float(os.getenv("SAFE_EPS", "1e-9"))
+
+def safe_div(a: float, b: float, eps: float = SAFE_EPS) -> float:
+    d = b if (isinstance(b, (int, float)) and abs(b) > eps) else (eps if isinstance(b, (int, float)) else eps)
+    return a / d
+
 # -----------------------------------------------------
 # Konversi tipe sederhana
 # -----------------------------------------------------
@@ -106,11 +112,12 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
     prev_close = d['close'].shift(1)
     tr = pd.concat([(d['high']-d['low']).abs(), (d['high']-prev_close).abs(), (d['low']-prev_close).abs()], axis=1).max(axis=1)
     d['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    d['atr_pct'] = d['atr'] / d['close']
+    d['atr'] = d['atr'].fillna(0.0)
+    d['atr_pct'] = safe_div(d['atr'], d['close'])
 
     # body/ATR + alias
     d['body'] = (d['close'] - d['open']).abs()
-    d['body_to_atr'] = d['body'] / d['atr']
+    d['body_to_atr'] = safe_div(d['body'], d['atr'])
     d['body_atr']    = d['body_to_atr']  # alias untuk backward compat
 
     # Base signal (sesuai request kamu)
@@ -157,10 +164,11 @@ def confirm_htf(htf_ind: pd.DataFrame, coin_cfg: Dict[str, Any]) -> bool:
     except Exception:
         return True
 
-def apply_ml_gate(up_prob: Optional[float], ml_thr: float, eps: float = 1e-9) -> bool:
+def apply_ml_gate(up_prob: Optional[float], ml_thr: float, eps: float = SAFE_EPS) -> bool:
     if up_prob is None:
         return True
-    up_odds = up_prob / max(1 - up_prob, eps)
+    p = min(max(up_prob, eps), 1 - eps)
+    up_odds = safe_div(p, 1 - p, eps)
     return up_odds >= ml_thr
 
 # -----------------------------------------------------
@@ -173,7 +181,7 @@ def risk_size(balance: float, risk_pct: float, entry: float, stop: float,
     diff = abs(entry - stop)
     if diff <= 0:
         return 0.0
-    qty = (risk_val * lev) / diff
+    qty = safe_div((risk_val * lev), diff)
     step = _to_float(sym_cfg.get('stepSize', 0), 0)
     return floor_to_step(qty, step) if step>0 else qty
 
@@ -183,12 +191,12 @@ def pnl_net(side: str, entry: float, exit: float, qty: float,
     slip = (entry + exit) * qty * slip_bps/10000.0
     gross = (exit - entry) * qty if side=='LONG' else (entry - exit) * qty
     pnl = gross - fee - slip
-    roi = (pnl / (entry*qty)) if entry*qty>0 else 0.0
+    roi = safe_div(pnl, (entry*qty)) if entry*qty>0 else 0.0
     return pnl, roi*100.0
 
 def r_multiple(entry: float, sl: float, price: float) -> float:
     r = abs(entry - sl)
-    return (abs(price - entry) / r) if r > 0 else 0.0
+    return safe_div(abs(price - entry), r)
 
 def r_multiple_signed(entry: float, sl: float, price: float, side: str) -> float:
     """R multiple bertanda; positif hanya jika bergerak sesuai arah profit."""
@@ -196,7 +204,7 @@ def r_multiple_signed(entry: float, sl: float, price: float, side: str) -> float
     if R <= 0:
         return 0.0
     move = (price - entry) if side == 'LONG' else (entry - price)
-    return move / R
+    return safe_div(move, R)
 
 def apply_breakeven_sl(side: str,
                        entry: float,
@@ -231,11 +239,11 @@ def apply_breakeven_sl(side: str,
     # 2) % fallback
     if be_trigger_pct and be_trigger_pct > 0:
         if side == 'LONG':
-            if (price - entry) / entry >= be_trigger_pct:
+            if safe_div((price - entry), entry) >= be_trigger_pct:
                 target = max(sl or 0.0, entry)
                 return min(target, price - gap)
         else:
-            if (entry - price) / entry >= be_trigger_pct:
+            if safe_div((entry - price), entry) >= be_trigger_pct:
                 target = min(sl or 1e18, entry)
                 return max(target, price + gap)
 
@@ -244,14 +252,14 @@ def apply_breakeven_sl(side: str,
 def roi_frac_now(side: str, entry: float, price: float, qty: float, leverage: int) -> float:
     if not entry or not qty or leverage <= 0:
         return 0.0
-    init_margin = (entry * abs(qty)) / max(leverage, 1)
+    init_margin = safe_div((entry * abs(qty)), leverage)
     if init_margin <= 0:
         return 0.0
     if side == 'LONG':
         pnl = (price - entry) * qty
     else:
         pnl = (entry - price) * qty
-    return pnl / init_margin
+    return safe_div(pnl, init_margin)
 
 def base_supports_side(base_long: bool, base_short: bool, side: str) -> bool:
     return (side == 'LONG' and base_long and not base_short) or (side == 'SHORT' and base_short and not base_long)
@@ -291,7 +299,7 @@ def step_trailing(side: str, bar: pd.Series, prev_state: Dict[str, Optional[floa
     if entry is None or price is None or entry == 0:
         profit_pct = 0.0
     else:
-        profit_pct = (price - entry) / entry * 100 if side == 'LONG' else (entry - price) / entry * 100
+        profit_pct = safe_div((price - entry), entry) * 100 if side == 'LONG' else safe_div((entry - price), entry) * 100
     if profit_pct < trigger:
         return prev_state.get('tsl')
     if side=='LONG':
@@ -306,9 +314,9 @@ def maybe_move_to_BE(side: str, entry: float, tsl: Optional[float], rule: Dict[s
     price = rule.get('price', entry)
     if be <= 0:
         return tsl
-    if side=='LONG' and (price-entry)/entry >= be:
+    if side=='LONG' and safe_div((price-entry), entry) >= be:
         return max(tsl or 0.0, entry)
-    if side=='SHORT' and (entry-price)/entry >= be:
+    if side=='SHORT' and safe_div((entry-price), entry) >= be:
         return min(tsl or 1e18, entry)
     return tsl
 

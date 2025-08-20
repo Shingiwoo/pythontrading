@@ -35,7 +35,7 @@
     "be_trigger_pct": 0.004,
     "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step": 0.30,
+    "trailing_step": 0.3,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -56,7 +56,8 @@
     "minQty": 1.0,
     "quantityPrecision": 0,
     "minNotional": 5.0,
-    "SLIPPAGE_PCT": 0.02
+    "SLIPPAGE_PCT": 0.02,
+    "trailing_step_min": 1e-09
   },
   "DOGEUSDT": {
     "leverage": 15,
@@ -94,7 +95,7 @@
     "be_trigger_pct": 0.004,
     "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step": 0.30,
+    "trailing_step": 0.3,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -115,7 +116,8 @@
     "minQty": 1.0,
     "quantityPrecision": 0,
     "minNotional": 5.0,
-    "SLIPPAGE_PCT": 0.02
+    "SLIPPAGE_PCT": 0.02,
+    "trailing_step_min": 1e-09
   },
   "XRPUSDT": {
     "leverage": 15,
@@ -153,7 +155,7 @@
     "be_trigger_pct": 0.004,
     "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step": 0.30,
+    "trailing_step": 0.3,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -174,7 +176,8 @@
     "minQty": 1.0,
     "quantityPrecision": 1,
     "minNotional": 5.0,
-    "SLIPPAGE_PCT": 0.02
+    "SLIPPAGE_PCT": 0.02,
+    "trailing_step_min": 1e-09
   },
   "TURBOUSDT": {
     "leverage": 15,
@@ -212,7 +215,7 @@
     "be_trigger_pct": 0.004,
     "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step": 0.30,
+    "trailing_step": 0.3,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -233,7 +236,8 @@
     "minQty": 1.0,
     "quantityPrecision": 0,
     "minNotional": 5.0,
-    "SLIPPAGE_PCT": 0.02
+    "SLIPPAGE_PCT": 0.02,
+    "trailing_step_min": 1e-09
   },
   "NEIROUSDT": {
     "leverage": 15,
@@ -271,7 +275,7 @@
     "be_trigger_pct": 0.004,
     "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step": 0.30,
+    "trailing_step": 0.3,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -292,7 +296,8 @@
     "minQty": 1.0,
     "quantityPrecision": 0,
     "minNotional": 5.0,
-    "SLIPPAGE_PCT": 0.02
+    "SLIPPAGE_PCT": 0.02,
+    "trailing_step_min": 1e-09
   },
   "USTCUSDT": {
     "leverage": 15,
@@ -330,7 +335,7 @@
     "be_trigger_pct": 0.004,
     "be_min_gap_pct": 0.0001,
     "trailing_trigger": 1.0,
-    "trailing_step": 0.30,
+    "trailing_step": 0.3,
     "trail_atr_k": 2.0,
     "early_stop_enabled": 0,
     "early_stop_bars": 2,
@@ -351,6 +356,7 @@
     "minQty": 1.0,
     "quantityPrecision": 0,
     "minNotional": 5.0,
-    "SLIPPAGE_PCT": 0.02
+    "SLIPPAGE_PCT": 0.02,
+    "trailing_step_min": 1e-09
   }
 }
