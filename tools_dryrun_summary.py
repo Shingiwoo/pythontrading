@@ -154,7 +154,7 @@ def main():
 
     # saran env untuk speed
     os.environ.setdefault("USE_ML", "1")
-    os.environ.setdefault("SCORE_THRESHOLD", "1.2")
+    os.environ.setdefault("SCORE_THRESHOLD", "1.0")
     os.environ.setdefault("ML_MIN_TRAIN_BARS", "400")
     os.environ.setdefault("ML_RETRAIN_EVERY", "5000")
 

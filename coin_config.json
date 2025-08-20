@@ -147,8 +147,8 @@
     },
     "ml": {
       "strict": true,
-      "up_prob_long": 0.55,
-      "down_prob_short": 0.45,
+      "up_prob_long": 0.50,
+      "down_prob_short": 0.50,
       "score_threshold": 1.0
     },
     "use_breakeven": 1,

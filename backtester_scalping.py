@@ -119,7 +119,7 @@ min_atr_pct = st.sidebar.number_input("min_atr_pct", value=cfgf("min_atr_pct", 0
 max_atr_pct = st.sidebar.number_input("max_atr_pct", value=cfgf("max_atr_pct", 0.03))
 max_body_atr = st.sidebar.number_input("max_body_atr", value=cfgf("max_body_atr", 1.0))
 # DEFAULT OFF SELALU (abaikan nilai config; tampilkan rekomendasi di caption)
-use_htf_filter = st.sidebar.checkbox("use_htf_filter (EMA50 vs EMA200, 1h)", value=False, help="Default OFF untuk test awal. Aktifkan manual bila ingin sinkron tren HTF.")
+use_htf_filter = st.sidebar.checkbox("use_htf_filter (EMA20 vs EMA22, 4h)", value=False, help="Default OFF untuk test awal. Aktifkan manual bila ingin sinkron tren HTF.")
 if sym_cfg:
     st.caption(f"Rekomendasi dari config: {'ON' if cfgb('use_htf_filter', False) else 'OFF'}")
 cooldown_seconds = st.sidebar.number_input("cooldown_seconds", value=cfgi("cooldown_seconds", 900))
@@ -213,14 +213,14 @@ if selected_file:
     else:
         bar_seconds = 0
 
-    # ---------- HTF filter (1h EMA50 vs EMA200) ----------
+    # ---------- HTF filter (4h EMA50 vs EMA200) ----------
     def htf_trend_ok(side: str, base_df: pd.DataFrame) -> bool:
         try:
             tmp = base_df.set_index('timestamp')[['close']].copy()
-            htf = tmp['close'].resample('1h').last().dropna()
+            htf = tmp['close'].resample('4h').last().dropna()
             if len(htf) < 210: return True
-            ema50 = htf.ewm(span=50, adjust=False).mean().iloc[-1]
-            ema200 = htf.ewm(span=200, adjust=False).mean().iloc[-1]
+            ema50 = htf.ewm(span=20, adjust=False).mean().iloc[-1]
+            ema200 = htf.ewm(span=22, adjust=False).mean().iloc[-1]
             return (ema50 >= ema200) if side=='LONG' else (ema50 <= ema200)
         except Exception:
             return True
