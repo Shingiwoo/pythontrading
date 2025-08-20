@@ -296,7 +296,7 @@ class CoinTrader:
         self.account_guard = account_guard
         self.verbose = verbose or _to_bool(self.config.get('VERBOSE', os.getenv('VERBOSE','0')), False)
         self.exec = exec_client
-        self.last_bar_close_ts = None
+        self._last_seen_len = None
         self.startup_skip_bars = int(self.config.get('startup_skip_bars', 2))
         self.post_restart_skip_entries_bars = int(self.config.get('post_restart_skip_entries_bars', 1))
         self.pending_skip_entries = self.startup_skip_bars
@@ -315,13 +315,18 @@ class CoinTrader:
         """Return DataFrame dengan kolom: timestamp, open, high, low, close, volume"""
         raise NotImplementedError("Implement fetch_recent_klines() sesuai exchange kamu.")
 
-    def _on_new_bar(self, last_ts):
-        if self.last_bar_close_ts != last_ts:
-            self.last_bar_close_ts = last_ts
+    def _on_new_bar(self, df: pd.DataFrame):
+        curr_len = len(df)
+        if self._last_seen_len is None:
+            self._last_seen_len = curr_len
+            return
+        if curr_len > self._last_seen_len:
+            delta = curr_len - self._last_seen_len
+            self._last_seen_len = curr_len
             if self.pending_skip_entries > 0:
-                self.pending_skip_entries -= 1
+                self.pending_skip_entries = max(0, self.pending_skip_entries - delta)
             if self.signal_flip_confirm_left > 0:
-                self.signal_flip_confirm_left -= 1
+                self.signal_flip_confirm_left = max(0, self.signal_flip_confirm_left - delta)
 
     def _safe_trailing_params(self) -> Tuple[float, float]:
         taker_fee = _to_float(self.config.get('taker_fee', DEFAULTS['taker_fee']), DEFAULTS['taker_fee'])
@@ -575,17 +580,15 @@ class CoinTrader:
             return 0.0
         heikin = _to_bool(self.config.get('heikin', False), False)
         df = calculate_indicators(df_raw, heikin=heikin)
+        self._on_new_bar(df)
         last = df.iloc[-1]
         price = float(last['close'])
         htf = str(self.config.get('htf', '1h'))
-        last_ts = int(df.index[-1]) if hasattr(df.index[-1], '__int__') else df.index[-1]
-        self._on_new_bar(last_ts)
 
         if self.pending_skip_entries > 0:
             self._log(f"STARTUP SKIP: tunda entry {self.pending_skip_entries} bar lagi")
-            if self.pos.side:
-                self._apply_breakeven(price)
-                self._update_trailing(price)
+            self._apply_breakeven(price)
+            self._update_trailing(price)
             return 0.0
 
         if self.pos.side:
@@ -759,8 +762,9 @@ class TradingManager:
         trader.pos.entry_time = pd.Timestamp.utcnow()
         trader.pos.sl = sl_price
         trader.pos.trailing_sl = sl_price
-        trader.rehydrated = True
-        trader.pending_skip_entries = max(trader.pending_skip_entries, trader.post_restart_skip_entries_bars)
+        if not trader.rehydrated:
+            trader.rehydrated = True
+            trader.pending_skip_entries = max(trader.pending_skip_entries, trader.post_restart_skip_entries_bars)
         trader._log(f"[SYNC] Rehydrate posisi dari exchange side={side} entry={entry_price} qty={qty} sl={sl_price}")
 
     def _watch_config(self):
