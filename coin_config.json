@@ -68,7 +68,7 @@
     "leverage": 15,
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
-    "margin_type": "CROSSED",
+    "margin_type": "ISOLATED",
     "startup_skip_bars": 2,
     "min_atr_pct": 0.003,
     "max_atr_pct": 0.04,
