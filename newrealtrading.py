@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import pandas as pd
 import numpy as np
-from decimal import Decimal, ROUND_DOWN, getcontext
+from decimal import getcontext
 
 # --- TA
 from ta.trend import EMAIndicator, SMAIndicator, MACD
@@ -30,7 +30,7 @@ except Exception:
     pass
 
 from engine_core import (
-    _to_float, _to_int, _to_bool, floor_to_step,
+    _to_float, _to_int, _to_bool, floor_to_step, ceil_to_step, to_scalar, to_bool,
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
     htf_trend_ok, r_multiple, apply_breakeven_sl, roi_frac_now, base_supports_side,
     safe_div, as_float
@@ -76,26 +76,6 @@ def safe_fetch_klines(client, symbol: str, interval: str, limit: int):
             if attempt == HTTP_RETRIES - 1:
                 raise
             time.sleep(HTTP_BACKOFF * (attempt + 1))
-
-
-def get_step_size(client, symbol: str, default: float = 1.0) -> float:
-    if client is None or not symbol:
-        return float(default)
-    try:
-        if hasattr(client, "symbol_filters"):
-            f = client.symbol_filters.get(symbol.upper()) if isinstance(symbol, str) else None
-            step = None
-            if f:
-                step = f.get("step") or f.get("stepSize")
-            if step:
-                return float(step)
-        if hasattr(client, "step_size"):
-            return float(client.step_size(symbol))
-    except Exception:
-        pass
-    return float(default)
-
-
 class ExecutionClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool=False, verbose: bool=False):
         self.client = Client(api_key, api_secret, testnet=testnet,
@@ -132,53 +112,40 @@ class ExecutionClient:
             for sym, flt in self.symbol_filters.items():
                 print(f"[FILTER:{sym}] step={flt['stepSize']} tick={flt['tickSize']} minQty={flt['minQty']} qPrec={flt['quantityPrecision']} pPrec={flt['pricePrecision']}")
 
-    @staticmethod
-    def _floor_to_step(x: Decimal, step: Decimal) -> Decimal:
-        if step is None or step == 0:
-            return x
-        q = (x / step).to_integral_value(rounding=ROUND_DOWN)
-        return (q * step).normalize()
-
     def has_symbol(self, symbol: str) -> bool:
         if not isinstance(symbol, str) or not symbol:
             return False
         return symbol.upper() in self.symbol_filters
 
-    def round_qty(self, symbol: str, qty: float) -> float:
-        if not isinstance(symbol, str) or not symbol:
-            return 0.0
-        flt = self.symbol_filters.get(symbol.upper())
+    def get_step_size(self, symbol: str) -> float:
+        symbol = (symbol or "").upper()
+        flt = self.symbol_filters.get(symbol)
         if not flt:
-            return 0.0
-        step = Decimal(str(flt.get("stepSize") or "0"))
-        min_qty = Decimal(str(flt.get("minQty") or "0"))
-        q = Decimal(str(qty))
-        if step > 0:
-            q = self._floor_to_step(q, step)
-        qp = flt.get("quantityPrecision")
-        if qp is not None:
-            q = q.quantize(Decimal(10) ** -int(qp), rounding=ROUND_DOWN)
-        if q < min_qty:
-            return 0.0
-        return float(q)
+            raise ValueError(f"symbol {symbol} tidak dikenal")
+        return float(flt.get("stepSize") or 0.0)
+
+    def get_tick_size(self, symbol: str) -> float:
+        symbol = (symbol or "").upper()
+        flt = self.symbol_filters.get(symbol)
+        if not flt:
+            raise ValueError(f"symbol {symbol} tidak dikenal")
+        return float(flt.get("tickSize") or 0.0)
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        symbol = (symbol or "").upper()
+        if not symbol:
+            raise ValueError("symbol is required")
+        qty = to_scalar(qty)
+        step = self.get_step_size(symbol)
+        return floor_to_step(qty, step)
 
     def round_price(self, symbol: str, price: float) -> float:
-        if not isinstance(symbol, str) or not symbol:
-            return float(price)
-        flt = self.symbol_filters.get(symbol.upper())
-        if not flt:
-            return float(price)
-        tick = Decimal(str(flt.get("tickSize") or "0"))
-        minp = Decimal(str(flt.get("minPrice") or "0"))
-        p = Decimal(str(price))
-        if p < minp:
-            p = minp
-        if tick > 0:
-            p = self._floor_to_step(p, tick)
-        pp = flt.get("pricePrecision")
-        if pp is not None:
-            p = p.quantize(Decimal(10) ** -int(pp), rounding=ROUND_DOWN)
-        return float(p)
+        symbol = (symbol or "").upper()
+        if not symbol:
+            raise ValueError("symbol is required")
+        price = to_scalar(price)
+        tick = self.get_tick_size(symbol)
+        return floor_to_step(price, tick)
 
     def set_leverage(self, symbol: str, leverage: int):
         try:
@@ -659,13 +626,13 @@ class CoinTrader:
 
         min_not = float(self.config.get("minNotional", 0.0) or 0.0)
         if min_not > 0 and price * qty < min_not:
-            step = get_step_size(self.exec, self.symbol, _to_float(self.config.get("stepSize", 0.0), 0.0))
+            step = self.exec.get_step_size(self.symbol) if self.exec else _to_float(self.config.get("stepSize", 0.0), 0.0)
             need_qty = safe_div(min_not, price)
             if step > 0:
-                need_qty = math.ceil(safe_div(need_qty, step)) * step
+                need_qty = ceil_to_step(need_qty, step)
             if self.exec:
                 need_qty = self.exec.round_qty(self.symbol, need_qty)
-            if safe_div((need_qty * price), lev) * (1.0 + fee_buf) > live_avail:
+            if to_scalar(safe_div((need_qty * price), lev) * (1.0 + fee_buf)) > live_avail:
                 self._log(f"SKIP entry: below MIN_NOTIONAL {min_not}, avail={live_avail:.2f}")
                 return 0.0
             qty = need_qty
@@ -765,6 +732,8 @@ class CoinTrader:
         if self.ml.use_ml:
             self.ml.fit_if_needed(df)
             up_prob = self.ml.predict_up_prob(df)
+            if up_prob is not None:
+                up_prob = to_scalar(up_prob)
 
         try:
             if self.pending_skip_entries > 0:
@@ -781,32 +750,25 @@ class CoinTrader:
                     return 0.0
 
             filters_cfg = (self.config.get('filters') if isinstance(self.config.get('filters'), dict) else {}) or {}
-            atr_body_enabled = filters_cfg.get('enable_atr_body_filter', True)
-            allow_ml_override = filters_cfg.get('allow_ml_override', True)
+            atr_enabled = filters_cfg.get('atr_filter_enabled', False)
+            body_enabled = filters_cfg.get('body_filter_enabled', False)
             min_atr_threshold = _to_float(filters_cfg.get('min_atr_threshold', self.config.get('min_atr_pct', DEFAULTS['min_atr_pct'])), DEFAULTS['min_atr_pct'])
             max_body_over_atr = _to_float(filters_cfg.get('max_body_over_atr', self.config.get('max_body_atr', DEFAULTS['max_body_atr'])), DEFAULTS['max_body_atr'])
 
-            atr_ok = True if not atr_body_enabled else (
-                (last['atr_pct'] >= min_atr_threshold) and (
-                    last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct'])
-                )
+            atr_ok = (last['atr_pct'] >= min_atr_threshold) and (
+                last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct'])
             )
             body_val = last.get('body_to_atr', last.get('body_atr'))
-            body_ok = True if not atr_body_enabled else (as_float(body_val) <= max_body_over_atr)
+            body_ok = (as_float(body_val) <= max_body_over_atr)
 
-            ml_triggered = False
-            if up_prob is not None:
-                ml_triggered = (up_prob >= self.ml.params.up_prob_thres) or ((1 - up_prob) >= self.ml.params.down_prob_thres)
+            if self.verbose:
+                print(f"[{self.symbol}] FILTER CHECK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
 
-            if atr_body_enabled and not (atr_ok and body_ok):
-                if allow_ml_override and ml_triggered:
-                    if self.verbose:
-                        print(f"[{self.symbol}] FILTER BYPASSED (ML override) atr_ok={atr_ok} body_ok={body_ok} up_prob={up_prob if up_prob is not None else float('nan'):.3f}")
-                else:
-                    if self.verbose:
-                        print(f"[{self.symbol}] FILTER BLOCK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
-                    if not self.pos.side:
-                        return 0.0
+            allow_entry = True
+            if atr_enabled and not atr_ok:
+                allow_entry = False
+            if body_enabled and not body_ok:
+                allow_entry = False
 
             # HTF filter (opsional)
             if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
@@ -855,9 +817,13 @@ class CoinTrader:
             else:
                 self.ml.params.score_threshold = _to_float(self.config.get("SCORE_THRESHOLD", ENV_DEFAULTS["SCORE_THRESHOLD"]), ENV_DEFAULTS["SCORE_THRESHOLD"])
             long_sig, short_sig = self.ml.score_and_decide(long_base, short_base, up_prob)
+            if not allow_entry:
+                long_sig = short_sig = False
 
+            up_prob_f = float(up_prob) if up_prob is not None else float('nan')
+            thr_val = float(self.ml.params.score_threshold)
             # Kelola posisi
-            self._log(f"DECISION price={price:.6f} base(L={long_base},S={short_base}) up_prob={(up_prob if up_prob is not None else 'n/a')} thr={self.ml.params.score_threshold} -> {('LONG' if long_sig else ('SHORT' if short_sig else '-'))} pos={self.pos.side}")
+            self._log(f"DECISION price={price:.6f} base(L={long_base},S={short_base}) up_prob={up_prob_f:.3f} thr={thr_val} -> {('LONG' if long_sig else ('SHORT' if short_sig else '-'))} pos={self.pos.side}")
             # Update SL/TS saat pegang posisi
             if self.pos.side:
                 self._apply_breakeven(price)
@@ -913,7 +879,7 @@ class CoinTrader:
 # Manager (contoh sederhana)
 # ============================
 class TradingManager:
-    def __init__(self, coin_config_path: str, symbols: List[str], *, instance_id: str="bot", account_guard: bool=False, exec_client: Optional[ExecutionClient]=None, verbose: bool=False, no_atr_filter: bool=False, ml_override: bool=False):
+    def __init__(self, coin_config_path: str, symbols: List[str], *, instance_id: str="bot", account_guard: bool=False, exec_client: Optional[ExecutionClient]=None, verbose: bool=False, no_atr_filter: bool=False, no_body_filter: bool=False, ml_override: bool=False):
         self.coin_config_path = coin_config_path
         raw_syms = [s.upper() for s in symbols]
         self.exec_client = exec_client
@@ -929,9 +895,9 @@ class TradingManager:
         for s in self.symbols:
             merged_cfg = merge_config(s, self._cfg)
             if no_atr_filter:
-                merged_cfg.setdefault('filters', {})['enable_atr_body_filter'] = False
-            if ml_override:
-                merged_cfg.setdefault('filters', {})['allow_ml_override'] = True
+                merged_cfg.setdefault('filters', {})['atr_filter_enabled'] = False
+            if no_body_filter:
+                merged_cfg.setdefault('filters', {})['body_filter_enabled'] = False
             self.traders[s] = CoinTrader(s, merged_cfg, instance_id=instance_id, account_guard=account_guard, verbose=self.verbose, exec_client=self.exec_client)
         self.boot_time = pd.Timestamp.utcnow()
         self._stop = False
@@ -1070,9 +1036,9 @@ if __name__ == "__main__":
     cfg_all = load_coin_config(args.coin_config) if os.path.exists(args.coin_config) else {}
     cfg = merge_config(args.symbol.upper(), cfg_all)
     if args.no_atr_filter:
-        cfg.setdefault('filters', {})['enable_atr_body_filter'] = False
-    if args.ml_override:
-        cfg.setdefault('filters', {})['allow_ml_override'] = True
+        cfg.setdefault('filters', {})['atr_filter_enabled'] = False
+    if getattr(args, 'no_body_filter', False):
+        cfg.setdefault('filters', {})['body_filter_enabled'] = False
 
     exec_client = None
     if args.real_exec:

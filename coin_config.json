@@ -1,8 +1,8 @@
 {
   "SYMBOL_DEFAULTS": {
     "filters": {
-      "enable_atr_body_filter": false,
-      "allow_ml_override": true,
+      "atr_filter_enabled": false,
+      "body_filter_enabled": false,
       "min_atr_threshold": 0.0,
       "max_body_over_atr": 9.99
     }

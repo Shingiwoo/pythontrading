@@ -6,43 +6,66 @@ import pandas as pd
 from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.momentum import RSIIndicator
 
-Series = pd.Series
-NDArray = np.ndarray
-Numeric = Union[int, float]
-ArrayLike = Union[Series, NDArray]
-SafeNum = Union[Numeric, ArrayLike]
+Float = Union[float, np.floating]
+ArrayLike = Union[pd.Series, np.ndarray]
+ScalarOrArray = Union[Float, ArrayLike]
 
 SAFE_EPS = float(os.getenv("SAFE_EPS", "1e-9"))
 
 
-def _as_array(x: SafeNum) -> Tuple[np.ndarray, Optional[pd.Index]]:
+def to_scalar(x: Optional[ScalarOrArray], *, how: str = "last", default: float = 0.0) -> float:
+    if x is None:
+        return default
     if isinstance(x, pd.Series):
-        return x.to_numpy(copy=False).astype(float, copy=False), x.index
+        if x.empty:
+            return default
+        return float(x.iloc[-1])
     if isinstance(x, np.ndarray):
-        return x.astype(float, copy=False), None
-    return np.array([float(x)]), None
+        if x.size == 0:
+            return default
+        return float(x.reshape(-1)[-1])
+    return float(x)
 
 
-def safe_div(a: SafeNum, b: SafeNum, default: float = 0.0) -> SafeNum:
-    a_arr, a_idx = _as_array(a)
-    b_arr, b_idx = _as_array(b)
+def to_bool(x: Union[bool, ArrayLike]) -> bool:
+    if isinstance(x, (pd.Series, np.ndarray)):
+        if len(x) == 0:
+            return False
+        return bool(np.asarray(x).reshape(-1)[-1])
+    return bool(x)
 
-    shape = np.broadcast_shapes(a_arr.shape, b_arr.shape)
-    a_b = np.broadcast_to(a_arr, shape)
-    b_b = np.broadcast_to(b_arr, shape)
 
-    out = np.divide(
-        a_b,
-        b_b,
-        out=np.full(shape, default, dtype=float),
-        where=(b_b != 0)
-    )
+def safe_div(a: ScalarOrArray, b: ScalarOrArray, eps: float = 1e-12) -> ScalarOrArray:
+    def _arr(v: ScalarOrArray):
+        return np.asarray(v) if isinstance(v, (pd.Series, np.ndarray)) else float(v)
 
-    if a_idx is not None:
-        return pd.Series(out, index=a_idx)
-    if b_idx is not None:
-        return pd.Series(out, index=b_idx)
-    return float(out[0]) if out.size == 1 else out
+    A, B = _arr(a), _arr(b)
+    if isinstance(A, np.ndarray) or isinstance(B, np.ndarray):
+        B_eps = np.where(np.abs(B) < eps, np.where(B >= 0, eps, -eps), B)
+        return A / B_eps
+    B_eps = B if abs(B) >= eps else (eps if B >= 0 else -eps)
+    return float(A / B_eps)
+
+
+def floor_to_step(x: ScalarOrArray, step: float) -> float:
+    xv = to_scalar(x)
+    if step <= 0:
+        return xv
+    return math.floor(xv / step) * step
+
+
+def ceil_to_step(x: ScalarOrArray, step: float) -> float:
+    xv = to_scalar(x)
+    if step <= 0:
+        return xv
+    return math.ceil(xv / step) * step
+
+
+def clamp_scalar(x: ScalarOrArray, lo: ScalarOrArray, hi: ScalarOrArray) -> float:
+    xv = to_scalar(x)
+    lov = to_scalar(lo)
+    hiv = to_scalar(hi)
+    return float(min(max(xv, lov), hiv))
 
 
 def as_float(x: Any, default: float = 0.0) -> float:
@@ -84,16 +107,6 @@ def round_to_step(x: float, step: float) -> float:
     if step <= 0:
         return float(x)
     return round(x / step) * step
-
-def floor_to_step(x: float, step: float) -> float:
-    if step <= 0:
-        return float(x)
-    return math.floor(x / step) * step
-
-def ceil_to_step(x: float, step: float) -> float:
-    if step <= 0:
-        return float(x)
-    return math.ceil(x / step) * step
 
 def enforce_precision(sym_cfg: Dict[str, Any], price: float, qty: float) -> Tuple[float, float]:
     p_step = _to_float(sym_cfg.get("tickSize", 0), 0)
@@ -208,7 +221,7 @@ def apply_ml_gate(up_prob: Optional[float], ml_thr: float, eps: float = SAFE_EPS
     if up_prob is None:
         return True
     p = min(max(up_prob, eps), 1 - eps)
-    up_odds = safe_div(p, 1 - p, default=eps)
+    up_odds = to_scalar(safe_div(p, 1 - p))
     return up_odds >= ml_thr
 
 # -----------------------------------------------------
@@ -223,7 +236,7 @@ def risk_size(balance: float, risk_pct: float, entry: float, stop: float,
         return 0.0
     qty = safe_div((risk_val * lev), diff)
     step = _to_float(sym_cfg.get('stepSize', 0), 0)
-    return floor_to_step(qty, step) if step>0 else qty
+    return floor_to_step(qty, step) if step>0 else to_scalar(qty)
 
 def pnl_net(side: str, entry: float, exit: float, qty: float,
             fee_bps: float, slip_bps: float) -> Tuple[float, float]:
@@ -231,12 +244,12 @@ def pnl_net(side: str, entry: float, exit: float, qty: float,
     slip = (entry + exit) * qty * slip_bps/10000.0
     gross = (exit - entry) * qty if side=='LONG' else (entry - exit) * qty
     pnl = gross - fee - slip
-    roi = safe_div(pnl, (entry*qty)) if entry*qty>0 else 0.0
+    roi = to_scalar(safe_div(pnl, (entry*qty))) if entry*qty>0 else 0.0
     return pnl, roi*100.0
 
 def r_multiple(entry: float, sl: float, price: float) -> float:
     r = abs(entry - sl)
-    return safe_div(abs(price - entry), r)
+    return to_scalar(safe_div(abs(price - entry), r))
 
 def r_multiple_signed(entry: float, sl: float, price: float, side: str) -> float:
     """R multiple bertanda; positif hanya jika bergerak sesuai arah profit."""
@@ -244,7 +257,7 @@ def r_multiple_signed(entry: float, sl: float, price: float, side: str) -> float
     if R <= 0:
         return 0.0
     move = (price - entry) if side == 'LONG' else (entry - price)
-    return safe_div(move, R)
+    return to_scalar(safe_div(move, R))
 
 def apply_breakeven_sl(side: str,
                        entry: float,
@@ -279,27 +292,29 @@ def apply_breakeven_sl(side: str,
     # 2) % fallback
     if be_trigger_pct and be_trigger_pct > 0:
         if side == 'LONG':
-            if safe_div((price - entry), entry) >= be_trigger_pct:
+            if to_scalar(safe_div((price - entry), entry)) >= be_trigger_pct:
                 target = max(sl or 0.0, entry)
                 return min(target, price - gap)
         else:
-            if safe_div((entry - price), entry) >= be_trigger_pct:
+            if to_scalar(safe_div((entry - price), entry)) >= be_trigger_pct:
                 target = min(sl or 1e18, entry)
                 return max(target, price + gap)
 
     return sl
 
-def roi_frac_now(side: str, entry: float, price: float, qty: float, leverage: int) -> float:
-    if not entry or not qty or leverage <= 0:
+def roi_frac_now(side: str, entry: Optional[float], price: float, qty: float, leverage: int) -> float:
+    if entry is None or not qty or leverage <= 0:
         return 0.0
-    init_margin = safe_div((entry * abs(qty)), leverage)
+    entry = float(entry)
+    price = float(price)
+    init_margin = to_scalar(safe_div((entry * abs(qty)), leverage))
     if init_margin <= 0:
         return 0.0
     if side == 'LONG':
         pnl = (price - entry) * qty
     else:
         pnl = (entry - price) * qty
-    return safe_div(pnl, init_margin)
+    return to_scalar(safe_div(pnl, init_margin))
 
 def base_supports_side(base_long: bool, base_short: bool, side: str) -> bool:
     return (side == 'LONG' and base_long and not base_short) or (side == 'SHORT' and base_short and not base_long)
@@ -339,7 +354,7 @@ def step_trailing(side: str, bar: pd.Series, prev_state: Dict[str, Optional[floa
     if entry is None or price is None or entry == 0:
         profit_pct = 0.0
     else:
-        profit_pct = safe_div((price - entry), entry) * 100 if side == 'LONG' else safe_div((entry - price), entry) * 100
+        profit_pct = to_scalar(safe_div((price - entry), entry)) * 100 if side == 'LONG' else to_scalar(safe_div((entry - price), entry)) * 100
     if profit_pct < trigger:
         return prev_state.get('tsl')
     if side=='LONG':
@@ -354,9 +369,9 @@ def maybe_move_to_BE(side: str, entry: float, tsl: Optional[float], rule: Dict[s
     price = rule.get('price', entry)
     if be <= 0:
         return tsl
-    if side=='LONG' and safe_div((price-entry), entry) >= be:
+    if side=='LONG' and to_scalar(safe_div((price-entry), entry)) >= be:
         return max(tsl or 0.0, entry)
-    if side=='SHORT' and safe_div((entry-price), entry) >= be:
+    if side=='SHORT' and to_scalar(safe_div((entry-price), entry)) >= be:
         return min(tsl or 1e18, entry)
     return tsl
 
