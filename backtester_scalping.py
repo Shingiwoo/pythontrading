@@ -9,6 +9,7 @@ from ta.volatility import BollingerBands
 from ta.momentum import RSIIndicator
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
+from engine_core import apply_breakeven_sl
 
 """
 ============================================================
@@ -384,12 +385,16 @@ if selected_file:
         if in_position and entry is not None and qty > 0:
             # Breakeven
             if bool(use_breakeven):
-                if position_type == 'LONG':
-                    pnl_frac = (price - entry)/entry
-                    if pnl_frac >= float(be_trigger_pct): sl = max(sl or 0.0, entry)
-                else:
-                    pnl_frac = (entry - price)/entry
-                    if pnl_frac >= float(be_trigger_pct): sl = min(sl or 1e18, entry)
+                sl = apply_breakeven_sl(
+                    side=position_type,
+                    entry=entry,
+                    price=price,
+                    sl=sl,
+                    tick_size=float(sym_cfg.get('tickSize', 0.0) or 0.0),
+                    min_gap_pct=float(sym_cfg.get('be_min_gap_pct', 0.0001) or 0.0001),
+                    be_trigger_r=float(sym_cfg.get('be_trigger_r', 0.0) or 0.0),
+                    be_trigger_pct=float(be_trigger_pct)
+                )
 
             # Trailing
             # arm hanya jika profit melewati ambang aman (fee+slippage+step)

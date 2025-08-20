@@ -31,13 +31,16 @@ except Exception:
 from engine_core import (
     _to_float, _to_int, _to_bool, floor_to_step,
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
-    htf_trend_ok, r_multiple
+    htf_trend_ok, r_multiple, apply_breakeven_sl
 )
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 INSTANCE_ID = os.getenv("INSTANCE_ID", "bot")
+
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
 
 
 class RateLimiter:
@@ -62,9 +65,22 @@ class RateLimiter:
             self.allowance -= 1.0
 
 
+def safe_fetch_klines(client, symbol: str, interval: str, limit: int):
+    delay = 1.0
+    for attempt in range(max(1, REQUEST_RETRIES)):
+        try:
+            return client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        except Exception:
+            if attempt == REQUEST_RETRIES - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+
+
 class ExecutionClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool=False, verbose: bool=False):
-        self.client = Client(api_key, api_secret, testnet=testnet)
+        self.client = Client(api_key, api_secret, testnet=testnet,
+                             requests_params={"timeout": REQUEST_TIMEOUT})
         if testnet:
             self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
         self.verbose = verbose
@@ -111,6 +127,12 @@ class ExecutionClient:
             else:
                 mtype = str(isolated)
             self.client.futures_change_margin_type(symbol=symbol, marginType=mtype)
+        except BinanceAPIException as e:
+            if e.code == -4046:
+                if self.verbose:
+                    print(f"[EXEC] set_margin_type fail: {e}")
+                return None
+            raise
         except Exception as e:
             if self.verbose:
                 print(f"[EXEC] set_margin_type fail: {e}")
@@ -179,6 +201,13 @@ class ExecutionClient:
         except Exception as e:
             if self.verbose:
                 print(f"[EXEC] cancel_all fail: {e}")
+
+    def position_info(self, symbol: str):
+        infos = self.client.futures_position_information(symbol=symbol)
+        return infos[0] if infos else None
+
+    def open_orders(self, symbol: str):
+        return self.client.futures_get_open_orders(symbol=symbol)
 
     def market_close(self, symbol: str, side: str, qty: float, client_id: Optional[str]=None) -> Dict[str, Any]:
         o = self.client.futures_create_order(
@@ -323,23 +352,21 @@ class CoinTrader:
     def _apply_breakeven(self, price: float) -> None:
         if not _to_bool(self.config.get('use_breakeven', DEFAULTS['use_breakeven']), DEFAULTS['use_breakeven']):
             return
-        if self.pos.side and self.pos.entry is not None and self.pos.sl is not None:
-            be_r = _to_float(self.config.get('be_trigger_r', 0.0), 0.0)
-            if be_r > 0:
-                rnow = r_multiple(self.pos.entry, self.pos.sl, price)
-                if rnow >= be_r:
-                    if self.pos.side == 'LONG':
-                        self.pos.sl = max(self.pos.sl, self.pos.entry)
-                    else:
-                        self.pos.sl = min(self.pos.sl, self.pos.entry)
-                return
-        be = _to_float(self.config.get('be_trigger_pct', DEFAULTS['be_trigger_pct']), DEFAULTS['be_trigger_pct'])
-        if self.pos.side == 'LONG' and self.pos.entry:
-            if (price - self.pos.entry) / self.pos.entry >= be:
-                self.pos.sl = max(self.pos.sl or 0.0, self.pos.entry)
-        elif self.pos.side == 'SHORT' and self.pos.entry:
-            if (self.pos.entry - price) / self.pos.entry >= be:
-                self.pos.sl = min(self.pos.sl or 1e18, self.pos.entry)
+        if not (self.pos.side and self.pos.entry is not None):
+            return
+        tick = _to_float(self.config.get('tickSize', 0.0), 0.0)
+        new_sl = apply_breakeven_sl(
+            side=self.pos.side,
+            entry=self.pos.entry,
+            price=price,
+            sl=self.pos.sl,
+            tick_size=tick,
+            min_gap_pct=_to_float(self.config.get('be_min_gap_pct', 0.0001), 0.0001),
+            be_trigger_r=_to_float(self.config.get('be_trigger_r', 0.0), 0.0),
+            be_trigger_pct=_to_float(self.config.get('be_trigger_pct', DEFAULTS['be_trigger_pct']),
+                                     DEFAULTS['be_trigger_pct'])
+        )
+        self.pos.sl = new_sl
 
     def _update_trailing(self, price: float) -> None:
         safe_trigger, step = self._safe_trailing_params()
@@ -393,12 +420,13 @@ class CoinTrader:
         risk = float(self.config.get('risk_per_trade', DEFAULTS['risk_per_trade']))
         fee_buf = float(self.config.get('fee_buffer_pct', 0.001))
 
+        mt = str(self.config.get('margin_type', 'ISOLATED')).upper()
         try:
             if self.exec:
-                self.exec.set_margin_type(self.symbol, True)
+                self.exec.set_margin_type(self.symbol, isolated=mt)
                 self.exec.set_leverage(self.symbol, lev)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log(f"[WARN] set_margin_type({mt}) gagal: {e}")
 
         margin = max(0.0, available_balance) * max(0.0, risk)
         if margin <= 0.0:
@@ -648,6 +676,37 @@ class TradingManager:
         t = threading.Thread(target=self._watch_config, daemon=True)
         t.start()
 
+    def _rehydrate_from_exchange(self, trader: CoinTrader):
+        """Jika ada posisi di exchange tapi state lokal kosong, rehydrate agar trailing/stop lanjut."""
+        if not trader.exec:
+            return
+        if trader.pos and trader.pos.qty:
+            return
+        info = trader.exec.position_info(trader.symbol)
+        if not info:
+            return
+        qty = float(info.get('positionAmt', 0) or 0)
+        if abs(qty) < 1e-12:
+            return
+        entry_price = float(info.get('entryPrice', 0) or 0)
+        side = 'LONG' if qty > 0 else 'SHORT'
+        qty = abs(qty)
+        orders = trader.exec.open_orders(trader.symbol) or []
+        sl_price = None
+        for o in orders:
+            if o.get('type') == 'STOP_MARKET' and o.get('reduceOnly'):
+                sp = float(o.get('stopPrice', 0) or 0)
+                if sp > 0:
+                    sl_price = sp
+                    break
+        trader.pos.side = side
+        trader.pos.entry = entry_price
+        trader.pos.qty = qty
+        trader.pos.entry_time = pd.Timestamp.utcnow()
+        trader.pos.sl = sl_price
+        trader.pos.trailing_sl = sl_price
+        trader._log(f"[SYNC] Rehydrate posisi dari exchange side={side} entry={entry_price} qty={qty} sl={sl_price}")
+
     def _watch_config(self):
         last_ts = 0.0
         safe_keys = {
@@ -698,6 +757,7 @@ class TradingManager:
             if trader is None or df is None or len(df) == 0:
                 continue
             try:
+                self._rehydrate_from_exchange(trader)
                 used_margin = trader.check_trading_signals(df, step_available)
                 if used_margin and used_margin > 0:
                     step_available = max(0.0, step_available - used_margin)
@@ -819,7 +879,7 @@ if __name__ == "__main__":
                 for s in syms:
                     limiter.wait()
                     time.sleep(0.3 + random.random() * 0.5)
-                    kl = client.futures_klines(symbol=s, interval=interval, limit=600)
+                    kl = safe_fetch_klines(client, s, interval, 600)
                     # Format ke DataFrame
                     df = pd.DataFrame(kl, columns=[
                         "open_time","open","high","low","close","volume","close_time",
