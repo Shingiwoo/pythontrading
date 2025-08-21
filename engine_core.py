@@ -198,8 +198,8 @@ def compute_base_signals_backtest(df: pd.DataFrame) -> tuple[bool, bool]:
 
 def compute_base_signals_live(df: pd.DataFrame) -> tuple[bool, bool]:
     last = df.iloc[-1]
-    long_base = (last.get('ema_22', 0) > last.get('ma_22', 0)) and (last.get('macd', 0) > last.get('macd_signal', 0)) and (last.get('rsi', 50) <= 45)
-    short_base = (last.get('ema_22', 0) < last.get('ma_22', 0)) and (last.get('macd', 0) < last.get('macd_signal', 0)) and (last.get('rsi', 50) >= 70)
+    long_base = (last.get('ema_22', 20) > last.get('ma_22', 22)) and (last.get('macd', 0) > last.get('macd_signal', 0)) and (last.get('rsi', 50) <= 45)
+    short_base = (last.get('ema_22', 20) < last.get('ma_22', 22)) and (last.get('macd', 0) < last.get('macd_signal', 0)) and (last.get('rsi', 50) >= 70)
     return bool(long_base), bool(short_base)
 
 

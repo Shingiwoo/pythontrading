@@ -1,9 +1,9 @@
 {
   "SYMBOL_DEFAULTS": {
     "filters": {
-      "atr": false,
-      "body": false,
-      "min_atr_threshold": 0.0,
+      "atr": true,
+      "body": true,
+      "min_atr_threshold": 0.00,
       "max_body_over_atr": 9.99
     }
   },
@@ -95,8 +95,8 @@
     },
     "ml": {
       "strict": true,
-      "up_prob_long": 0.65,
-      "down_prob_short": 0.55,
+      "up_prob_long": 0.55,
+      "down_prob_short": 0.45,
       "score_threshold": 1.2
     },
     "use_breakeven": 1,
@@ -155,8 +155,8 @@
     },
     "ml": {
       "strict": true,
-      "up_prob_long": 0.5,
-      "down_prob_short": 0.5,
+      "up_prob_long": 0.55,
+      "down_prob_short": 0.45,
       "score_threshold": 1.0
     },
     "use_breakeven": 1,
