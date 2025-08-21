@@ -160,7 +160,7 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
         d[['open','high','low','close']] = ha[['ha_open','ha_high','ha_low','ha_close']]
 
     # EMA/MA, MACD, RSI
-    d['ema_22'] = EMAIndicator(d['close'], 22).ema_indicator()
+    d['ema_20'] = EMAIndicator(d['close'], 20).ema_indicator()
     d['ma_22'] = SMAIndicator(d['close'], 22).sma_indicator()
     macd = MACD(d['close'])
     d['macd'] = macd.macd()
@@ -184,7 +184,7 @@ USE_BACKTEST_ENTRY_LOGIC = bool(int(os.getenv("USE_BACKTEST_ENTRY_LOGIC", "1")))
 
 
 def compute_base_signals_backtest(df: pd.DataFrame) -> tuple[bool, bool]:
-    ema_now, ema_prev = df['ema_22'].iloc[-1], df['ema_22'].iloc[-2]
+    ema_now, ema_prev = df['ema_20'].iloc[-1], df['ema_20'].iloc[-2]
     ma_now, ma_prev = df['ma_22'].iloc[-1], df['ma_22'].iloc[-2]
     macd_now, macd_sig = df['macd'].iloc[-1], df['macd_signal'].iloc[-1]
     rsi_now = df['rsi'].iloc[-1]
@@ -203,7 +203,7 @@ def compute_base_signals_live(df: pd.DataFrame) -> tuple[bool, bool]:
     return bool(long_base), bool(short_base)
 
 
-ML_WEIGHT = float(os.getenv("ML_WEIGHT", "1.5"))
+ML_WEIGHT = float(os.getenv("ML_WEIGHT", "1.2"))
 
 
 def get_coin_ml_params(symbol: str, coin_config: dict) -> dict:
@@ -252,8 +252,8 @@ def htf_trend_ok(side: str, base_df: pd.DataFrame, htf: str = '1h') -> bool:
         htf_close = tmp['close'].resample(res).last().dropna()
         if len(htf_close) < 210:
             return True
-        ema50 = htf_close.ewm(span=50, adjust=False).mean().iloc[-1]
-        ema200 = htf_close.ewm(span=200, adjust=False).mean().iloc[-1]
+        ema50 = htf_close.ewm(span=20, adjust=False).mean().iloc[-1]
+        ema200 = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
         return (ema50 >= ema200) if side == 'LONG' else (ema50 <= ema200)
     except Exception:
         return True
@@ -278,10 +278,10 @@ def decide_base(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Dict[str, bool]:
     return {'L': bool(ind.get('long_base', False)), 'S': bool(ind.get('short_base', False))}
 
 def confirm_htf(htf_ind: pd.DataFrame, coin_cfg: Dict[str, Any]) -> bool:
-    # placeholder konfirmasi HTF: true jika ema50 >= ema200
+    # placeholder konfirmasi HTF: true jika ema20>= ema22
     try:
-        ema50 = htf_ind['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-        ema200 = htf_ind['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+        ema50 = htf_ind['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+        ema200 = htf_ind['close'].ewm(span=22, adjust=False).mean().iloc[-1]
         side = coin_cfg.get('side','LONG')
         return ema50 >= ema200 if side=='LONG' else ema50 <= ema200
     except Exception:
