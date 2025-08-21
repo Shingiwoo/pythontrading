@@ -1,30 +1,40 @@
-import os, json, math
-from typing import Dict, Any, Tuple, Optional, Union
+import os, json, logging
+from typing import Dict, Any, Tuple, Optional, Union, Any
 
 import numpy as np
 import pandas as pd
 from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.momentum import RSIIndicator
 
-Float = Union[float, np.floating]
-ArrayLike = Union[pd.Series, np.ndarray]
-ScalarOrArray = Union[Float, ArrayLike]
+# --- helpers (top-level util) ---
+Numeric = Union[float, int, np.floating, np.integer]
+ArrayLike = Union[pd.Series, np.ndarray, list, tuple]
+ScalarOrArray = Union[Numeric, ArrayLike]
+
+def as_scalar(x: Any) -> float:
+    """Ambil angka scalar dari berbagai tipe.
+    - pd.Series -> nilai terakhir
+    - np.ndarray/list/tuple -> elemen terakhir
+    - float/int -> cast float
+    """
+    if isinstance(x, pd.Series):
+        if len(x) == 0:
+            return 0.0
+        return float(x.iloc[-1])
+    if isinstance(x, (np.ndarray, list, tuple)):
+        if len(x) == 0:
+            return 0.0
+        return float(x[-1])
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
 SAFE_EPS = float(os.getenv("SAFE_EPS", "1e-9"))
 
 
-def to_scalar(x: Optional[ScalarOrArray], *, how: str = "last", default: float = 0.0) -> float:
-    if x is None:
-        return default
-    if isinstance(x, pd.Series):
-        if x.empty:
-            return default
-        return float(x.iloc[-1])
-    if isinstance(x, np.ndarray):
-        if x.size == 0:
-            return default
-        return float(x.reshape(-1)[-1])
-    return float(x)
+def to_scalar(x: Optional[Any], *, how: str = "last", default: float = 0.0) -> float:
+    return as_scalar(x) if x is not None else default
 
 
 def to_bool(x: Union[bool, ArrayLike]) -> bool:
@@ -35,30 +45,21 @@ def to_bool(x: Union[bool, ArrayLike]) -> bool:
     return bool(x)
 
 
-def safe_div(a: ScalarOrArray, b: ScalarOrArray, eps: float = 1e-12) -> ScalarOrArray:
-    def _arr(v: ScalarOrArray):
-        return np.asarray(v) if isinstance(v, (pd.Series, np.ndarray)) else float(v)
-
-    A, B = _arr(a), _arr(b)
-    if isinstance(A, np.ndarray) or isinstance(B, np.ndarray):
-        B_eps = np.where(np.abs(B) < eps, np.where(B >= 0, eps, -eps), B)
-        return A / B_eps
-    B_eps = B if abs(B) >= eps else (eps if B >= 0 else -eps)
-    return float(A / B_eps)
+def safe_div(a: Any, b: Any, default: float = 0.0) -> float:
+    aa, bb = as_scalar(a), as_scalar(b)
+    if bb == 0.0 or np.isnan(bb):
+        return default
+    return aa / bb
 
 
-def floor_to_step(x: ScalarOrArray, step: float) -> float:
-    xv = to_scalar(x)
-    if step <= 0:
-        return xv
-    return math.floor(xv / step) * step
+def floor_to_step(x: Any, step: Any) -> float:
+    xf, sf = as_scalar(x), max(as_scalar(step), 1e-18)
+    return float(np.floor(xf / sf) * sf)
 
 
-def ceil_to_step(x: ScalarOrArray, step: float) -> float:
-    xv = to_scalar(x)
-    if step <= 0:
-        return xv
-    return math.ceil(xv / step) * step
+def ceil_to_step(x: Any, step: Any) -> float:
+    xf, sf = as_scalar(x), max(as_scalar(step), 1e-18)
+    return float(np.ceil(xf / sf) * sf)
 
 
 def clamp_scalar(x: ScalarOrArray, lo: ScalarOrArray, hi: ScalarOrArray) -> float:
@@ -106,7 +107,12 @@ def _to_bool(v: Any, d: bool) -> bool:
 def round_to_step(x: float, step: float) -> float:
     if step <= 0:
         return float(x)
-    return round(x / step) * step
+    return float(round(x / step) * step)
+
+
+def round_to_tick(x: Any, tick: Any) -> float:
+    xf, tf = as_scalar(x), max(as_scalar(tick), 1e-18)
+    return float(np.round(xf / tf) * tf)
 
 def enforce_precision(sym_cfg: Dict[str, Any], price: float, qty: float) -> Tuple[float, float]:
     p_step = _to_float(sym_cfg.get("tickSize", 0), 0)
@@ -153,30 +159,91 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
         ha['ha_low']   = ha[['low','ha_open','ha_close']].min(axis=1)
         d[['open','high','low','close']] = ha[['ha_open','ha_high','ha_low','ha_close']]
 
-    # EMA/MA, MACD, RSI(14)
-    d['ema'] = EMAIndicator(d['close'], 22).ema_indicator()
-    d['ma']  = SMAIndicator(d['close'], 20).sma_indicator()
+    # EMA/MA, MACD, RSI
+    d['ema_22'] = EMAIndicator(d['close'], 22).ema_indicator()
+    d['ma_22'] = SMAIndicator(d['close'], 22).sma_indicator()
     macd = MACD(d['close'])
     d['macd'] = macd.macd()
     d['macd_signal'] = macd.macd_signal()
-    d['rsi'] = RSIIndicator(d['close'], 25).rsi()
+    d['rsi'] = RSIIndicator(d['close'], 14).rsi()
 
     # ATR (EMA Wilder-ish) & normalisasi
     prev_close = d['close'].shift(1)
     tr = pd.concat([(d['high']-d['low']).abs(), (d['high']-prev_close).abs(), (d['low']-prev_close).abs()], axis=1).max(axis=1)
-    d['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    d['atr'] = d['atr'].fillna(0.0)
-    d['atr_pct'] = safe_div(d['atr'], d['close'])
+    d['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean().fillna(0.0)
+    d['atr_pct'] = (d['atr'] / d['close']).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
     # body/ATR + alias
     d['body'] = (d['close'] - d['open']).abs()
-    d['body_to_atr'] = safe_div(d['body'], d['atr'])
+    d['body_to_atr'] = (d['body'] / d['atr']).replace([np.inf, -np.inf], 0.0).fillna(0.0)
     d['body_atr']    = d['body_to_atr']  # alias untuk backward compat
-
-    # Base signal (sesuai request kamu)
-    d['long_base']  = (d['ema'] > d['ma']) & (d['macd'] > d['macd_signal']) & d['rsi'].between(10, 45)
-    d['short_base'] = (d['ema'] < d['ma']) & (d['macd'] < d['macd_signal']) & d['rsi'].between(70, 90)
     return d
+
+
+USE_BACKTEST_ENTRY_LOGIC = bool(int(os.getenv("USE_BACKTEST_ENTRY_LOGIC", "1")))
+
+
+def compute_base_signals_backtest(df: pd.DataFrame) -> tuple[bool, bool]:
+    ema_now, ema_prev = df['ema_22'].iloc[-1], df['ema_22'].iloc[-2]
+    ma_now, ma_prev = df['ma_22'].iloc[-1], df['ma_22'].iloc[-2]
+    macd_now, macd_sig = df['macd'].iloc[-1], df['macd_signal'].iloc[-1]
+    rsi_now = df['rsi'].iloc[-1]
+    long_base = (ema_prev <= ma_prev) and (ema_now > ma_now) and (macd_now > macd_sig) and (40 <= rsi_now <= 70)
+    short_base = (ema_prev >= ma_prev) and (ema_now < ma_now) and (macd_now < macd_sig) and (30 <= rsi_now <= 60)
+    logging.getLogger(__name__).info(
+        f"BASE ema22={ema_now:.6f} ma22={ma_now:.6f} macd={macd_now:.6f} sig={macd_sig:.6f} rsi={rsi_now:.2f} -> L={long_base} S={short_base}"
+    )
+    return bool(long_base), bool(short_base)
+
+
+def compute_base_signals_live(df: pd.DataFrame) -> tuple[bool, bool]:
+    last = df.iloc[-1]
+    long_base = (last.get('ema_22', 0) > last.get('ma_22', 0)) and (last.get('macd', 0) > last.get('macd_signal', 0)) and (last.get('rsi', 50) <= 45)
+    short_base = (last.get('ema_22', 0) < last.get('ma_22', 0)) and (last.get('macd', 0) < last.get('macd_signal', 0)) and (last.get('rsi', 50) >= 70)
+    return bool(long_base), bool(short_base)
+
+
+ML_WEIGHT = float(os.getenv("ML_WEIGHT", "1.5"))
+
+
+def get_coin_ml_params(symbol: str, coin_config: dict) -> dict:
+    d = coin_config.get(symbol, {}).get("ml", {})
+    return {
+        "enabled": bool(d.get("enabled", True)),
+        "strict": bool(d.get("strict", False)),
+        "up_prob": float(d.get("up_prob_long", 0.55)),
+        "down_prob": float(d.get("down_prob_short", 0.45)),
+        "score_threshold": float(d.get("score_threshold", 1.0)),
+        "weight": float(d.get("weight", ML_WEIGHT)),
+    }
+
+
+def make_decision(df: pd.DataFrame, symbol: str, coin_cfg: dict, ml_up_prob: float | None) -> Optional[str]:
+    params = get_coin_ml_params(symbol, coin_cfg)
+    if USE_BACKTEST_ENTRY_LOGIC:
+        long_base, short_base = compute_base_signals_backtest(df)
+    else:
+        long_base, short_base = compute_base_signals_live(df)
+    score_long = 1.0 if long_base else 0.0
+    score_short = 1.0 if short_base else 0.0
+    if params["enabled"] and ml_up_prob is not None:
+        if long_base and ml_up_prob >= params["up_prob"]:
+            score_long += params["weight"]
+        if short_base and ml_up_prob <= params["down_prob"]:
+            score_short += params["weight"]
+    thr = params["score_threshold"]
+    if params["strict"] and ml_up_prob is None:
+        logging.getLogger(__name__).info(f"[{symbol}] ML_WARMUP: menunda hingga model siap (strict).")
+        return None
+    decision = None
+    if score_long >= thr and score_long > score_short:
+        decision = "LONG"
+    elif score_short >= thr and score_short > score_long:
+        decision = "SHORT"
+    logging.getLogger(__name__).info(
+        f"[{symbol}] DECISION base(L={long_base},S={short_base}) up_prob={ml_up_prob} thr={thr} score(L={score_long:.2f},S={score_short:.2f}) -> {decision}"
+    )
+    return decision
 
 def htf_trend_ok(side: str, base_df: pd.DataFrame, htf: str = '1h') -> bool:
     try:
@@ -198,7 +265,10 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
 
     body_val = ind.get('body_to_atr', ind.get('body_atr'))
     body_ok = (float(body_val) <= max_body) if body_val is not None else False
-
+    if not atr_ok or not body_ok:
+        logging.getLogger(__name__).info(
+            f"[{coin_cfg.get('symbol', '?')}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} price={ind.get('close')}"
+        )
     return atr_ok, body_ok, {
         'atr_pct': float(ind['atr_pct']),
         'body_to_atr': float(body_val) if body_val is not None else float('nan')
@@ -221,7 +291,7 @@ def apply_ml_gate(up_prob: Optional[float], ml_thr: float, eps: float = SAFE_EPS
     if up_prob is None:
         return True
     p = min(max(up_prob, eps), 1 - eps)
-    up_odds = to_scalar(safe_div(p, 1 - p))
+    up_odds = safe_div(p, 1 - p)
     return up_odds >= ml_thr
 
 # -----------------------------------------------------
@@ -244,12 +314,12 @@ def pnl_net(side: str, entry: float, exit: float, qty: float,
     slip = (entry + exit) * qty * slip_bps/10000.0
     gross = (exit - entry) * qty if side=='LONG' else (entry - exit) * qty
     pnl = gross - fee - slip
-    roi = to_scalar(safe_div(pnl, (entry*qty))) if entry*qty>0 else 0.0
+    roi = safe_div(pnl, (entry*qty)) if entry*qty>0 else 0.0
     return pnl, roi*100.0
 
 def r_multiple(entry: float, sl: float, price: float) -> float:
     r = abs(entry - sl)
-    return to_scalar(safe_div(abs(price - entry), r))
+    return safe_div(abs(price - entry), r)
 
 def r_multiple_signed(entry: float, sl: float, price: float, side: str) -> float:
     """R multiple bertanda; positif hanya jika bergerak sesuai arah profit."""
@@ -257,7 +327,7 @@ def r_multiple_signed(entry: float, sl: float, price: float, side: str) -> float
     if R <= 0:
         return 0.0
     move = (price - entry) if side == 'LONG' else (entry - price)
-    return to_scalar(safe_div(move, R))
+    return safe_div(move, R)
 
 def apply_breakeven_sl(side: str,
                        entry: float,
@@ -292,11 +362,11 @@ def apply_breakeven_sl(side: str,
     # 2) % fallback
     if be_trigger_pct and be_trigger_pct > 0:
         if side == 'LONG':
-            if to_scalar(safe_div((price - entry), entry)) >= be_trigger_pct:
+            if safe_div((price - entry), entry) >= be_trigger_pct:
                 target = max(sl or 0.0, entry)
                 return min(target, price - gap)
         else:
-            if to_scalar(safe_div((entry - price), entry)) >= be_trigger_pct:
+            if safe_div((entry - price), entry) >= be_trigger_pct:
                 target = min(sl or 1e18, entry)
                 return max(target, price + gap)
 
@@ -307,14 +377,14 @@ def roi_frac_now(side: str, entry: Optional[float], price: float, qty: float, le
         return 0.0
     entry = float(entry)
     price = float(price)
-    init_margin = to_scalar(safe_div((entry * abs(qty)), leverage))
+    init_margin = safe_div((entry * abs(qty)), leverage)
     if init_margin <= 0:
         return 0.0
     if side == 'LONG':
         pnl = (price - entry) * qty
     else:
         pnl = (entry - price) * qty
-    return to_scalar(safe_div(pnl, init_margin))
+    return safe_div(pnl, init_margin)
 
 def base_supports_side(base_long: bool, base_short: bool, side: str) -> bool:
     return (side == 'LONG' and base_long and not base_short) or (side == 'SHORT' and base_short and not base_long)
@@ -354,7 +424,7 @@ def step_trailing(side: str, bar: pd.Series, prev_state: Dict[str, Optional[floa
     if entry is None or price is None or entry == 0:
         profit_pct = 0.0
     else:
-        profit_pct = to_scalar(safe_div((price - entry), entry)) * 100 if side == 'LONG' else to_scalar(safe_div((entry - price), entry)) * 100
+        profit_pct = safe_div((price - entry), entry) * 100 if side == 'LONG' else safe_div((entry - price), entry) * 100
     if profit_pct < trigger:
         return prev_state.get('tsl')
     if side=='LONG':
@@ -369,9 +439,9 @@ def maybe_move_to_BE(side: str, entry: float, tsl: Optional[float], rule: Dict[s
     price = rule.get('price', entry)
     if be <= 0:
         return tsl
-    if side=='LONG' and to_scalar(safe_div((price-entry), entry)) >= be:
+    if side=='LONG' and safe_div((price-entry), entry) >= be:
         return max(tsl or 0.0, entry)
-    if side=='SHORT' and to_scalar(safe_div((entry-price), entry)) >= be:
+    if side=='SHORT' and safe_div((entry-price), entry) >= be:
         return min(tsl or 1e18, entry)
     return tsl
 
