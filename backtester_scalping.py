@@ -520,7 +520,7 @@ if selected_file:
 
     # ---------- Diagnostics ----------
     with st.expander("📟 Diagnostics (cek kenapa nggak entry)", expanded=False):
-        base_long = int(((df['ema']>df['ma']) & (df['macd']>df['macd_signal']) & df['rsi'].between(40,70)).sum())
+        base_long = int(((df['ema']>df['ma']) & (df['macd']>df['macd_signal']) & df['rsi'].between(40,60)).sum())
         base_short = int(((df['ema']<df['ma']) & (df['macd']<df['macd_signal']) & df['rsi'].between(30,60)).sum())
         atr_ok = int((df['atr_pct'].between(min_atr_pct, max_atr_pct)).sum())
         st.write({
