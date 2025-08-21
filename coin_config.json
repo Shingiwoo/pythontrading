@@ -1,8 +1,8 @@
 {
   "SYMBOL_DEFAULTS": {
     "filters": {
-      "atr_filter_enabled": false,
-      "body_filter_enabled": false,
+      "atr": false,
+      "body": false,
       "min_atr_threshold": 0.0,
       "max_body_over_atr": 9.99
     }

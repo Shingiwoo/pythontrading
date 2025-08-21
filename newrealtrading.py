@@ -33,7 +33,8 @@ from engine_core import (
     _to_float, _to_int, _to_bool, floor_to_step, ceil_to_step, to_scalar, to_bool,
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
     htf_trend_ok, r_multiple, apply_breakeven_sl, roi_frac_now, base_supports_side,
-    safe_div, as_float
+    safe_div, as_float, compute_base_signals_backtest, make_decision, round_to_tick,
+    as_scalar
 )
 
 from binance.client import Client
@@ -135,7 +136,7 @@ class ExecutionClient:
         symbol = (symbol or "").upper()
         if not symbol:
             raise ValueError("symbol is required")
-        qty = to_scalar(qty)
+        qty = as_scalar(qty)
         step = self.get_step_size(symbol)
         return floor_to_step(qty, step)
 
@@ -143,9 +144,9 @@ class ExecutionClient:
         symbol = (symbol or "").upper()
         if not symbol:
             raise ValueError("symbol is required")
-        price = to_scalar(price)
+        price = as_scalar(price)
         tick = self.get_tick_size(symbol)
-        return floor_to_step(price, tick)
+        return round_to_tick(price, tick)
 
     def set_leverage(self, symbol: str, leverage: int):
         try:
@@ -481,7 +482,7 @@ class CoinTrader:
         dist = max(dist, max(_to_float(self.config.get('tickSize', 0.0), 0.0), 1e-12))
         qty = safe_div(risk_usdt, dist)
         if self.exec:
-            qty = self.exec.round_qty(self.symbol, qty)
+            qty = self.exec.round_qty(self.symbol, as_scalar(qty))
         else:
             step = _to_float(self.config.get('stepSize', 0.0), 0.0)
             qty = floor_to_step(qty, step) if step>0 else qty
@@ -597,7 +598,7 @@ class CoinTrader:
 
         raw_qty = safe_div((margin * lev), price)
         if self.exec:
-            qty = self.exec.round_qty(self.symbol, raw_qty)
+            qty = self.exec.round_qty(self.symbol, as_scalar(raw_qty))
         else:
             step = _to_float(self.config.get('stepSize', 0.0), 0.0)
             qty = floor_to_step(raw_qty, step) if step > 0 else raw_qty
@@ -613,7 +614,7 @@ class CoinTrader:
         if need > max(live_avail, 0.0):
             max_qty_by_margin = safe_div(safe_div(live_avail, lev), price) * 0.95
             if self.exec:
-                shrunk = self.exec.round_qty(self.symbol, max(0.0, max_qty_by_margin))
+                shrunk = self.exec.round_qty(self.symbol, as_scalar(max(0.0, max_qty_by_margin)))
             else:
                 step = _to_float(self.config.get('stepSize', 0.0), 0.0)
                 shrunk = floor_to_step(max(0.0, max_qty_by_margin), step) if step > 0 else max(0.0, max_qty_by_margin)
@@ -631,7 +632,7 @@ class CoinTrader:
             if step > 0:
                 need_qty = ceil_to_step(need_qty, step)
             if self.exec:
-                need_qty = self.exec.round_qty(self.symbol, need_qty)
+                need_qty = self.exec.round_qty(self.symbol, as_scalar(need_qty))
             if to_scalar(safe_div((need_qty * price), lev) * (1.0 + fee_buf)) > live_avail:
                 self._log(f"SKIP entry: below MIN_NOTIONAL {min_not}, avail={live_avail:.2f}")
                 return 0.0
@@ -750,8 +751,6 @@ class CoinTrader:
                     return 0.0
 
             filters_cfg = (self.config.get('filters') if isinstance(self.config.get('filters'), dict) else {}) or {}
-            atr_enabled = filters_cfg.get('atr_filter_enabled', False)
-            body_enabled = filters_cfg.get('body_filter_enabled', False)
             min_atr_threshold = _to_float(filters_cfg.get('min_atr_threshold', self.config.get('min_atr_pct', DEFAULTS['min_atr_pct'])), DEFAULTS['min_atr_pct'])
             max_body_over_atr = _to_float(filters_cfg.get('max_body_over_atr', self.config.get('max_body_atr', DEFAULTS['max_body_atr'])), DEFAULTS['max_body_atr'])
 
@@ -760,32 +759,25 @@ class CoinTrader:
             )
             body_val = last.get('body_to_atr', last.get('body_atr'))
             body_ok = (as_float(body_val) <= max_body_over_atr)
-
-            if self.verbose:
-                print(f"[{self.symbol}] FILTER CHECK atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
-
-            allow_entry = True
-            if atr_enabled and not atr_ok:
-                allow_entry = False
-            if body_enabled and not body_ok:
-                allow_entry = False
+            if self.verbose and (not atr_ok or not body_ok):
+                print(f"[{self.symbol}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
 
             # HTF filter (opsional)
             if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
-                if last['ema'] > last['ma'] and not htf_trend_ok('LONG', df, htf=htf):
+                if last['ema_22'] > last['ma_22'] and not htf_trend_ok('LONG', df, htf=htf):
                     long_htf_ok = False
                 else:
                     long_htf_ok = True
-                if last['ema'] < last['ma'] and not htf_trend_ok('SHORT', df, htf=htf):
+                if last['ema_22'] < last['ma_22'] and not htf_trend_ok('SHORT', df, htf=htf):
                     short_htf_ok = False
                 else:
                     short_htf_ok = True
             else:
                 long_htf_ok = short_htf_ok = True
 
-            # Skor base
-            long_base = bool(last.get('long_base', False)) and long_htf_ok
-            short_base = bool(last.get('short_base', False)) and short_htf_ok
+            long_base, short_base = compute_base_signals_backtest(df)
+            long_base = long_base and long_htf_ok
+            short_base = short_base and short_htf_ok
 
             if self.rehydrated and self.pos.side:
                 lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
@@ -810,20 +802,9 @@ class CoinTrader:
                     self._update_trailing(price)
                 return 0.0
 
-            # ML
-            ml_cfg = self.config.get("ml", {}) if isinstance(self.config.get("ml"), dict) else {}
-            if "score_threshold" in ml_cfg:
-                self.ml.params.score_threshold = _to_float(ml_cfg.get("score_threshold"), ENV_DEFAULTS["SCORE_THRESHOLD"])
-            else:
-                self.ml.params.score_threshold = _to_float(self.config.get("SCORE_THRESHOLD", ENV_DEFAULTS["SCORE_THRESHOLD"]), ENV_DEFAULTS["SCORE_THRESHOLD"])
-            long_sig, short_sig = self.ml.score_and_decide(long_base, short_base, up_prob)
-            if not allow_entry:
-                long_sig = short_sig = False
-
-            up_prob_f = float(up_prob) if up_prob is not None else float('nan')
-            thr_val = float(self.ml.params.score_threshold)
-            # Kelola posisi
-            self._log(f"DECISION price={price:.6f} base(L={long_base},S={short_base}) up_prob={up_prob_f:.3f} thr={thr_val} -> {('LONG' if long_sig else ('SHORT' if short_sig else '-'))} pos={self.pos.side}")
+            decision = make_decision(df, self.symbol, self.config, up_prob)
+            long_sig = decision == 'LONG'
+            short_sig = decision == 'SHORT'
             # Update SL/TS saat pegang posisi
             if self.pos.side:
                 self._apply_breakeven(price)
