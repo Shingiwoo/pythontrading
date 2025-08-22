@@ -36,7 +36,7 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
     sym_cfg = cfg.get(args.symbol, {})
     # (opsi) merge preset
     preset_name = args.preset or sym_cfg.get("use_preset") or (cfg.get("PRESETS") and "SCALP-ADA-15M-LEGACY")
-    if preset_name and isinstance(cfg.get("PRESETS"), dict) and preset_name in cfg["PRESETS"]:
+    if preset_name and isinstance(cfg.get("PRESETS"), dict) and preset_name in cfg.get("PRESETS", {}):
         base_p = dict(cfg["PRESETS"][preset_name])
         merged = {**base_p, **sym_cfg}
         for k in ("filters", "ml"):
@@ -45,6 +45,19 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
                 mk.update(sym_cfg.get(k, {}))
                 merged[k] = mk
         sym_cfg = merged
+    else:
+        # Fallback: jika args.preset diminta tapi tidak ada, kembali ke use_preset atau LEGACY
+        fb = sym_cfg.get("use_preset") or "SCALP-ADA-15M-LEGACY"
+        if args.preset and fb in (cfg.get("PRESETS") or {}):
+            base_p = dict(cfg["PRESETS"][fb])
+            merged = {**base_p, **sym_cfg}
+            for k in ("filters", "ml"):
+                if k in base_p or k in sym_cfg:
+                    mk = dict(base_p.get(k, {})); mk.update(sym_cfg.get(k, {})); merged[k] = mk
+            sym_cfg = merged
+            print(f"[INFO] preset '{args.preset}' tidak ditemukan. Fallback ke '{fb}'.")
+        elif args.preset:
+            print(f"[WARN] preset '{args.preset}' tidak ditemukan dan tidak ada fallback yang cocok.")
     sym_cfg["heikin"] = bool(args.heikin)
     sym_cfg["rsi_mode"] = args.rsi_mode
     if args.no_macd_confirm:
@@ -72,6 +85,12 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
     tmp_cfg = f"_tmp_cfg_{args.symbol}.json"
     with open(tmp_cfg, "w") as f:
         json.dump(cfg, f, indent=2)
+    
+    # Log preset final yang dipakai agar mudah diverifikasi dari CLI
+    try:
+        print(f"[INFO] Preset dipakai: {sym_cfg.get('use_preset', '(inline merged)')} / rsi_mode={sym_cfg.get('rsi_mode')} macd_confirm={sym_cfg.get('use_macd_confirm', False)}")
+    except Exception:
+        pass
 
     mgr = TradingManager(
         tmp_cfg,
