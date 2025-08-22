@@ -28,9 +28,7 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
 HTTP_BACKOFF = float(os.getenv("HTTP_BACKOFF", "1.3"))
 
-# Binance
-from binance.client import Client
-from binance.enums import HistoricalKlinesType
+from exchanges import binance_adapter as bnx
 
 # Import core engine dan trader
 try:
@@ -57,17 +55,17 @@ except Exception as e:  # pragma: no cover
 # Util waktu & interval
 # -----------------------------
 INTERVAL_MAP = {
-    "1m":  Client.KLINE_INTERVAL_1MINUTE,
-    "3m":  Client.KLINE_INTERVAL_3MINUTE,
-    "5m":  Client.KLINE_INTERVAL_5MINUTE,
-    "15m": Client.KLINE_INTERVAL_15MINUTE,
-    "30m": Client.KLINE_INTERVAL_30MINUTE,
-    "1h":  Client.KLINE_INTERVAL_1HOUR,
-    "2h":  Client.KLINE_INTERVAL_2HOUR,
-    "4h":  Client.KLINE_INTERVAL_4HOUR,
-    "6h":  Client.KLINE_INTERVAL_6HOUR,
-    "12h": Client.KLINE_INTERVAL_12HOUR,
-    "1d":  Client.KLINE_INTERVAL_1DAY,
+    "1m":  "1m",
+    "3m":  "3m",
+    "5m":  "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h":  "1h",
+    "2h":  "2h",
+    "4h":  "4h",
+    "6h":  "6h",
+    "12h": "12h",
+    "1d":  "1d",
 }
 
 def interval_seconds(s: str) -> int:
@@ -151,9 +149,13 @@ class RateLimiter:
             self.allowance -= 1.0
 
 class BinanceFutures:
-    def __init__(self, requests_timeout: float = REQUEST_TIMEOUT, max_retries: int = HTTP_RETRIES):
-        self.client = Client(requests_params={"timeout": requests_timeout})
+    def __init__(self, requests_timeout: float = REQUEST_TIMEOUT, max_retries: int = HTTP_RETRIES, *, use_real_client: bool = True):
         self.max_retries = max_retries
+        if use_real_client:
+            bnx.ensure()
+            self.client = bnx.Client(requests_params={"timeout": requests_timeout})
+        else:
+            self.client = None
 
     def _retry(self, fn, *args, **kwargs):
         last_ex = None
@@ -167,17 +169,29 @@ class BinanceFutures:
         raise last_ex if last_ex else RuntimeError("Unknown error occurred during Binance call retries.")
 
     def exchange_info(self) -> dict:
-        # Futures USDⓈ-M
-        return self._retry(self.client.futures_exchange_info)
+        if self.client:
+            return self._retry(self.client.futures_exchange_info)
+        import requests
+        url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
 
     def klines(self, symbol: str, interval: str, limit: int = 500) -> List[list]:
-        # Ambil klines futures (closed bars)
-        result = self._retry(
-            self.client.futures_klines,
-            symbol=symbol.upper(),
-            interval=interval,
-            limit=limit
-        )
+        if self.client:
+            result = self._retry(
+                self.client.futures_klines,
+                symbol=symbol.upper(),
+                interval=interval,
+                limit=limit
+            )
+        else:
+            import requests
+            url = "https://fapi.binance.com/fapi/v1/klines"
+            params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            result = resp.json()
         if not isinstance(result, list) or not all(isinstance(item, list) for item in result):
             raise TypeError("Expected a List of lists, but got a different type.")
         return result
@@ -407,7 +421,12 @@ def main():
         "slip_bps": args.slip_bps,
     }
 
-    bnc = BinanceFutures(requests_timeout=args.timeout, max_retries=args.retries)
+    if args.live_paper:
+        use_real_client = False
+    else:
+        use_real_client = True
+
+    bnc = BinanceFutures(requests_timeout=args.timeout, max_retries=args.retries, use_real_client=use_real_client)
     cfg_all = ensure_filters_to_coin_config(bnc, args.coin_config, syms)
     valid_syms = []
     for s in syms:
@@ -481,7 +500,8 @@ def main():
 if __name__ == "__main__":
     if not _to_bool(os.getenv("BINANCE_FORCE_PUBLIC_ONLY", "1"), True):
         # (opsional) Masukkan API KEY kalau mau private call lain — untuk feed klines tidak wajib.
-        Client(os.getenv("BINANCE_API_KEY",""), os.getenv("BINANCE_API_SECRET",""))
+        bnx.ensure()
+        bnx.Client(os.getenv("BINANCE_API_KEY",""), os.getenv("BINANCE_API_SECRET",""))
     try:
         main()
     except KeyboardInterrupt:
