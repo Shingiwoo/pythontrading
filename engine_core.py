@@ -377,16 +377,35 @@ def make_decision(
     )
     return decision
 
+def _norm_resample_freq(freq: str | None, default: str = "1h") -> str:
+    """Normalisasi frekuensi untuk pandas.resample.
+    - Pakai huruf kecil sesuai anjuran pandas >2.
+    - Ubah akhiran 'm' ke 'min' agar tidak ambigu dengan bulan.
+    """
+    f = (str(freq or default)).strip().lower()
+    if f.endswith("m") and not f.endswith("min"):
+        if f.endswith("ms") or f.endswith("us"):
+            return f
+        f = f[:-1] + "min"
+    return f
+
+
 def htf_trend_ok(side: str, base_df: pd.DataFrame, htf: str = '1h') -> bool:
     try:
-        tmp = base_df.set_index('timestamp')[['close']].copy()
-        res = str(htf).upper()
-        htf_close = tmp['close'].resample(res).last().dropna()
-        if len(htf_close) < 210:
+        d = base_df.copy()
+        if 'timestamp' in d.columns:
+            d = d.set_index(pd.to_datetime(d['timestamp'], utc=True))
+        else:
+            d.index = pd.to_datetime(d.index, utc=True)
+        res = _norm_resample_freq(htf, "1h")
+        htf_close = d['close'].resample(res).last().dropna()
+        if len(htf_close) < 30:
             return True
-        ema50 = htf_close.ewm(span=20, adjust=False).mean().iloc[-1]
-        ema200 = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
-        return (ema50 >= ema200) if side == 'LONG' else (ema50 <= ema200)
+        ema22 = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
+        sma22 = htf_close.rolling(22).mean().iloc[-1]
+        if np.isnan(ema22) or np.isnan(sma22):
+            return True
+        return (ema22 >= sma22) if side == 'LONG' else (ema22 <= sma22)
     except Exception:
         return True
 def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool, Dict[str, Any]]:

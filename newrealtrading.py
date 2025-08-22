@@ -7,6 +7,7 @@
 # =============================================================
 from __future__ import annotations
 import os, json, time, math, threading, random, string
+import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from uuid import uuid4
@@ -26,6 +27,11 @@ from ml_signal_plugin import MLSignal
 try:
     from dotenv import load_dotenv
     load_dotenv()
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=".*is deprecated and will be removed in a future version.*",
+    )
 except Exception:
     pass
 
@@ -812,7 +818,7 @@ class CoinTrader:
         price = float(last['close'])
         bar_high = float(last['high'])
         bar_low = float(last['low'])
-        htf = str(self.config.get('htf', '1h'))
+        htf = str(self.config.get('htf', '1h')).strip().lower()
         if not math.isfinite(price):
             raise ValueError("Non-finite price")
         atr = float(last['atr']) if not pd.isna(last['atr']) else 0.0
@@ -963,6 +969,7 @@ class TradingManager:
         self.traders: Dict[str, CoinTrader] = {}
         for s in self.symbols:
             merged_cfg = merge_config(s, self._cfg)
+            merged_cfg['htf'] = str(merged_cfg.get('htf', '1h')).strip().lower()
             if no_atr_filter:
                 merged_cfg.setdefault('filters', {})['atr_filter_enabled'] = False
             if no_body_filter:
@@ -1086,6 +1093,7 @@ if __name__ == "__main__":
     ap.add_argument("--live", action="store_true", help="Jalankan real-trading live (REST polling)")
     ap.add_argument("--symbols", default=None, help="Comma-separated symbols; default = --symbol")
     ap.add_argument("--interval", default=os.getenv("INTERVAL","15m"))
+    ap.add_argument("--htf", default=None, help="Higher timeframe (contoh: 1h)")
     ap.add_argument("--dry-run-loop", action="store_true", help="Replay CSV bar-by-bar (simulasi real-time)")
     ap.add_argument("--sleep", type=float, default=0.0, help="Delay per step (detik) saat dry-run")
     ap.add_argument("--limit", type=int, default=0, help="Batasi jumlah langkah dry-run (0 = semua)")
@@ -1097,6 +1105,8 @@ if __name__ == "__main__":
     ap.add_argument("--no-atr-filter", action="store_true", help="Disable ATR/body candle filter (ML always allowed)")
     ap.add_argument("--ml-override", action="store_true", help="Allow ML to bypass ATR/body filter when triggered")
     args = ap.parse_args()
+    if args.htf is not None:
+        args.htf = str(args.htf).strip().lower()
     if args.verbose:
         os.environ["VERBOSE"] = "1"
     os.environ["INSTANCE_ID"] = args.instance_id
@@ -1139,6 +1149,9 @@ if __name__ == "__main__":
             start_i = min(warmup, len(df)-1)
             steps = 0
             mgr = TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose, no_atr_filter=args.no_atr_filter, ml_override=args.ml_override)
+            if args.htf:
+                for t in mgr.traders.values():
+                    t.config['htf'] = args.htf
             for i in range(start_i, len(df)):
                 data_map = {sym: df.iloc[:i+1].copy()}
                 mgr.run_once(data_map, {sym: args.balance})
@@ -1151,7 +1164,11 @@ if __name__ == "__main__":
             print(f"Dry-run completed: {steps} steps (start={start_i}, total_bars={len(df)}). Last position: {last_side}")
         else:
             data_map = {sym: df}
-            TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose, no_atr_filter=args.no_atr_filter, ml_override=args.ml_override).run_once(data_map, {sym: args.balance})
+            mgr = TradingManager(args.coin_config, [sym], instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose, no_atr_filter=args.no_atr_filter, ml_override=args.ml_override)
+            if args.htf:
+                for t in mgr.traders.values():
+                    t.config['htf'] = args.htf
+            mgr.run_once(data_map, {sym: args.balance})
             print("Run once completed (dummy). Cek log/print sesuai hook eksekusi.")
     else:
         if args.live:
@@ -1178,6 +1195,9 @@ if __name__ == "__main__":
             step = _sec(interval)
 
             mgr = TradingManager(args.coin_config, syms, instance_id=args.instance_id, account_guard=args.account_guard, exec_client=exec_client, verbose=args.verbose, no_atr_filter=args.no_atr_filter, ml_override=args.ml_override)
+            if args.htf:
+                for t in mgr.traders.values():
+                    t.config['htf'] = args.htf
 
             print(f"[LIVE] balance sumber: account availableBalance (bukan arg --balance)")
             print(f"[LIVE] start symbols={','.join(syms)} interval={interval}")
