@@ -9,7 +9,7 @@ from ta.volatility import BollingerBands
 from ta.momentum import RSIIndicator
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
-from engine_core import apply_breakeven_sl, make_decision, compute_base_signals
+from engine_core import apply_breakeven_sl, make_decision, compute_base_signals, apply_filters
 
 """
 ============================================================
@@ -287,7 +287,8 @@ if selected_file:
                 'down_prob_short': 0.45
             }
         }
-        decision = make_decision(sub, symbol or 'SYM', cfg_loop, up_prob)
+        atr_ok, body_ok, meta = apply_filters(sub.iloc[-1], cfg_loop)
+        decision = make_decision(sub, symbol or 'SYM', cfg_loop, up_prob, atr_ok=atr_ok, body_ok=body_ok, meta=meta)
         long_raw = decision == 'LONG'
         short_raw = decision == 'SHORT'
 
@@ -305,11 +306,11 @@ if selected_file:
             blocked_reasons_short.append('score_below_threshold')
 
         # Filters
-        if not (min_atr_pct <= atr_pct_now <= max_atr_pct):
+        if not atr_ok:
             long_raw = False; short_raw = False
-            blocked_reasons_long.append('atr_out_of_range')
-            blocked_reasons_short.append('atr_out_of_range')
-        if body_to_atr_now > max_body_atr:
+            blocked_reasons_long.append('atr_or_bb_filter')
+            blocked_reasons_short.append('atr_or_bb_filter')
+        if not body_ok:
             long_raw = False; short_raw = False
             blocked_reasons_long.append('body_exceeds_atr')
             blocked_reasons_short.append('body_exceeds_atr')
