@@ -1,3 +1,12 @@
+# from __future__ import harus paling atas
+from __future__ import annotations
+
+# --- begin: third-party warning filters (allow PYTHONWARNINGS=error) ---
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^websockets(\.|$)")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^binance(\.|$)")
+# --- end: filters ---
+
 # newrealtrading.py — FULL PATCH (revised)
 # =============================================================
 # Update: 2025-08-16
@@ -5,9 +14,7 @@
 # - Tetap kompatibel dengan papertrade.py (live paper feed / tanpa order)
 # - Struktur modular: CoinTrader, TradingManager, utils, indikator, loader config, ML plugin hook
 # =============================================================
-from __future__ import annotations
 import os, json, time, math, threading, random, string
-import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from uuid import uuid4
@@ -43,8 +50,7 @@ from engine_core import (
     as_scalar, apply_filters
 )
 
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+from exchanges import binance_adapter as bnx
 
 INSTANCE_ID = os.getenv("INSTANCE_ID", "bot")
 
@@ -96,8 +102,9 @@ def _to_dt_safe(x) -> pd.Timestamp:
         return pd.Timestamp.utcnow().tz_localize('UTC')
 class ExecutionClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool=False, verbose: bool=False):
-        self.client = Client(api_key, api_secret, testnet=testnet,
-                             requests_params={"timeout": REQUEST_TIMEOUT})
+        bnx.ensure()
+        self.client = bnx.Client(api_key, api_secret, testnet=testnet,
+                                 requests_params={"timeout": REQUEST_TIMEOUT})
         if testnet:
             self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
         self.verbose = verbose
@@ -178,7 +185,7 @@ class ExecutionClient:
             else:
                 mtype = str(isolated)
             self.client.futures_change_margin_type(symbol=symbol, marginType=mtype)
-        except BinanceAPIException as e:
+        except bnx.BinanceAPIException as e:
             if e.code == -4046:
                 self._log(f"set_margin_type fail: {e}")
                 return None
@@ -215,7 +222,7 @@ class ExecutionClient:
             return {}
         try:
             return self.client.futures_create_order(**params)
-        except BinanceAPIException as e:
+        except bnx.BinanceAPIException as e:
             if e.code == -1111:
                 flt = self.symbol_filters.get(symbol.upper(), {})
                 self._log(f"[ROUND-RETRY] {symbol}: raw_qty={raw_qty} step={flt.get('stepSize')} qPrec={flt.get('quantityPrecision')} -> retry")
@@ -297,7 +304,7 @@ class ExecutionClient:
             if self.verbose and o:
                 print(f"[EXEC] STOP_MARKET {symbol} {side} stop={sp} qty={r_qty} -> orderId={o.get('orderId')}")
             return o
-        except BinanceAPIException as e:
+        except bnx.BinanceAPIException as e:
             if getattr(e, "code", None) == -2022 and "ReduceOnly" in str(e):
                 if self.verbose:
                     print(f"[EXEC] STOP_MARKET ignore -2022 (no position to reduce) {symbol}")
@@ -340,7 +347,7 @@ class ExecutionClient:
             if self.verbose and o:
                 print(f"[EXEC] MARKET CLOSE {symbol} {side} {r_qty} -> orderId={o.get('orderId')}")
             return o
-        except BinanceAPIException as e:
+        except bnx.BinanceAPIException as e:
             if getattr(e, "code", None) == -2022 and "ReduceOnly" in str(e):
                 if self.verbose:
                     print(f"[EXEC] MARKET CLOSE ignore -2022 (no position to reduce) {symbol}")
@@ -713,7 +720,7 @@ class CoinTrader:
                 stop_side = 'SELL' if side == 'LONG' else 'BUY'
                 self.exec.stop_market(self.symbol, stop_side, sl, qty, reduce_only=True, client_id=cid + "-sl")
             return safe_div((price * qty), lev)
-        except BinanceAPIException as e:
+        except bnx.BinanceAPIException as e:
             if getattr(e, "code", None) == -2019:
                 self._log("WARN: Margin insufficient. Cooldown & skip.")
                 self.cooldown_until_ts = time.time() + int(self.config.get("cooldown_seconds", DEFAULTS.get("cooldown_seconds", 60)))
@@ -1173,8 +1180,8 @@ if __name__ == "__main__":
     else:
         if args.live:
             # ==== LIVE MODE (python-binance) ====
-            from binance.client import Client
             import time, pandas as pd
+            bnx.ensure()
 
             def _sec(tf: str) -> int:
                 tf = tf.strip().lower()
@@ -1186,7 +1193,7 @@ if __name__ == "__main__":
 
             api_key = os.getenv("BINANCE_API_KEY","")
             api_sec = os.getenv("BINANCE_API_SECRET","")
-            client = exec_client.client if exec_client else Client(api_key, api_sec, testnet=args.testnet)
+            client = exec_client.client if exec_client else bnx.Client(api_key, api_sec, testnet=args.testnet)
             if args.testnet and not exec_client:
                 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 

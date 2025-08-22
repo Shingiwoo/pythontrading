@@ -16,9 +16,17 @@ python tools_dryrun_summary.py \
 Tips percepat:
 export USE_ML=1; export SCORE_THRESHOLD=2.0; export ML_RETRAIN_EVERY=5000
 """
+# from __future__ import harus berada di awal
 from __future__ import annotations
-import os, sys, time, argparse, json
+
+# --- force third-party deprecation ignores (so PYTHONWARNINGS=error won't fail) ---
 import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^websockets(\.|$)")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^binance(\.|$)")
+# -----------------------------------------------------------------------------
+import newrealtrading as nrt
+
+import os, sys, time, argparse, json
 import pandas as pd
 import numpy as np
 from engine_core import (
@@ -27,19 +35,11 @@ from engine_core import (
     get_coin_ml_params,
 )
 
-# pastikan bisa import modul project
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 warnings.filterwarnings(
     "ignore",
     category=FutureWarning,
     message=".*is deprecated and will be removed in a future version.*",
 )
-try:
-    import newrealtrading as nrt
-except Exception:
-    # fallback: jika tools/ ada di subfolder, coba parent
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    import newrealtrading as nrt
 
 # Simpan method asli dan pasang wrapper yang tanda tangannya identik
 _orig_enter = nrt.CoinTrader._enter_position
