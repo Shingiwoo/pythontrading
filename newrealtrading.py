@@ -753,14 +753,17 @@ class CoinTrader:
             filters_cfg = (self.config.get('filters') if isinstance(self.config.get('filters'), dict) else {}) or {}
             min_atr_threshold = _to_float(filters_cfg.get('min_atr_threshold', self.config.get('min_atr_pct', DEFAULTS['min_atr_pct'])), DEFAULTS['min_atr_pct'])
             max_body_over_atr = _to_float(filters_cfg.get('max_body_over_atr', self.config.get('max_body_atr', DEFAULTS['max_body_atr'])), DEFAULTS['max_body_atr'])
+            min_bb_width = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
 
             atr_ok = (last['atr_pct'] >= min_atr_threshold) and (
                 last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct'])
             )
             body_val = last.get('body_to_atr', last.get('body_atr'))
             body_ok = (as_float(body_val) <= max_body_over_atr)
-            if self.verbose and (not atr_ok or not body_ok):
-                print(f"[{self.symbol}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} price={price} pos={self.pos.side or 'None'}")
+            bb_val = as_float(last.get('bb_width_pct', 0.0))
+            bb_ok = bb_val >= min_bb_width
+            if self.verbose and (not atr_ok or not body_ok or not bb_ok):
+                print(f"[{self.symbol}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} bb_ok={bb_ok} price={price} pos={self.pos.side or 'None'}")
 
             # HTF filter (opsional)
             if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
@@ -775,9 +778,9 @@ class CoinTrader:
             else:
                 long_htf_ok = short_htf_ok = True
 
-            long_base, short_base = compute_base_signals_backtest(df)
-            long_base = long_base and long_htf_ok
-            short_base = short_base and short_htf_ok
+            long_base, short_base = compute_base_signals_backtest(df, self.config)
+            long_base = long_base and long_htf_ok and atr_ok and body_ok and bb_ok
+            short_base = short_base and short_htf_ok and atr_ok and body_ok and bb_ok
 
             if self.rehydrated and self.pos.side:
                 lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
@@ -803,6 +806,8 @@ class CoinTrader:
                 return 0.0
 
             decision = make_decision(df, self.symbol, self.config, up_prob)
+            if not (atr_ok and body_ok and bb_ok):
+                decision = None
             long_sig = decision == 'LONG'
             short_sig = decision == 'SHORT'
             # Update SL/TS saat pegang posisi
