@@ -322,15 +322,22 @@ def htf_trend_ok(side: str, base_df: pd.DataFrame, htf: str = '1h') -> bool:
     except Exception:
         return True
 def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool, Dict[str, Any]]:
+    filters_cfg = (coin_cfg.get('filters') if isinstance(coin_cfg.get('filters'), dict) else {}) or {}
     min_atr = _to_float(coin_cfg.get('min_atr_pct', 0.0), 0.0)
     max_atr = _to_float(coin_cfg.get('max_atr_pct', 1.0), 1.0)
     max_body = _to_float(coin_cfg.get('max_body_atr', 999.0), 999.0)
-    min_bb = _to_float(coin_cfg.get('filters', {}).get('min_bb_width', 0.0), 0.0)
+    min_bb = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
+    atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled', True))
+    body_filter_enabled = bool(filters_cfg.get('body_filter_enabled', True))
 
     atr_ok = (ind['atr_pct'] >= min_atr) and (ind['atr_pct'] <= max_atr)
 
     body_val = ind.get('body_to_atr', ind.get('body_atr'))
     body_ok = (float(body_val) <= max_body) if body_val is not None else False
+    if not atr_filter_enabled:
+        atr_ok = True
+    if not body_filter_enabled:
+        body_ok = True
     bb_val = float(ind.get('bb_width_pct', 0.0))
     bb_ok = bb_val >= min_bb
     if not atr_ok or not body_ok or not bb_ok:

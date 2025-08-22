@@ -757,12 +757,18 @@ class CoinTrader:
             min_atr_threshold = _to_float(filters_cfg.get('min_atr_threshold', self.config.get('min_atr_pct', DEFAULTS['min_atr_pct'])), DEFAULTS['min_atr_pct'])
             max_body_over_atr = _to_float(filters_cfg.get('max_body_over_atr', self.config.get('max_body_atr', DEFAULTS['max_body_atr'])), DEFAULTS['max_body_atr'])
             min_bb_width = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
+            atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled', True))
+            body_filter_enabled = bool(filters_cfg.get('body_filter_enabled', True))
 
             atr_ok = (last['atr_pct'] >= min_atr_threshold) and (
                 last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct'])
             )
             body_val = last.get('body_to_atr', last.get('body_atr'))
             body_ok = (as_float(body_val) <= max_body_over_atr)
+            if not atr_filter_enabled:
+                atr_ok = True
+            if not body_filter_enabled:
+                body_ok = True
             bb_val = as_float(last.get('bb_width_pct', 0.0))
             bb_ok = bb_val >= min_bb_width
             if self.verbose and (not atr_ok or not body_ok or not bb_ok):
