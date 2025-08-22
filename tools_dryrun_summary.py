@@ -20,6 +20,11 @@ from __future__ import annotations
 import os, sys, time, argparse, json
 import pandas as pd
 import numpy as np
+from engine_core import (
+    compute_base_signals_backtest,
+    apply_filters,
+    get_coin_ml_params,
+)
 
 # pastikan bisa import modul project
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -80,7 +85,14 @@ nrt.CoinTrader._enter_position = _enter_wrap
 nrt.CoinTrader._exit_position = _exit_wrap
 
 
-def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int, balance: float) -> tuple[dict, pd.DataFrame]:
+def run_dry(
+    symbol: str,
+    csv_path: str,
+    coin_config_path: str,
+    steps_limit: int,
+    balance: float,
+    debug_reasons: bool = False,
+) -> tuple[dict, pd.DataFrame, pd.DataFrame | None]:
     df = pd.read_csv(csv_path)
     if "timestamp" not in df.columns:
         if "open_time" in df.columns:
@@ -100,6 +112,7 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
     trader = mgr.traders[symbol]
     trader._log = lambda *args, **kwargs: None  # matikan log biar cepat
     trader._journal = []
+    reasons_rows: list[dict] = [] if debug_reasons else []
 
     # Pre-fit ML sekali di warmup (opsional, untuk speed)
     try:
@@ -126,6 +139,67 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
             # fallback aman
             last_close_s = int(pd.Timestamp.utcnow().tz_localize("UTC").timestamp())
         trader.check_trading_signals(sub, balance, now_ts=last_close_s)
+
+        if debug_reasons:
+            ind = nrt.calculate_indicators(sub, heikin=bool(trader.config.get('heikin', False)))
+            last_ind = ind.iloc[-1]
+            atr_ok, body_ok, meta = apply_filters(last_ind, trader.config)
+            long_base0, short_base0 = compute_base_signals_backtest(ind, trader.config)
+            up_prob = trader.ml.predict_up_prob(ind) if trader.ml.use_ml else None
+            if up_prob is not None:
+                try:
+                    up_prob = float(up_prob)
+                except Exception:
+                    up_prob = float(up_prob)
+            params = get_coin_ml_params(symbol, {symbol: trader.config})
+            long_base = long_base0 and atr_ok and body_ok
+            short_base = short_base0 and atr_ok and body_ok
+            score_long = 1.0 if long_base else 0.0
+            score_short = 1.0 if short_base else 0.0
+            if params["enabled"] and up_prob is not None:
+                if long_base and up_prob >= params["up_prob"]:
+                    score_long += params["weight"]
+                if short_base and up_prob <= params["down_prob"]:
+                    score_short += params["weight"]
+            thr = params["score_threshold"]
+            if not params["strict"] and up_prob is None:
+                thr = 1.0
+            decision_dbg = None
+            if score_long >= thr and score_long > score_short:
+                decision_dbg = "LONG"
+            elif score_short >= thr and score_short > score_long:
+                decision_dbg = "SHORT"
+            ts_iso = pd.to_datetime(last_ts, utc=True).isoformat()
+            for side, base_flag in (("LONG", long_base0), ("SHORT", short_base0)):
+                if base_flag and decision_dbg != side:
+                    reasons = []
+                    if not atr_ok:
+                        reasons.append("ATR")
+                    if not body_ok:
+                        reasons.append("BODY")
+                    if params["enabled"]:
+                        if up_prob is None:
+                            if params["strict"]:
+                                reasons.append("ML_WARM")
+                        else:
+                            if side == "LONG" and up_prob < params["up_prob"]:
+                                reasons.append("ML")
+                            if side == "SHORT" and up_prob > params["down_prob"]:
+                                reasons.append("ML")
+                    reasons_rows.append(
+                        {
+                            "timestamp": ts_iso,
+                            "side": side,
+                            "atr_ok": atr_ok,
+                            "body_ok": body_ok,
+                            "base_long": bool(long_base0),
+                            "base_short": bool(short_base0),
+                            "ml_prob": up_prob,
+                            "score_long": score_long,
+                            "score_short": score_short,
+                            "reason_list": ";".join(reasons) if reasons else "-",
+                        }
+                    )
         steps += 1
     elapsed = time.time() - t0
 
@@ -191,7 +265,8 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
         "avg_pnl": round(float(avg_pnl), 6),
         "elapsed_sec": round(elapsed, 2),
     }
-    return summary, closed_df
+    reasons_df = pd.DataFrame(reasons_rows) if debug_reasons else None
+    return summary, closed_df, reasons_df
 
 
 def main():
@@ -206,6 +281,7 @@ def main():
     ap.add_argument("--ml-thr", type=float, default=None, help="Threshold odds ML (1.0=OR, 2.0=AND)")
     ap.add_argument("--trailing-step", type=float, default=None)
     ap.add_argument("--trailing-trigger", type=float, default=None)
+    ap.add_argument("--debug-reasons", action="store_true")
     args = ap.parse_args()
 
     # saran env untuk speed
@@ -237,7 +313,14 @@ def main():
             json.dump(cfg, f)
         cfg_path = tmp_cfg_path
 
-    summary, trades_df = run_dry(args.symbol.upper(), args.csv, cfg_path, args.steps, args.balance)
+    summary, trades_df, reasons_df = run_dry(
+        args.symbol.upper(),
+        args.csv,
+        cfg_path,
+        args.steps,
+        args.balance,
+        debug_reasons=args.debug_reasons,
+    )
 
     print("\n=== SUMMARY ===")
     for k, v in summary.items():
@@ -246,6 +329,14 @@ def main():
     if args.out and not trades_df.empty:
         trades_df.to_csv(args.out, index=False)
         print(f"\nTrades saved to: {args.out}")
+        if args.debug_reasons and reasons_df is not None and not reasons_df.empty:
+            reason_out = args.out.replace(".csv", "_reasons.csv")
+            reasons_df.to_csv(reason_out, index=False)
+            print(f"Reasons saved to: {reason_out}")
+    elif args.debug_reasons and reasons_df is not None and not reasons_df.empty:
+        reason_out = f"{args.symbol.upper()}_reasons.csv"
+        reasons_df.to_csv(reason_out, index=False)
+        print(f"Reasons saved to: {reason_out}")
 
 if __name__ == "__main__":
     main()
