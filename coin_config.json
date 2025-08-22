@@ -1,10 +1,12 @@
 {
   "SYMBOL_DEFAULTS": {
+    "rsi_mode": "PULLBACK",
     "filters": {
       "atr": true,
       "body": true,
       "min_atr_threshold": 0.00,
-      "max_body_over_atr": 9.99
+      "max_body_over_atr": 9.99,
+      "min_bb_width": 0.0
     }
   },
   "ADAUSDT": {

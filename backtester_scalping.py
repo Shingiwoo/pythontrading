@@ -397,7 +397,7 @@ if selected_file:
         # Manage
         if in_position and entry is not None and qty > 0:
             # Breakeven
-            if bool(use_breakeven):
+            if bool(use_breakeven) and position_type:
                 sl = apply_breakeven_sl(
                     side=position_type,
                     entry=entry,
