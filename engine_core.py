@@ -139,16 +139,18 @@ def load_coin_config(path: str) -> Dict[str, Any]:
 
 def merge_config(symbol: str, base_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Gabungkan SYMBOL_DEFAULTS -> override oleh config per-simbol.
-    Termasuk merge nested 'filters'.
+    Merge SYMBOL_DEFAULTS -> override oleh config per-simbol.
+    Termasuk nested 'filters'.
     """
     merged: Dict[str, Any] = {}
     if isinstance(base_cfg, dict):
-        merged.update(base_cfg.get("SYMBOL_DEFAULTS", {}))
+        # base defaults
+        merged.update(base_cfg.get("SYMBOL_DEFAULTS", {}) or {})
+        # per-symbol overrides
         sym_cfg = base_cfg.get(symbol, {}) if isinstance(symbol, str) else {}
-        # merge 'filters' nested
-        f = dict(merged.get("filters", {}))
-        f.update(sym_cfg.get("filters", {}))
+        # gabung nested filters
+        f = dict(merged.get("filters", {}) or {})
+        f.update(sym_cfg.get("filters", {}) or {})
         merged.update({k: v for k, v in sym_cfg.items() if k != "filters"})
         if f:
             merged["filters"] = f
@@ -341,7 +343,7 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
     max_atr = _to_float(coin_cfg.get('max_atr_pct', 1.0), 1.0)
     max_body = _to_float(coin_cfg.get('max_body_atr', 999.0), 999.0)
     min_bb = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
-    # default-kan OFF; hormati alias lama 'atr'/'body' jika ada
+    # Default-kan OFF; hormati alias lama 'atr'/'body' hanya jika diset eksplisit.
     atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled',
                                filters_cfg.get('atr', False)))
     body_filter_enabled = bool(filters_cfg.get('body_filter_enabled',

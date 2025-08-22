@@ -112,14 +112,12 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
     steps = 0
     for i in range(start_i, min(len(df), start_i + args.steps)):
         sub = df.iloc[: i + 1].copy()
-        # ambil epoch detik dari bar terakhir (virtual clock backtest)
-        last_ts = sub['timestamp'].iloc[-1]
+        # pakai jam virtual dari bar terakhir (epoch detik UTC)
         try:
-            # dukung berbagai tipe ts (pandas/np/datetime)
-            bar_ts = pd.Timestamp(last_ts).to_pydatetime().timestamp()
+            now_ts = int(pd.to_datetime(sub["timestamp"].iloc[-1]).tz_convert("UTC").timestamp())
         except Exception:
-            bar_ts = float(pd.to_datetime(last_ts).timestamp())
-        trader.check_trading_signals(sub, args.balance, now_ts=float(bar_ts))
+            now_ts = int(pd.to_datetime(sub["timestamp"].iloc[-1], utc=True).timestamp())
+        trader.check_trading_signals(sub, args.balance, now_ts=now_ts)
         steps += 1
     elapsed = time.time() - t0
 
