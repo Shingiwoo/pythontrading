@@ -96,8 +96,8 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
     t0 = time.time()
     steps = 0
     for i in range(start_i, min(len(df), start_i + steps_limit)):
-        data_map = {symbol: df.iloc[: i + 1].copy()}
-        mgr.run_once(data_map, {symbol: balance})
+        sub = df.iloc[: i + 1].copy()
+        trader.check_trading_signals(sub, balance)
         steps += 1
     elapsed = time.time() - t0
 
