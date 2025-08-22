@@ -411,6 +411,7 @@ class CoinTrader:
         self._last_seen_len = None            # legacy (tidak dipakai lagi untuk skip)
         self.last_bar_close_ts = None         # <- tambah: jejak bar terakhir (UTC close timestamp)
         self.startup_skip_bars = int(self.config.get('startup_skip_bars', 2))
+        self._now_ts: Optional[float] = None  # virtual clock utk backtest
         self.post_restart_skip_entries_bars = int(self.config.get('post_restart_skip_entries_bars', 1))
         self.pending_skip_entries = self.startup_skip_bars
         self.rehydrated = False
@@ -422,6 +423,16 @@ class CoinTrader:
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
             print(f"[{self.instance_id}:{self.symbol}] {pd.Timestamp.utcnow().isoformat()} | {msg}")
+
+    def _cooldown_active(self, now_ts: Optional[float] = None) -> bool:
+        """Cooldown berbasis epoch detik; dukung virtual clock saat backtest."""
+        ts_now = float(now_ts) if now_ts is not None else time.time()
+        return bool(self.cooldown_until_ts and ts_now < float(self.cooldown_until_ts))
+
+    def _to_dt(self, now_ts: Optional[float] = None) -> pd.Timestamp:
+        if now_ts is None:
+            return pd.Timestamp.utcnow()
+        return pd.to_datetime(int(now_ts), unit='s', utc=True)  # aman untuk epoch detik
 
     def _clamp_pos(self, x: float, min_x: float = 1e-9) -> float:
         return x if (x is not None and x > min_x) else min_x
@@ -571,12 +582,8 @@ class CoinTrader:
                         cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
                         self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True, client_id=cid)
 
-    def _cooldown_active(self) -> bool:
-        return bool(self.cooldown_until_ts and time.time() < self.cooldown_until_ts)
 
-    def _enter_position(self, side: str, price: float, atr: float, available_balance: float) -> float:
-        if self._cooldown_active():
-            return 0.0
+    def _enter_position(self, side: str, price: float, atr: float, available_balance: float, **kw) -> float:
         if self.exec and self.account_guard and self.exec.has_position(self.symbol):
             self._log("SKIP entry: posisi masih terbuka di akun")
             return 0.0
@@ -648,7 +655,8 @@ class CoinTrader:
         if not math.isfinite(dist) or dist <= eps:
             self._log(f"SKIP entry: SL==entry (dist={dist:.12f})")
             return 0.0
-        self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=pd.Timestamp.utcnow())
+        now_ts = kw.get("now_ts", None)
+        self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=self._to_dt(now_ts))
 
         try:
             cid = f"x-{os.getenv('INSTANCE_ID', 'bot')}-{self.symbol}-{uuid4().hex[:8]}"
@@ -688,7 +696,7 @@ class CoinTrader:
                 return True, 'Hit Hard SL'
         return False, None
 
-    def _exit_position(self, price: float, reason: str) -> None:
+    def _exit_position(self, price: float, reason: str = 'Exit', **kw) -> None:
         if self.exec and self.pos.side and self.pos.qty:
             try:
                 self.exec.cancel_all(self.symbol)
@@ -708,13 +716,15 @@ class CoinTrader:
         elif 'Max hold' in (reason or '') or 'early' in (reason or '').lower():
             mul = _to_float(self.config.get('cooldown_mul_early_stop', 1.0), 1.0)
         cd = max(0, int(base_cd * mul))
-        self.cooldown_until_ts = time.time() + cd
+        base = float(kw.get('now_ts', time.time()))
+        self.cooldown_until_ts = base + cd
         try:
             self._log(f"COOLDOWN until {pd.Timestamp.utcfromtimestamp(self.cooldown_until_ts).isoformat()}")
         except Exception:
             pass
 
-    def check_trading_signals(self, df_raw: pd.DataFrame, available_balance: float) -> float:
+    def check_trading_signals(self, df_raw: pd.DataFrame, available_balance: float, *, now_ts: Optional[float] = None) -> float:
+        self._now_ts = now_ts
         if df_raw is None or df_raw.empty:
             return 0.0
         heikin = _to_bool(self.config.get('heikin', False), False)
@@ -739,6 +749,12 @@ class CoinTrader:
             if up_prob is not None:
                 up_prob = to_scalar(up_prob)
 
+        # ---- Cooldown berdasar virtual clock ----
+        if self._cooldown_active(now_ts):
+            if self.verbose:
+                print(f"[{self.symbol}] COOLDOWN aktif s/d {pd.to_datetime(self.cooldown_until_ts, unit='s', utc=True)}")
+            return 0.0
+
         try:
             if self.pending_skip_entries > 0:
                 self._apply_breakeven(price)
@@ -750,7 +766,7 @@ class CoinTrader:
                 self._update_trailing(price)
                 ex, rs = self._should_exit(price)
                 if ex:
-                    self._exit_position(price, rs or 'Exit')
+                    self._exit_position(price, rs or 'Exit', now_ts=now_ts)
                     return 0.0
 
             filters_cfg = (self.config.get('filters') if isinstance(self.config.get('filters'), dict) else {}) or {}
@@ -828,7 +844,7 @@ class CoinTrader:
                 self._update_trailing(price)
                 ex, reason = self._should_exit(price)
                 if ex:
-                    self._exit_position(price, reason or 'Exit')
+                    self._exit_position(price, reason or 'Exit', now_ts=now_ts)
                     return 0.0
 
             # ---- Time-stop (selaras backtest) ----
@@ -836,7 +852,8 @@ class CoinTrader:
             min_roi  = _to_float(self.config.get("min_roi_to_close_by_time", DEFAULTS.get("min_roi_to_close_by_time", 0.005)), 0.005)
 
             if self.pos.side and self.pos.entry_time and max_hold > 0:
-                elapsed = (pd.Timestamp.utcnow() - self.pos.entry_time).total_seconds()
+                now_dt = self._to_dt(now_ts)
+                elapsed = (now_dt - self.pos.entry_time).total_seconds()
                 lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
                 if self.pos.entry is not None and self.pos.qty is not None:
                     init_margin = safe_div((self.pos.entry * self.pos.qty), lev)
@@ -849,24 +866,24 @@ class CoinTrader:
                     if elapsed >= max_hold:
                         if only_if_loss:
                             if roi_frac <= 0:
-                                self._exit_position(price, f"Max hold reached (loss, ROI {roi_frac*100:.2f}%)")
+                                self._exit_position(price, f"Max hold reached (loss, ROI {roi_frac*100:.2f}% )", now_ts=now_ts)
                                 return 0.0
                             else:
-                                self.pos.entry_time = pd.Timestamp.utcnow()
+                                self.pos.entry_time = now_dt
                         else:
                             if roi_frac >= min_roi:
-                                self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)")
+                                self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)", now_ts=now_ts)
                                 return 0.0
                             else:
-                                self.pos.entry_time = pd.Timestamp.utcnow()
+                                self.pos.entry_time = now_dt
             # --------------------------------------
             used = 0.0
             # Entry baru
-            if not self.pos.side and not self._cooldown_active():
+            if not self.pos.side and not self._cooldown_active(now_ts):
                 if long_sig:
-                    used = self._enter_position('LONG', price, atr, available_balance)
+                    used = self._enter_position('LONG', price, atr, available_balance, now_ts=now_ts)
                 elif short_sig:
-                    used = self._enter_position('SHORT', price, atr, available_balance)
+                    used = self._enter_position('SHORT', price, atr, available_balance, now_ts=now_ts)
             return used or 0.0
         except ZeroDivisionError as e:
             self._log(f"[{self.symbol}] ZDIV DIAG: price={price} atr={atr} entry={getattr(self.pos,'entry',None)} step={self.config.get('trailing_step')}")
