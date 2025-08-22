@@ -400,6 +400,9 @@ class CoinTrader:
         self.config = config
         self.ml = MLSignal(self.config)
         self.pos = Position()
+        self._entry_count: int = 0
+        self._exit_count: int = 0
+        self._last_used_margin: float = 0.0
         self.cooldown_until_ts: Optional[float] = None
         self.instance_id = instance_id
         self.account_guard = account_guard
