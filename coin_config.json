@@ -96,7 +96,8 @@
     "no_cooldown_on_profit": 1
   },
   "ADAUSDT": {
-    "use_preset": "SCALP-ADA-15M-STRICT",
+    "use_preset": "SCALP-ADA-15M",
+    "rsi_mode": "PULLBACK",
     "leverage": 15,
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,

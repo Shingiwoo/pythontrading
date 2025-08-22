@@ -134,15 +134,10 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
         trader._last_used_margin = used
         return used
 
-    def _exit_wrap(price, reason, **kw):
+    def _exit_wrap(price: float, reason: str = "Exit", **kw) -> None:
         pos = trader.pos
         ts = kw.get("now_ts", None)
-        exit_time = pd.Timestamp.utcnow()
-        if ts is not None:
-            try:
-                exit_time = pd.to_datetime(int(ts), unit="s", utc=True)  # type: ignore[arg-type]
-            except Exception:
-                pass
+        exit_time = nrt._to_dt_safe(ts)
         if pos.side and pos.entry and pos.qty:
             pnl, roi = pnl_net(pos.side, float(pos.entry), float(price), float(pos.qty), args.fee_bps, args.slip_bps)
             trades.append({
@@ -159,7 +154,7 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
                 "exit_time": exit_time,
             })
         trader._exit_count += 1
-        _orig_exit(price, reason, **kw)
+        return _orig_exit(price, reason, **kw)
 
     trader._enter_position = _enter_wrap
     trader._exit_position = _exit_wrap
