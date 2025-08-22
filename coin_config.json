@@ -28,12 +28,12 @@
       "time_stop_only_if_loss": 0,
       "min_roi_to_close_by_time": -1.0,
       "ml": {
-        "enabled": false,
+        "enabled": true,
         "strict": false,
-        "up_prob_long": 0.60,
-        "down_prob_short": 0.40,
-        "score_threshold": 1.00,
-        "weight": 1.0
+        "up_prob_long": 0.55,
+        "down_prob_short": 0.45,
+        "score_threshold": 2.0,
+        "weight": 1.5
       },
       "filters": {
         "atr_filter_enabled": false,
@@ -80,6 +80,15 @@
         "min_bb_width": 0.0
       },
       "ml": { "enabled": true, "strict": false, "score_threshold": 2.0, "weight": 1.5 }
+    },
+    "SCALP-ADA-15M-STRICT-HTF1H": {
+      "use_macd_confirm": true,
+      "rsi_mode": "PULLBACK",
+      "rsi_long_max": 45.0,
+      "rsi_short_min": 60.0,
+      "use_htf_filter": 1,
+      "htf": "1h",
+      "ml": { "enabled": true, "strict": false, "score_threshold": 2.0, "weight": 1.5 }
     }
   },
   "SYMBOL_DEFAULTS": {
@@ -93,7 +102,8 @@
     },
     "cooldown_seconds": 900,
     "min_bars_between_entries": 2,
-    "no_cooldown_on_profit": 1
+    "no_cooldown_on_profit": 1,
+    "use_htf_filter": 0
   },
   "ADAUSDT": {
     "use_preset": "SCALP-ADA-15M-STRICT",
@@ -187,10 +197,12 @@
       ]
     },
     "ml": {
+      "enabled": true,
       "strict": true,
       "up_prob_long": 0.55,
       "down_prob_short": 0.45,
-      "score_threshold": 1.2
+      "score_threshold": 2.0,
+      "weight": 1.5
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
@@ -247,10 +259,12 @@
       ]
     },
     "ml": {
+      "enabled": true,
       "strict": true,
       "up_prob_long": 0.55,
       "down_prob_short": 0.45,
-      "score_threshold": 1.0
+      "score_threshold": 2.0,
+      "weight": 1.5
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
@@ -307,10 +321,12 @@
       ]
     },
     "ml": {
+      "enabled": true,
       "strict": true,
       "up_prob_long": 0.55,
       "down_prob_short": 0.45,
-      "score_threshold": 1.0
+      "score_threshold": 2.0,
+      "weight": 1.5
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
@@ -367,10 +383,12 @@
       ]
     },
     "ml": {
+      "enabled": true,
       "strict": true,
       "up_prob_long": 0.55,
       "down_prob_short": 0.45,
-      "score_threshold": 1.0
+      "score_threshold": 2.0,
+      "weight": 1.5
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,
@@ -427,10 +445,12 @@
       ]
     },
     "ml": {
+      "enabled": true,
       "strict": true,
       "up_prob_long": 0.55,
       "down_prob_short": 0.45,
-      "score_threshold": 1.0
+      "score_threshold": 2.0,
+      "weight": 1.5
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,

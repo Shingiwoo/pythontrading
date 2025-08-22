@@ -14,7 +14,7 @@ python tools_dryrun_summary.py \
   --out ADA_dryrun_trades_500.csv
 
 Tips percepat:
-export USE_ML=1; export SCORE_THRESHOLD=1.2; export ML_RETRAIN_EVERY=5000
+export USE_ML=1; export SCORE_THRESHOLD=2.0; export ML_RETRAIN_EVERY=120; export ML_WEIGHT=1.5
 """
 from __future__ import annotations
 import os, sys, time, argparse, json
@@ -154,9 +154,10 @@ def main():
 
     # saran env untuk speed
     os.environ.setdefault("USE_ML", "1")
-    os.environ.setdefault("SCORE_THRESHOLD", "1.0")
+    os.environ.setdefault("SCORE_THRESHOLD", "2.0")
     os.environ.setdefault("ML_MIN_TRAIN_BARS", "400")
-    os.environ.setdefault("ML_RETRAIN_EVERY", "5000")
+    os.environ.setdefault("ML_RETRAIN_EVERY", "120")
+    os.environ.setdefault("ML_WEIGHT", "1.5")
 
     if args.use_ml is not None:
         os.environ["USE_ML"] = str(int(args.use_ml))
