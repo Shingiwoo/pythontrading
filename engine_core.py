@@ -253,11 +253,10 @@ def _rsi_midrange(rsi: float, side: str) -> bool:
 
 def compute_base_signals(df: pd.DataFrame, coin_cfg: Dict[str, Any] | None = None) -> tuple[bool, bool]:
     """
-    Hitung sinyal dasar berbasis tren EMA vs SMA + rentang RSI.
-    (OPSI) Konfirmasi MACD jika diaktifkan pada config:
+    Hitung sinyal dasar: tren (EMA22 vs MA22) + RSI mode (PULLBACK/MIDRANGE).
+    (Opsional) Konfirmasi MACD jika `use_macd_confirm` = True:
       - LONG: macd > macd_signal
       - SHORT: macd < macd_signal
-    rsi_mode default PULLBACK.
     """
     coin_cfg = coin_cfg or {}
     last = df.iloc[-1]
@@ -274,14 +273,16 @@ def compute_base_signals(df: pd.DataFrame, coin_cfg: Dict[str, Any] | None = Non
         long_ok = trend_up and _rsi_pullback(rsi_now, 'LONG')
         short_ok = trend_dn and _rsi_pullback(rsi_now, 'SHORT')
     # (opsional) MACD confirm
-    if bool(coin_cfg.get("use_macd_confirm", True)):
+    if bool(coin_cfg.get("use_macd_confirm", False)):
         macd_val = float(last.get('macd', 0.0))
         macd_sig = float(last.get('macd_signal', 0.0))
         long_ok  = bool(long_ok  and (macd_val > macd_sig))
         short_ok = bool(short_ok and (macd_val < macd_sig))
 
     logging.getLogger(__name__).info(
-        f"BASE ema22={ema:.6f} ma22={ma:.6f} rsi={rsi_now:.2f} mode={mode} macd={float(last.get('macd',0)):.6f}/{float(last.get('macd_signal',0)):.6f} -> L={long_ok} S={short_ok}"
+        f"BASE ema22={ema:.6f} ma22={ma:.6f} rsi={rsi_now:.2f} "
+        f"mode={mode} macd={float(last.get('macd',0)):.6f}/{float(last.get('macd_signal',0)):.6f} "
+        f"-> L={long_ok} S={short_ok}"
     )
     return bool(long_ok), bool(short_ok)
 
