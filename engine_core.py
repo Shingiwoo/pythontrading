@@ -253,36 +253,38 @@ def _rsi_midrange(rsi: float, side: str) -> bool:
 
 def compute_base_signals(df: pd.DataFrame, coin_cfg: Dict[str, Any] | None = None) -> tuple[bool, bool]:
     """
-    Hitung sinyal dasar: tren (EMA22 vs MA22) + RSI mode (PULLBACK/MIDRANGE).
-    (Opsional) Konfirmasi MACD jika `use_macd_confirm` = True:
-      - LONG: macd > macd_signal
-      - SHORT: macd < macd_signal
+    Sinyal dasar:
+      - Arah tren: EMA22 vs MA22
+      - Konfirmasi RSI (parametris via coin_cfg): rsi_long_max / rsi_short_min
+      - (Opsional) Konfirmasi MACD (use_macd_confirm)
     """
     coin_cfg = coin_cfg or {}
     last = df.iloc[-1]
-    ema = last.get('ema_22', 0)
-    ma = last.get('ma_22', 0)
+    ema = float(last.get('ema_22', 0))
+    ma  = float(last.get('ma_22', 0))
     rsi_now = float(last.get('rsi', 50))
     trend_up = ema > ma
     trend_dn = ema < ma
+    # Threshold dari config (default seperti backtest lama)
+    rsi_long_max  = float(coin_cfg.get('rsi_long_max', 45.0))
+    rsi_short_min = float(coin_cfg.get('rsi_short_min', 70.0))
+    use_macd = bool(coin_cfg.get('use_macd_confirm', False))
+    macd_now = float(last.get('macd', 0.0))
+    macd_sig = float(last.get('macd_signal', 0.0))
     mode = str(coin_cfg.get('rsi_mode', 'PULLBACK')).upper()
+    # Mode RSI
     if mode == 'MIDRANGE':
         long_ok = trend_up and _rsi_midrange(rsi_now, 'LONG')
         short_ok = trend_dn and _rsi_midrange(rsi_now, 'SHORT')
     else:
-        long_ok = trend_up and _rsi_pullback(rsi_now, 'LONG')
-        short_ok = trend_dn and _rsi_pullback(rsi_now, 'SHORT')
-    # (opsional) MACD confirm
-    if bool(coin_cfg.get("use_macd_confirm", False)):
-        macd_val = float(last.get('macd', 0.0))
-        macd_sig = float(last.get('macd_signal', 0.0))
-        long_ok  = bool(long_ok  and (macd_val > macd_sig))
-        short_ok = bool(short_ok and (macd_val < macd_sig))
-
+        long_ok = trend_up and (rsi_now <= rsi_long_max)
+        short_ok = trend_dn and (rsi_now >= rsi_short_min)
+    # Opsional MACD
+    if use_macd:
+        long_ok  = bool(long_ok  and (macd_now > macd_sig))
+        short_ok = bool(short_ok and (macd_now < macd_sig))
     logging.getLogger(__name__).info(
-        f"BASE ema22={ema:.6f} ma22={ma:.6f} rsi={rsi_now:.2f} "
-        f"mode={mode} macd={float(last.get('macd',0)):.6f}/{float(last.get('macd_signal',0)):.6f} "
-        f"-> L={long_ok} S={short_ok}"
+        f"BASE ema22={ema:.6f} ma22={ma:.6f} rsi={rsi_now:.2f} mode={mode} macd_ok={use_macd} -> L={long_ok} S={short_ok}"
     )
     return bool(long_ok), bool(short_ok)
 
