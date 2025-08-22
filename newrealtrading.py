@@ -813,6 +813,11 @@ class CoinTrader:
             up_prob = self.ml.predict_up_prob(df)
             if up_prob is not None:
                 up_prob = to_scalar(up_prob)
+        if up_prob is None and 'ml_signal' in df_raw.columns:
+            try:
+                up_prob = 0.60 if int(df_raw.iloc[-1]['ml_signal']) == 1 else 0.40
+            except Exception:
+                up_prob = None
 
         # ---- Cooldown berdasar virtual clock ----
         if self._cooldown_active(now_ts):

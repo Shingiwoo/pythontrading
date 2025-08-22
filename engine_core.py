@@ -343,21 +343,23 @@ def make_decision(
     last = df.iloc[-1]
     if atr_ok is None or body_ok is None or meta is None:
         atr_ok, body_ok, meta = apply_filters(last, coin_cfg)
-    if not atr_ok or not body_ok:
-        return None
 
     long_base = long_base and atr_ok and body_ok
     short_base = short_base and atr_ok and body_ok
 
     score_long = 1.0 if long_base else 0.0
     score_short = 1.0 if short_base else 0.0
-    if params["enabled"] and ml_up_prob is not None:
+    ml_ready = (ml_up_prob is not None)
+    if params["enabled"] and ml_ready:
         if long_base and ml_up_prob >= params["up_prob"]:
             score_long += params["weight"]
         if short_base and ml_up_prob <= params["down_prob"]:
             score_short += params["weight"]
+    # Fallback: jika strict=False & ML belum siap → izinkan base-only (thr=1.0)
     thr = params["score_threshold"]
-    if params["strict"] and ml_up_prob is None:
+    if not params["strict"] and not ml_ready:
+        thr = 1.0
+    if params["strict"] and not ml_ready:
         logging.getLogger(__name__).info(f"[{symbol}] ML_WARMUP: menunda hingga model siap (strict).")
         return None
     decision = None
