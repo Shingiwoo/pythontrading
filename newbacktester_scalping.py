@@ -37,13 +37,17 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
     # (opsi) merge preset
     preset_name = args.preset or sym_cfg.get("use_preset") or (cfg.get("PRESETS") and "SCALP-ADA-15M-LEGACY")
     if preset_name and isinstance(cfg.get("PRESETS"), dict) and preset_name in cfg.get("PRESETS", {}):
+        # Jika preset dipilih via CLI, PRESET harus MENANG atas symbol config
         base_p = dict(cfg["PRESETS"][preset_name])
-        merged = {**base_p, **sym_cfg}
-        for k in ("filters", "ml"):
-            if k in base_p or k in sym_cfg:
-                mk = dict(base_p.get(k, {}))
-                mk.update(sym_cfg.get(k, {}))
-                merged[k] = mk
+        merged = dict(sym_cfg)
+        # deep-merge: kunci preset override symbol (termasuk nested filters/ml)
+        for k, v in base_p.items():
+            if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                nv = dict(merged.get(k, {}))
+                nv.update(v)           # preset override
+                merged[k] = nv
+            else:
+                merged[k] = v
         sym_cfg = merged
     else:
         # Fallback: jika args.preset diminta tapi tidak ada, kembali ke use_preset atau LEGACY
@@ -66,6 +70,14 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
         sym_cfg["cooldown_seconds"] = int(args.cooldown)
     sym_cfg["taker_fee"] = float(args.fee_bps) / 10000.0
     sym_cfg["SLIPPAGE_PCT"] = float(args.slip_bps) * 0.01
+    # Paksa OFF filter bila diminta dari CLI
+    fcfg = sym_cfg.setdefault("filters", {})
+    if args.no_atr_filter:
+        fcfg["atr_filter_enabled"] = False
+        fcfg["atr"] = False
+    if args.no_body_filter:
+        fcfg["body_filter_enabled"] = False
+        fcfg["body"] = False
     if args.htf:
         sym_cfg["use_htf_filter"] = 1
         sym_cfg["htf"] = args.htf
