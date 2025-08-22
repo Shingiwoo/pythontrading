@@ -34,6 +34,13 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
     with open(args.coin_config, "r") as f:
         cfg = json.load(f)
     sym_cfg = cfg.get(args.symbol, {})
+    # (opsi) merge preset dari coin_config["PRESETS"]
+    preset_name = args.preset or sym_cfg.get("use_preset")
+    if preset_name and isinstance(cfg.get("PRESETS"), dict) and preset_name in cfg["PRESETS"]:
+        p = dict(cfg["PRESETS"][preset_name])
+        # preset sebagai base, lalu override oleh per-simbol
+        merged = {**p, **sym_cfg}
+        sym_cfg = merged
     sym_cfg["heikin"] = bool(args.heikin)
     sym_cfg["rsi_mode"] = args.rsi_mode
     sym_cfg["taker_fee"] = float(args.fee_bps) / 10000.0
@@ -167,6 +174,7 @@ def main():
     ap.add_argument("--ml-thr", type=float, default=2.0)
     ap.add_argument("--htf", default=None)
     ap.add_argument("--heikin", action="store_true")
+    ap.add_argument("--preset", default=os.getenv("BT_PRESET"), help="Nama preset di coin_config.json/`PRESETS`")
     ap.add_argument("--fee-bps", type=float, default=10.0)
     ap.add_argument("--slip-bps", type=float, default=0.0)
     ap.add_argument("--no-atr-filter", action="store_true")

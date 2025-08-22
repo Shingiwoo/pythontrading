@@ -1,10 +1,53 @@
 {
+  "PRESETS": {
+    "SCALP-ADA-15M": {
+      "heikin": false,
+      "rsi_mode": "PULLBACK",
+      "use_macd_confirm": true,
+      "use_htf_filter": 0,
+      "leverage": 15,
+      "risk_per_trade": 0.06,
+      "taker_fee": 0.0005,
+      "min_atr_pct": 0.003,
+      "max_atr_pct": 0.04,
+      "max_body_atr": 1.2,
+      "cooldown_seconds": 120,
+      "min_bars_between_entries": 0,
+      "no_cooldown_on_profit": 1,
+      "sl_mode": "ATR",
+      "sl_atr_mult": 1.7,
+      "sl_min_pct": 0.009,
+      "sl_max_pct": 0.035,
+      "use_breakeven": 1,
+      "be_trigger_pct": 0.0045,
+      "be_min_gap_pct": 0.0001,
+      "trailing_trigger": 0.7,
+      "trailing_step": 0.35,
+      "max_hold_seconds": 3600,
+      "time_stop_only_if_loss": 1,
+      "min_roi_to_close_by_time": 0.0,
+      "ml": {
+        "strict": true,
+        "up_prob_long": 0.6,
+        "down_prob_short": 0.4,
+        "score_threshold": 1.6,
+        "weight": 1.0
+      },
+      "filters": {
+        "atr_filter_enabled": true,
+        "body_filter_enabled": true,
+        "min_atr_threshold": 0.003,
+        "max_body_over_atr": 1.2,
+        "min_bb_width": 0.002
+      }
+    }
+  },
   "SYMBOL_DEFAULTS": {
     "rsi_mode": "PULLBACK",
     "filters": {
       "atr_filter_enabled": false,
       "body_filter_enabled": false,
-      "min_atr_threshold": 0.00,
+      "min_atr_threshold": 0.0,
       "max_body_over_atr": 9.99,
       "min_bb_width": 0.0
     },
@@ -20,7 +63,7 @@
     "margin_type": "ISOLATED",
     "startup_skip_bars": 0,
     "max_atr_pct": 0.04,
-    "max_body_atr": 2.50,
+    "max_body_atr": 2.5,
     "use_htf_filter": 0,
     "cooldown_seconds": 900,
     "sl_mode": "ATR",
@@ -70,7 +113,8 @@
     "quantityPrecision": 0,
     "minNotional": 5.0,
     "SLIPPAGE_PCT": 0.02,
-    "trailing_step_min": 1e-09
+    "trailing_step_min": 1e-09,
+    "use_preset": "SCALP-ADA-15M"
   },
   "DOGEUSDT": {
     "leverage": 15,
