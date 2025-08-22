@@ -30,6 +30,47 @@ except Exception:
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     import newrealtrading as nrt
 
+# Simpan method asli dan pasang wrapper yang tanda tangannya identik
+_orig_enter = nrt.CoinTrader._enter_position
+_orig_exit = nrt.CoinTrader._exit_position
+
+
+def _enter_wrap(self, side: str, price: float, atr: float, available_balance: float, **kw) -> float:
+    used_margin = _orig_enter(self, side, price, atr, available_balance, **kw)
+    try:
+        if used_margin and used_margin > 0:
+            self._journal.append(
+                {
+                    "t": "entry",
+                    "side": side,
+                    "price": float(price),
+                    "qty": float(self.pos.qty if self.pos and self.pos.qty else 0.0),
+                    "ts": int((kw.get("now_ts") or time.time())),
+                }
+            )
+    except Exception:
+        pass
+    return float(used_margin or 0.0)
+
+
+def _exit_wrap(self, price: float, reason: str = "Exit", **kw) -> None:
+    _orig_exit(self, price, reason, **kw)
+    try:
+        self._journal.append(
+            {
+                "t": "exit",
+                "reason": str(reason),
+                "price": float(price),
+                "ts": int((kw.get("now_ts") or time.time())),
+            }
+        )
+    except Exception:
+        pass
+
+
+nrt.CoinTrader._enter_position = _enter_wrap
+nrt.CoinTrader._exit_position = _exit_wrap
+
 
 def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int, balance: float) -> tuple[dict, pd.DataFrame]:
     df = pd.read_csv(csv_path)
@@ -38,7 +79,8 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
             df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
         elif "date" in df.columns:
             df["timestamp"] = pd.to_datetime(df["date"], errors="coerce")
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    # Pastikan semua timestamp UTC-aware agar konsisten di seluruh stack
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     # warmup supaya indikator & ML siap
@@ -49,6 +91,7 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
     mgr = nrt.TradingManager(coin_config_path, [symbol])
     trader = mgr.traders[symbol]
     trader._log = lambda *args, **kwargs: None  # matikan log biar cepat
+    trader._journal = []
 
     # Pre-fit ML sekali di warmup (opsional, untuk speed)
     try:
@@ -58,52 +101,54 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
     except Exception:
         pass
 
-    # Hook kumpulkan trades
-    trades: list[dict] = []
-    orig_enter = trader._enter_position
-    orig_exit = trader._exit_position
-
-    def _enter_wrap(side: str, price: float, atr: float, available_balance: float, **kw) -> float:
-        ok = orig_enter(side, price, atr, available_balance, **kw)
-        if ok and trader.pos.side:
-            trades.append({
-                "entry_ts": trader.pos.entry_time.isoformat() if trader.pos.entry_time is not None else None,
-                "side": trader.pos.side,
-                "entry": trader.pos.entry,
-                "qty": trader.pos.qty,
-                "sl_init": trader.pos.sl,
-                "tsl_init": trader.pos.trailing_sl,
-            })
-        return ok
-
-    def _exit_wrap(price: float, reason: str = "Exit", **kw) -> None:
-        before = trades[-1] if trades else None
-        orig_exit(price, reason, **kw)
-        if before and before.get("exit") is None:
-            before["exit_ts"] = pd.Timestamp.utcnow().isoformat()
-            before["exit"] = price
-            before["reason"] = reason
-            before["pnl"] = (
-                (price - before["entry"]) * before["qty"]
-                if before["side"] == "LONG"
-                else (before["entry"] - price) * before["qty"]
-            )
-
-    trader._enter_position = _enter_wrap
-    trader._exit_position = _exit_wrap
 
     # Replay loop
     t0 = time.time()
     steps = 0
-    for i in range(start_i, min(len(df), start_i + steps_limit)):
+    for i in range(start_i, min(len(df) - 1, start_i + steps_limit)):
         sub = df.iloc[: i + 1].copy()
-        trader.check_trading_signals(sub, balance)
+        # ambil close time bar terakhir sebagai jam virtual
+        last_ts = sub["timestamp"].iloc[-1]
+        try:
+            if isinstance(last_ts, pd.Timestamp):
+                last_close_s = int(last_ts.tz_convert("UTC").timestamp())
+            else:
+                last_close_s = int(pd.to_datetime(last_ts, utc=True).timestamp())
+        except Exception:
+            # fallback aman
+            last_close_s = int(pd.Timestamp.utcnow().tz_localize("UTC").timestamp())
+        trader.check_trading_signals(sub, balance, now_ts=last_close_s)
         steps += 1
     elapsed = time.time() - t0
 
     # Ringkasan
+    events = getattr(trader, "_journal", [])
+    trades: list[dict] = []
+    current = None
+    for ev in events:
+        if ev.get("t") == "entry":
+            current = ev
+        elif ev.get("t") == "exit" and current:
+            trades.append(
+                {
+                    "entry_ts": pd.to_datetime(current["ts"], unit="s", utc=True).isoformat(),
+                    "side": current.get("side"),
+                    "entry": current.get("price"),
+                    "qty": current.get("qty", 0.0),
+                    "exit_ts": pd.to_datetime(ev["ts"], unit="s", utc=True).isoformat(),
+                    "exit": ev.get("price"),
+                    "reason": ev.get("reason", "Exit"),
+                    "pnl": (
+                        (ev.get("price") - current.get("price")) * current.get("qty", 0.0)
+                        if current.get("side") == "LONG"
+                        else (current.get("price") - ev.get("price")) * current.get("qty", 0.0)
+                    ),
+                }
+            )
+            current = None
+
     trades_df = pd.DataFrame(trades)
-    closed_df = trades_df.dropna(subset=["exit"]) if not trades_df.empty else trades_df
+    closed_df = trades_df
     if not closed_df.empty:
         wins = (closed_df["pnl"] > 0).sum()
         losses = (closed_df["pnl"] <= 0).sum()
@@ -121,8 +166,8 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
         wr = 0.0
         avg_pnl = 0.0
 
-    entries = len(trades)
-    exits = len(closed_df)
+    entries = sum(1 for ev in events if ev.get("t") == "entry")
+    exits = sum(1 for ev in events if ev.get("t") == "exit")
 
     summary = {
         "symbol": symbol,
@@ -132,7 +177,7 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
         "entries": entries,
         "exits": exits,
         "last_position": trader.pos.side,
-        "trades": exits,
+        "trades": len(closed_df),
         "win_rate_pct": round(float(wr), 2),
         "profit_factor": float(pf) if pf == np.inf else (round(float(pf), 2) if not np.isnan(pf) else None),
         "avg_pnl": round(float(avg_pnl), 6),
