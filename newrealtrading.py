@@ -765,6 +765,12 @@ class CoinTrader:
             body_ok = (as_float(body_val) <= max_body_over_atr)
             bb_val = as_float(last.get('bb_width_pct', 0.0))
             bb_ok = bb_val >= min_bb_width
+            atr_enabled = _to_bool(filters_cfg.get('atr_filter_enabled', True), True)
+            body_enabled = _to_bool(filters_cfg.get('body_filter_enabled', True), True)
+            if not atr_enabled:
+                atr_ok = True
+            if not body_enabled:
+                body_ok = True
             if self.verbose and (not atr_ok or not body_ok or not bb_ok):
                 print(f"[{self.symbol}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} bb_ok={bb_ok} price={price} pos={self.pos.side or 'None'}")
 
