@@ -72,15 +72,21 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
     _orig_enter = trader._enter_position
     _orig_exit = trader._exit_position
 
-    def _enter_wrap(side, price, atr, balance, **kw):
+    def _enter_wrap(side: str, price: float, atr: float, available_balance: float, **kw) -> float:
         trader._entry_count += 1
-        used = _orig_enter(side, price, atr, balance, **kw)
+        used = _orig_enter(side, price, atr, available_balance, **kw)
         trader._last_used_margin = used
         return used
 
     def _exit_wrap(price, reason, **kw):
         pos = trader.pos
-        exit_time = pd.to_datetime(kw.get("now_ts"), unit="s", utc=True) if "now_ts" in kw and kw.get("now_ts") is not None else pd.Timestamp.utcnow()
+        ts = kw.get("now_ts", None)
+        exit_time = pd.Timestamp.utcnow()
+        if ts is not None:
+            try:
+                exit_time = pd.to_datetime(int(ts), unit="s", utc=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
         if pos.side and pos.entry and pos.qty:
             pnl, roi = pnl_net(pos.side, float(pos.entry), float(price), float(pos.qty), args.fee_bps, args.slip_bps)
             trades.append({
@@ -147,8 +153,8 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--symbol", required=True)
-    ap.add_argument("--csv", required=True)
+    ap.add_argument("--symbol", default=os.getenv("BT_SYMBOL"))
+    ap.add_argument("--csv", default=os.getenv("BT_CSV"))
     ap.add_argument("--coin_config", default="coin_config.json")
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--balance", type=float, default=20.0)
@@ -164,6 +170,8 @@ def main():
     ap.add_argument("--rsi-mode", choices=["PULLBACK","MIDRANGE"], default="PULLBACK")
     ap.add_argument("--out", default=None, help="simpan trade ke CSV")
     args = ap.parse_args()
+    if not args.symbol or not args.csv:
+        ap.error("--symbol dan --csv wajib diisi (atau set env BT_SYMBOL / BT_CSV).")
 
     os.environ.setdefault("USE_ML", "1")
     os.environ.setdefault("SCORE_THRESHOLD", "2.0")

@@ -335,7 +335,7 @@ if selected_file:
 
     # ---------- Backtest (selaras real) ----------
     in_position = False
-    position_type = None
+    position_type: str | None = None
     entry = sl = trailing_sl = None
     qty = 0.0
     capital = float(initial_capital)
@@ -396,6 +396,8 @@ if selected_file:
 
         # Manage
         if in_position and entry is not None and qty > 0:
+            if position_type is None:
+                continue
             # Breakeven
             if bool(use_breakeven):
                 sl = apply_breakeven_sl(
