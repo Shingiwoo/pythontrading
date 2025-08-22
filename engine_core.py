@@ -327,8 +327,10 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
     max_atr = _to_float(coin_cfg.get('max_atr_pct', 1.0), 1.0)
     max_body = _to_float(coin_cfg.get('max_body_atr', 999.0), 999.0)
     min_bb = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
-    atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled', True))
-    body_filter_enabled = bool(filters_cfg.get('body_filter_enabled', True))
+    atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled',
+                               filters_cfg.get('atr', True)))
+    body_filter_enabled = bool(filters_cfg.get('body_filter_enabled',
+                               filters_cfg.get('body', True)))
 
     atr_ok = (ind['atr_pct'] >= min_atr) and (ind['atr_pct'] <= max_atr)
 
