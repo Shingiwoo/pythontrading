@@ -77,6 +77,17 @@ def safe_fetch_klines(client, symbol: str, interval: str, limit: int):
             if attempt == HTTP_RETRIES - 1:
                 raise
             time.sleep(HTTP_BACKOFF * (attempt + 1))
+
+
+def _to_dt_safe(x) -> pd.Timestamp:
+    try:
+        if isinstance(x, pd.Timestamp):
+            return x.tz_localize('UTC') if x.tzinfo is None else x.tz_convert('UTC')
+        if x is None or (isinstance(x, float) and not math.isfinite(x)):
+            return pd.Timestamp.utcnow().tz_localize('UTC')
+        return pd.to_datetime(int(float(x)), unit='s', utc=True)
+    except Exception:
+        return pd.Timestamp.utcnow().tz_localize('UTC')
 class ExecutionClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool=False, verbose: bool=False):
         self.client = Client(api_key, api_secret, testnet=testnet,
@@ -436,9 +447,7 @@ class CoinTrader:
         return bool(self.cooldown_until_ts and ts_now < float(self.cooldown_until_ts))
 
     def _to_dt(self, now_ts: Optional[float] = None) -> pd.Timestamp:
-        if now_ts is None:
-            return pd.Timestamp.utcnow()
-        return pd.to_datetime(int(now_ts), unit='s', utc=True)  # aman untuk epoch detik
+        return _to_dt_safe(now_ts)
 
     def _clamp_pos(self, x: float, min_x: float = 1e-9) -> float:
         return x if (x is not None and x > min_x) else min_x
@@ -492,7 +501,19 @@ class CoinTrader:
         else:
             fallback_ts = self.config.get('trailing_step_min_pct', self.config.get('trail', {}).get('min_step_pct'))
             trailing_step_val = fallback_ts if fallback_ts is not None else DEFAULTS['trailing_step']
-        trailing_step = self._clamp_pos(float(trailing_step_val), float(self.config.get('trailing_step_min', 1e-9)))
+        try:
+            ts_min = self.config.get('trailing_step_min', 1e-9)
+            ts_min = float(ts_min) if ts_min is not None else 1e-9
+        except Exception:
+            ts_min = 1e-9
+        if trailing_step_val is None:
+            trailing_step_val = DEFAULTS['trailing_step']
+        else:
+            try:
+                trailing_step_val = float(trailing_step_val)
+            except Exception:
+                trailing_step_val = DEFAULTS['trailing_step']
+        trailing_step = self._clamp_pos(trailing_step_val, ts_min)
         safe_trigger = max(trailing_trigger, safe_buffer_pct + trailing_step)
         return safe_trigger, trailing_step
 
@@ -786,7 +807,7 @@ class CoinTrader:
             # throttle log: hanya sekali per bar / saat target berubah
             if self.verbose:
                 if (self._last_cooldown_log_bar != self._bar_idx) or (self._cd_logged_until_ts != self.cooldown_until_ts):
-                    print(f"[{self.symbol}] COOLDOWN aktif s/d {pd.to_datetime(self.cooldown_until_ts, unit='s', utc=True)}")
+                    print(f"[{self.symbol}] COOLDOWN aktif s/d {_to_dt_safe(self.cooldown_until_ts)}")
                     self._last_cooldown_log_bar = self._bar_idx
                     self._cd_logged_until_ts = self.cooldown_until_ts
             return 0.0

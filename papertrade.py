@@ -322,22 +322,24 @@ class JournaledCoinTrader(CoinTrader):
     def _apply_breakeven(self, price: float) -> None:
         return super()._apply_breakeven(price)
 
-    def _enter_position(self, side: str, price: float, atr: float, available_balance: float) -> float:
+    def _enter_position(self, side: str, price: float, atr: float, available_balance: float, **kw) -> float:
         before_qty = getattr(self.pos, "qty", 0.0) or 0.0
-        used = super()._enter_position(side, price, atr, available_balance)
-        # Jika benar-benar masuk (qty > 0 & ada side)
+        used = super()._enter_position(side, price, atr, available_balance, **kw)
         if self.pos.side and self.pos.qty > 0 and self.pos.qty != before_qty:
             self.journal.on_entry(
-                self.symbol, self.pos.side, self.pos.entry if self.pos.entry is not None else 0.0, self.pos.qty,
-                self.pos.sl, self.pos.trailing_sl
+                self.symbol,
+                self.pos.side,
+                self.pos.entry if self.pos.entry is not None else 0.0,
+                self.pos.qty,
+                self.pos.sl,
+                self.pos.trailing_sl,
             )
         return used
 
-    def _exit_position(self, price: float, reason: str) -> None:
-        # simpan dulu utk CSV
+    def _exit_position(self, price: float, reason: str = "Exit", **kw) -> None:
         if self.pos.side:
             self.journal.on_exit(self.symbol, price, reason)
-        super()._exit_position(price, reason)
+        return super()._exit_position(price, reason, **kw)
 
 # -----------------------------
 # Live runner
@@ -416,18 +418,20 @@ def main():
         merged = merge_config(s, cfg_all)
         if rules["risk_pct"] is not None:
             merged["risk_per_trade"] = float(rules["risk_pct"])
-        merged.setdefault("ml", {})["score_threshold"] = rules["ml_thr"]
-        if rules["ml_thr"] is not None:
-            merged["USE_ML"] = 1
-        if rules["htf"]:
-            merged["htf"] = rules["htf"]
+        ml_cfg = merged.setdefault("ml", {})
+        filters = merged.setdefault("filters", {})
+        if args.ml_thr is not None:
+            ml_cfg["score_threshold"] = float(args.ml_thr)
+        ml_cfg.setdefault("weight", float(os.getenv("ML_WEIGHT", "1.5")))
+        filters["atr_filter_enabled"] = not args.no_atr_filter
+        filters["body_filter_enabled"] = not args.no_body_filter
+        if args.htf and args.htf.lower() == "off":
+            merged["use_htf_filter"] = 0
+        elif args.htf:
+            merged["htf"] = args.htf
         merged["heikin"] = rules["heikin"]
         merged["taker_fee"] = rules["fee_bps"] / 10000.0
         merged["SLIPPAGE_PCT"] = rules["slip_bps"] * 0.01
-        if args.no_atr_filter:
-            merged.setdefault('filters', {})['atr_filter_enabled'] = False
-        if args.no_body_filter:
-            merged.setdefault('filters', {})['body_filter_enabled'] = False
         cfg_by_sym[s] = merged
 
     journal = Journal(os.path.dirname(args.logs_dir), args.instance_id, cfg_by_sym, args.balance)

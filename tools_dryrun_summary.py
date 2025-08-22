@@ -62,18 +62,18 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
     trades: list[dict] = []
     trader._entry_count = 0
     trader._exit_count = 0
-    _orig_enter = trader._enter_position
-    _orig_exit = trader._exit_position
+    orig_enter = nrt.CoinTrader._enter_position
+    orig_exit = nrt.CoinTrader._exit_position
 
-    # === FIX: terima **kwargs (mis. now_ts) dan teruskan ke fungsi asli ===
-    def _enter_wrap(side, price, atr, balance, **kwargs):
-        trader._entry_count += 1
-        _orig_enter(side, price, atr, balance, **kwargs)
+    def _enter_wrap(self, side: str, price: float, atr: float, available_balance: float, **kw) -> float:
+        self._entry_count += 1
+        used = orig_enter(self, side, price, atr, available_balance, **kw)
+        return used
 
-    def _exit_wrap(price, reason, **kwargs):
-        pos = trader.pos
-        # gunakan waktu yang konsisten dgn loop (kalau ada now_ts)
-        exit_time = pd.to_datetime(kwargs.get("now_ts"), unit="s", utc=True) if ("now_ts" in kwargs and kwargs.get("now_ts") is not None) else pd.Timestamp.utcnow()
+    def _exit_wrap(self, price: float, reason: str = "Exit", **kw) -> None:
+        pos = self.pos
+        ts = kw.get("now_ts")
+        exit_time = nrt._to_dt_safe(ts)
         if pos.side and pos.entry and pos.qty:
             pnl = (price - pos.entry) * pos.qty if pos.side == "LONG" else (pos.entry - price) * pos.qty
             trades.append({
@@ -87,11 +87,11 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
                 "entry_time": pos.entry_time,
                 "exit_time": exit_time,
             })
-        trader._exit_count += 1
-        _orig_exit(price, reason, **kwargs)
+        self._exit_count += 1
+        return orig_exit(self, price, reason, **kw)
 
-    trader._enter_position = _enter_wrap
-    trader._exit_position = _exit_wrap
+    nrt.CoinTrader._enter_position = _enter_wrap
+    nrt.CoinTrader._exit_position = _exit_wrap
 
     # Replay loop
     t0 = time.time()
