@@ -1,5 +1,48 @@
 {
   "PRESETS": {
+    "SCALP-ADA-15M": {
+      "heikin": false,
+      "rsi_mode": "PULLBACK",
+      "use_macd_confirm": false,
+      "use_htf_filter": 0,
+      "startup_skip_bars": 0,
+      "cooldown_seconds": 0,
+      "min_bars_between_entries": 0,
+      "no_cooldown_on_profit": 1,
+      "leverage": 15,
+      "risk_per_trade": 0.06,
+      "taker_fee": 0.0005,
+      "min_atr_pct": 0.0,
+      "max_atr_pct": 1.0,
+      "max_body_atr": 9.99,
+      "sl_mode": "ATR",
+      "sl_atr_mult": 1.6,
+      "sl_min_pct": 0.008,
+      "sl_max_pct": 0.035,
+      "use_breakeven": 1,
+      "be_trigger_pct": 0.0,
+      "be_min_gap_pct": 0.0001,
+      "trailing_trigger": 0.45,
+      "trailing_step": 0.25,
+      "max_hold_seconds": 3600,
+      "time_stop_only_if_loss": 0,
+      "min_roi_to_close_by_time": -1.0,
+      "ml": {
+        "enabled": false,
+        "strict": false,
+        "up_prob_long": 0.60,
+        "down_prob_short": 0.40,
+        "score_threshold": 1.00,
+        "weight": 1.0
+      },
+      "filters": {
+        "atr_filter_enabled": false,
+        "body_filter_enabled": false,
+        "min_atr_threshold": 0.0,
+        "max_body_over_atr": 9.99,
+        "min_bb_width": 0.0
+      }
+    },
     "SCALP-ADA-15M-LEGACY": {
       "heikin": false,
       "rsi_mode": "PULLBACK",
@@ -101,7 +144,7 @@
     "no_cooldown_on_profit": 1
   },
   "ADAUSDT": {
-    "use_preset": "SCALP-ADA-15M-LEGACY",
+    "use_preset": "SCALP-ADA-15M",
     "leverage": 15,
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
