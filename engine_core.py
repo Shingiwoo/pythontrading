@@ -188,7 +188,7 @@ def compute_base_signals_backtest(df: pd.DataFrame) -> tuple[bool, bool]:
     ma_now, ma_prev = df['ma_22'].iloc[-1], df['ma_22'].iloc[-2]
     macd_now, macd_sig = df['macd'].iloc[-1], df['macd_signal'].iloc[-1]
     rsi_now = df['rsi'].iloc[-1]
-    long_base = (ema_prev <= ma_prev) and (ema_now > ma_now) and (macd_now > macd_sig) and (40 <= rsi_now <= 60)
+    long_base = (ema_prev <= ma_prev) and (ema_now > ma_now) and (macd_now > macd_sig) and (40 <= rsi_now <= 70)
     short_base = (ema_prev >= ma_prev) and (ema_now < ma_now) and (macd_now < macd_sig) and (30 <= rsi_now <= 60)
     logging.getLogger(__name__).info(
         f"BASE ema_20={ema_now:.6f} ma22={ma_now:.6f} macd={macd_now:.6f} sig={macd_sig:.6f} rsi={rsi_now:.2f} -> L={long_base} S={short_base}"
