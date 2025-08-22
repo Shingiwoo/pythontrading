@@ -18,19 +18,20 @@ from engine_core import SAFE_EPS
 
 @dataclass
 class MLParams:
-    use_ml: bool = False
+    use_ml: bool = True
     score_threshold: float = 2.0
     min_train_bars: int = 400
     lookahead: int = 5
     retrain_every_bars: int = 120
     up_prob_thres: float = 0.55
     down_prob_thres: float = 0.45
+    weight: float = 1.5
 
 class MLSignal:
     def __init__(
         self,
         coin_cfg: Dict[str, Any] | None = None,
-        thr: float = 1.20,
+        thr: float = 2.0,
         htf: str | None = None,
         heikin: bool = False,
         model_path: str | None = None,
@@ -65,13 +66,14 @@ class MLSignal:
             return bool(default)
 
         self.params = MLParams(
-            use_ml=_getb('USE_ML', False),
+            use_ml=_getb('USE_ML', True),
             score_threshold=_getf('SCORE_THRESHOLD', 2.0),
             min_train_bars=_geti('ML_MIN_TRAIN_BARS', 400),
             lookahead=_geti('ML_LOOKAHEAD', 5),
             retrain_every_bars=_geti('ML_RETRAIN_EVERY', 120),
             up_prob_thres=_getf('ML_UP_PROB', 0.55),
             down_prob_thres=_getf('ML_DOWN_PROB', 0.45),
+            weight=_getf('ML_WEIGHT', 1.5),
         )
         self.model: Optional[RandomForestClassifier] = None
         self._last_fit_index: int = -1
@@ -110,9 +112,9 @@ class MLSignal:
         sc_short = 1.0 if base_short else 0.0
         if self.use_ml and (up_prob is not None):
             if up_prob >= self.params.up_prob_thres:
-                sc_long += 1.0
+                sc_long += self.params.weight
             elif up_prob <= self.params.down_prob_thres:
-                sc_short += 1.0
+                sc_short += self.params.weight
         return (sc_long >= th, sc_short >= th)
 
     # ===== dataset & fitur =====
