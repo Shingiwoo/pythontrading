@@ -191,15 +191,15 @@ def compute_base_signals_backtest(df: pd.DataFrame) -> tuple[bool, bool]:
     long_base = (ema_prev <= ma_prev) and (ema_now > ma_now) and (macd_now > macd_sig) and (40 <= rsi_now <= 60)
     short_base = (ema_prev >= ma_prev) and (ema_now < ma_now) and (macd_now < macd_sig) and (30 <= rsi_now <= 60)
     logging.getLogger(__name__).info(
-        f"BASE ema22={ema_now:.6f} ma22={ma_now:.6f} macd={macd_now:.6f} sig={macd_sig:.6f} rsi={rsi_now:.2f} -> L={long_base} S={short_base}"
+        f"BASE ema_20={ema_now:.6f} ma22={ma_now:.6f} macd={macd_now:.6f} sig={macd_sig:.6f} rsi={rsi_now:.2f} -> L={long_base} S={short_base}"
     )
     return bool(long_base), bool(short_base)
 
 
 def compute_base_signals_live(df: pd.DataFrame) -> tuple[bool, bool]:
     last = df.iloc[-1]
-    long_base = (last.get('ema_22', 20) > last.get('ma_22', 22)) and (last.get('macd', 0) > last.get('macd_signal', 0)) and (last.get('rsi', 50) <= 45)
-    short_base = (last.get('ema_22', 20) < last.get('ma_22', 22)) and (last.get('macd', 0) < last.get('macd_signal', 0)) and (last.get('rsi', 50) >= 70)
+    long_base = (last.get('ema_20', 0) > last.get('ma_22', 0)) and (last.get('macd', 0) > last.get('macd_signal', 0)) and (last.get('rsi', 50) <= 45)
+    short_base = (last.get('ema_20', 0) < last.get('ma_22', 0)) and (last.get('macd', 0) < last.get('macd_signal', 0)) and (last.get('rsi', 50) >= 70)
     return bool(long_base), bool(short_base)
 
 

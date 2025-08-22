@@ -15,3 +15,5 @@ data/strategy_params.json
 .env
 *.csv
 logs/*.xt
+data/lain2/README.markdown
+data/lain2/strategy_params.json
