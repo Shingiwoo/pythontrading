@@ -34,15 +34,23 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
     with open(args.coin_config, "r") as f:
         cfg = json.load(f)
     sym_cfg = cfg.get(args.symbol, {})
-    # (opsi) merge preset dari coin_config["PRESETS"]
-    preset_name = args.preset or sym_cfg.get("use_preset")
+    # (opsi) merge preset
+    preset_name = args.preset or sym_cfg.get("use_preset") or (cfg.get("PRESETS") and "SCALP-ADA-15M-LEGACY")
     if preset_name and isinstance(cfg.get("PRESETS"), dict) and preset_name in cfg["PRESETS"]:
-        p = dict(cfg["PRESETS"][preset_name])
-        # preset sebagai base, lalu override oleh per-simbol
-        merged = {**p, **sym_cfg}
+        base_p = dict(cfg["PRESETS"][preset_name])
+        merged = {**base_p, **sym_cfg}
+        for k in ("filters", "ml"):
+            if k in base_p or k in sym_cfg:
+                mk = dict(base_p.get(k, {}))
+                mk.update(sym_cfg.get(k, {}))
+                merged[k] = mk
         sym_cfg = merged
     sym_cfg["heikin"] = bool(args.heikin)
     sym_cfg["rsi_mode"] = args.rsi_mode
+    if args.no_macd_confirm:
+        sym_cfg["use_macd_confirm"] = False
+    if args.cooldown is not None:
+        sym_cfg["cooldown_seconds"] = int(args.cooldown)
     sym_cfg["taker_fee"] = float(args.fee_bps) / 10000.0
     sym_cfg["SLIPPAGE_PCT"] = float(args.slip_bps) * 0.01
     if args.htf:
@@ -50,10 +58,20 @@ def run_backtest(args) -> tuple[dict, pd.DataFrame]:
         sym_cfg["htf"] = args.htf
     else:
         sym_cfg["use_htf_filter"] = 0
+
+    # sinkronkan parameter ML
+    ml_cfg = sym_cfg.setdefault("ml", {})
+    if args.use_ml is not None:
+        os.environ["USE_ML"] = str(int(args.use_ml))
+        ml_cfg["enabled"] = bool(int(args.use_ml))
+    if args.ml_thr is not None:
+        os.environ["SCORE_THRESHOLD"] = str(float(args.ml_thr))
+        ml_cfg["score_threshold"] = float(args.ml_thr)
+
     cfg[args.symbol] = sym_cfg
     tmp_cfg = f"_tmp_cfg_{args.symbol}.json"
     with open(tmp_cfg, "w") as f:
-        json.dump(cfg, f)
+        json.dump(cfg, f, indent=2)
 
     mgr = TradingManager(
         tmp_cfg,
@@ -175,6 +193,8 @@ def main():
     ap.add_argument("--htf", default=None)
     ap.add_argument("--heikin", action="store_true")
     ap.add_argument("--preset", default=os.getenv("BT_PRESET"), help="Nama preset di coin_config.json/`PRESETS`")
+    ap.add_argument("--cooldown", type=int, default=None, help="Override cooldown_seconds")
+    ap.add_argument("--no-macd-confirm", action="store_true", help="Matikan konfirmasi MACD di sinyal dasar")
     ap.add_argument("--fee-bps", type=float, default=10.0)
     ap.add_argument("--slip-bps", type=float, default=0.0)
     ap.add_argument("--no-atr-filter", action="store_true")
@@ -191,11 +211,6 @@ def main():
     os.environ.setdefault("ML_MIN_TRAIN_BARS", "400")
     os.environ.setdefault("ML_RETRAIN_EVERY", "5000")
     os.environ.setdefault("ML_WEIGHT", "1.0")
-
-    if args.use_ml is not None:
-        os.environ["USE_ML"] = str(int(args.use_ml))
-    if args.ml_thr is not None:
-        os.environ["SCORE_THRESHOLD"] = str(float(args.ml_thr))
 
     summary, trades_df = run_backtest(args)
 
