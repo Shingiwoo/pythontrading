@@ -167,7 +167,7 @@ python papertrade.py \
 * Menjamin presisi **LOT\_SIZE** dan **MIN\_NOTIONAL** sesuai exchange.
 * **Balance** dipisah per simbol (simulasi saldo lokal).
 
-**Argumen utama**: `--risk_pct`, `--ml-thr`, `--htf`, `--heikin`, `--fee_bps`, `--slip_bps`, `--max-concurrent`, `--limit_bars`, `--timeout`, `--retries`, `--verbose`.
+**Argumen utama**: `--risk_pct`, `--ml-thr`, `--ml-override`, `--no-atr-filter`, `--no-body-filter`, `--htf`, `--heikin`, `--fee_bps`, `--slip_bps`, `--max-concurrent`, `--limit_bars`, `--timeout`, `--retries`, `--verbose`.
 
 ---
 

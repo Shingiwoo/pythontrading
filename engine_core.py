@@ -299,6 +299,19 @@ def compute_base_signals_live(df: pd.DataFrame, coin_cfg: Dict[str, Any] | None 
 
 ML_WEIGHT = float(os.getenv("ML_WEIGHT", "1.5"))
 
+# ----- Auto-relax filter parameters -----
+FILTER_TARGET_PASS_RATIO = float(os.getenv("FILTER_TARGET_PASS_RATIO", "0"))
+FILTER_HYSTERESIS_TIGHTEN = float(os.getenv("FILTER_HYSTERESIS_TIGHTEN", "1"))
+FILTER_RELAX_STEP_ATR = float(os.getenv("FILTER_RELAX_STEP_ATR", "0"))
+FILTER_RELAX_STEP_BODY = float(os.getenv("FILTER_RELAX_STEP_BODY", "0"))
+FILTER_MAX_RELAX_ATR = float(os.getenv("FILTER_MAX_RELAX_ATR", "0"))
+FILTER_MAX_RELAX_BODY = float(os.getenv("FILTER_MAX_RELAX_BODY", "0"))
+
+_filter_total = 0
+_filter_pass = 0
+_relax_atr = 0.0
+_relax_body = 0.0
+
 
 def get_coin_ml_params(symbol: str, coin_config: dict) -> dict:
     d = coin_config.get(symbol, {}).get("ml", {})
@@ -312,12 +325,28 @@ def get_coin_ml_params(symbol: str, coin_config: dict) -> dict:
     }
 
 
-def make_decision(df: pd.DataFrame, symbol: str, coin_cfg: dict, ml_up_prob: float | None) -> Optional[str]:
+def make_decision(
+    df: pd.DataFrame,
+    symbol: str,
+    coin_cfg: dict,
+    ml_up_prob: float | None,
+    atr_ok: bool | None = None,
+    body_ok: bool | None = None,
+    meta: Dict[str, Any] | None = None,
+) -> Optional[str]:
     params = get_coin_ml_params(symbol, coin_cfg)
     if USE_BACKTEST_ENTRY_LOGIC:
         long_base, short_base = compute_base_signals_backtest(df, coin_cfg)
     else:
         long_base, short_base = compute_base_signals_live(df, coin_cfg)
+
+    last = df.iloc[-1]
+    if atr_ok is None or body_ok is None or meta is None:
+        atr_ok, body_ok, meta = apply_filters(last, coin_cfg)
+
+    long_base = long_base and atr_ok and body_ok
+    short_base = short_base and atr_ok and body_ok
+
     score_long = 1.0 if long_base else 0.0
     score_short = 1.0 if short_base else 0.0
     if params["enabled"] and ml_up_prob is not None:
@@ -334,8 +363,16 @@ def make_decision(df: pd.DataFrame, symbol: str, coin_cfg: dict, ml_up_prob: flo
         decision = "LONG"
     elif score_short >= thr and score_short > score_long:
         decision = "SHORT"
+
+    ema = float(last.get('ema_22', 0.0))
+    ma = float(last.get('ma_22', 0.0))
+    rsi = float(last.get('rsi', 0.0))
+    bb_width = meta.get('bb_width_pct') if isinstance(meta, dict) else float('nan')
+
     logging.getLogger(__name__).info(
-        f"[{symbol}] DECISION base(L={long_base},S={short_base}) up_prob={ml_up_prob} thr={thr} score(L={score_long:.2f},S={score_short:.2f}) -> {decision}"
+        f"[{symbol}] DECISION ema22={ema:.6f} ma22={ma:.6f} rsi={rsi:.2f} base(L={long_base},S={short_base}) "
+        f"atr_ok={atr_ok} body_ok={body_ok} bb_width_pct={bb_width:.4f} "
+        f"ml_up_prob={ml_up_prob} thr={thr} score(L={score_long:.2f},S={score_short:.2f}) -> {decision}"
     )
     return decision
 
@@ -352,16 +389,17 @@ def htf_trend_ok(side: str, base_df: pd.DataFrame, htf: str = '1h') -> bool:
     except Exception:
         return True
 def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool, Dict[str, Any]]:
+    global _filter_total, _filter_pass, _relax_atr, _relax_body
     filters_cfg = (coin_cfg.get('filters') if isinstance(coin_cfg.get('filters'), dict) else {}) or {}
-    min_atr = _to_float(coin_cfg.get('min_atr_pct', 0.0), 0.0)
+    base_min_atr = _to_float(coin_cfg.get('min_atr_pct', 0.0), 0.0)
     max_atr = _to_float(coin_cfg.get('max_atr_pct', 1.0), 1.0)
-    max_body = _to_float(coin_cfg.get('max_body_atr', 999.0), 999.0)
+    base_max_body = _to_float(coin_cfg.get('max_body_atr', 999.0), 999.0)
     min_bb = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
-    # Default-kan OFF; hormati alias lama 'atr'/'body' hanya jika diset eksplisit.
-    atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled',
-                               filters_cfg.get('atr', False)))
-    body_filter_enabled = bool(filters_cfg.get('body_filter_enabled',
-                               filters_cfg.get('body', False)))
+    atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled', filters_cfg.get('atr', False)))
+    body_filter_enabled = bool(filters_cfg.get('body_filter_enabled', filters_cfg.get('body', False)))
+
+    min_atr = max(base_min_atr - _relax_atr, base_min_atr - FILTER_MAX_RELAX_ATR)
+    max_body = min(base_max_body + _relax_body, base_max_body + FILTER_MAX_RELAX_BODY)
 
     atr_ok = (ind['atr_pct'] >= min_atr) and (ind['atr_pct'] <= max_atr)
 
@@ -373,6 +411,18 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
         body_ok = True
     bb_val = float(ind.get('bb_width_pct', 0.0))
     bb_ok = bb_val >= min_bb
+
+    _filter_total += 1
+    if atr_ok and body_ok and bb_ok:
+        _filter_pass += 1
+    pass_ratio = safe_div(_filter_pass, _filter_total, 0.0)
+    if pass_ratio < FILTER_TARGET_PASS_RATIO:
+        _relax_atr = min(_relax_atr + FILTER_RELAX_STEP_ATR, FILTER_MAX_RELAX_ATR)
+        _relax_body = min(_relax_body + FILTER_RELAX_STEP_BODY, FILTER_MAX_RELAX_BODY)
+    elif pass_ratio > FILTER_HYSTERESIS_TIGHTEN:
+        _relax_atr = max(_relax_atr - FILTER_RELAX_STEP_ATR, 0.0)
+        _relax_body = max(_relax_body - FILTER_RELAX_STEP_BODY, 0.0)
+
     if not atr_ok or not body_ok or not bb_ok:
         logging.getLogger(__name__).info(
             f"[{coin_cfg.get('symbol', '?')}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} "

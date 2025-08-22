@@ -34,7 +34,7 @@ from engine_core import (
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
     htf_trend_ok, r_multiple, apply_breakeven_sl, roi_frac_now, base_supports_side,
     safe_div, as_float, compute_base_signals_backtest, make_decision, round_to_tick,
-    as_scalar
+    as_scalar, apply_filters
 )
 
 from binance.client import Client
@@ -805,29 +805,10 @@ class CoinTrader:
                     self._exit_position(price, rs or 'Exit', now_ts=now_ts)
                     return 0.0
 
-            filters_cfg = (self.config.get('filters') if isinstance(self.config.get('filters'), dict) else {}) or {}
-            min_atr_threshold = _to_float(filters_cfg.get('min_atr_threshold', self.config.get('min_atr_pct', DEFAULTS['min_atr_pct'])), DEFAULTS['min_atr_pct'])
-            max_body_over_atr = _to_float(filters_cfg.get('max_body_over_atr', self.config.get('max_body_atr', DEFAULTS['max_body_atr'])), DEFAULTS['max_body_atr'])
-            min_bb_width = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
-            # default OFF; hormati alias lama untuk kompatibilitas
-            atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled',
-                                           filters_cfg.get('atr', False)))
-            body_filter_enabled = bool(filters_cfg.get('body_filter_enabled',
-                                           filters_cfg.get('body', False)))
-
-            atr_ok = (last['atr_pct'] >= min_atr_threshold) and (
-                last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct'])
-            )
-            body_val = last.get('body_to_atr', last.get('body_atr'))
-            body_ok = (as_float(body_val) <= max_body_over_atr)
-            if not atr_filter_enabled:
-                atr_ok = True
-            if not body_filter_enabled:
-                body_ok = True
-            bb_val = as_float(last.get('bb_width_pct', 0.0))
-            bb_ok = bb_val >= min_bb_width
-            if self.verbose and (not atr_ok or not body_ok or not bb_ok):
-                print(f"[{self.symbol}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} bb_ok={bb_ok} price={price} pos={self.pos.side or 'None'}")
+            atr_ok, body_ok, meta = apply_filters(last, self.config)
+            bb_val = meta.get('bb_width_pct', 0.0)
+            if self.verbose and (not atr_ok or not body_ok):
+                print(f"[{self.symbol}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} bb_width_pct={bb_val:.4f} price={price} pos={self.pos.side or 'None'}")
 
             # HTF filter (opsional)
             if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
@@ -843,8 +824,8 @@ class CoinTrader:
                 long_htf_ok = short_htf_ok = True
 
             long_base, short_base = compute_base_signals_backtest(df, self.config)
-            long_base = long_base and long_htf_ok and atr_ok and body_ok and bb_ok
-            short_base = short_base and short_htf_ok and atr_ok and body_ok and bb_ok
+            long_base = long_base and long_htf_ok and atr_ok and body_ok
+            short_base = short_base and short_htf_ok and atr_ok and body_ok
 
             if self.rehydrated and self.pos.side:
                 lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
@@ -869,9 +850,7 @@ class CoinTrader:
                     self._update_trailing(price)
                 return 0.0
 
-            decision = make_decision(df, self.symbol, self.config, up_prob)
-            if not (atr_ok and body_ok and bb_ok):
-                decision = None
+            decision = make_decision(df, self.symbol, self.config, up_prob, atr_ok=atr_ok, body_ok=body_ok, meta=meta)
             long_sig = decision == 'LONG'
             short_sig = decision == 'SHORT'
             # Update SL/TS saat pegang posisi
