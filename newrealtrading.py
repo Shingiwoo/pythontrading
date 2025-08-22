@@ -447,10 +447,12 @@ class CoinTrader:
         ts_now = float(now_ts) if now_ts is not None else time.time()
         return bool(self.cooldown_until_ts and ts_now < float(self.cooldown_until_ts))
 
-    def _to_dt(self, ts: float | int | None) -> pd.Timestamp:
-        if ts is None:
-            return pd.Timestamp.utcnow().tz_localize("UTC")
-        return pd.to_datetime(float(ts), unit="s", utc=True)
+    def _to_dt(self, ts: float | int | pd.Timestamp | None) -> pd.Timestamp:
+        # Gunakan helper yang sudah tz-safe:
+        # - Timestamp aware -> tz_convert('UTC')
+        # - Naive -> tz_localize('UTC')
+        # - Epoch detik -> to_datetime(..., utc=True)
+        return _to_dt_safe(ts)
 
     def _clamp_pos(self, x: float, min_x: float = 1e-9) -> float:
         return x if (x is not None and x > min_x) else min_x
