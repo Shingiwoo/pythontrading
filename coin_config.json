@@ -2,12 +2,15 @@
   "SYMBOL_DEFAULTS": {
     "rsi_mode": "PULLBACK",
     "filters": {
-      "atr_filter_enabled": true,
-      "body_filter_enabled": true,
+      "atr_filter_enabled": false,
+      "body_filter_enabled": false,
       "min_atr_threshold": 0.00,
       "max_body_over_atr": 9.99,
       "min_bb_width": 0.0
-    }
+    },
+    "cooldown_seconds": 900,
+    "min_bars_between_entries": 2,
+    "no_cooldown_on_profit": 1
   },
   "ADAUSDT": {
     "leverage": 15,

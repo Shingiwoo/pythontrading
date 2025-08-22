@@ -353,7 +353,9 @@ DEFAULTS = {
     "max_atr_pct": 0.03,
     "max_body_atr": 0.95,
     "use_htf_filter": 1,
-    "cooldown_seconds": 1500,
+    "cooldown_seconds": 900,
+    "min_bars_between_entries": 2,
+    "no_cooldown_on_profit": 1,
     # SL / BE / Trailing
     "sl_mode": "ATR",
     "sl_pct": 0.008,
@@ -419,6 +421,10 @@ class CoinTrader:
         self.rehydrate_profit_min_pct = float(self.config.get('rehydrate_profit_min_pct', 0.0005))
         self.signal_confirm_bars_after_restart = int(self.config.get('signal_confirm_bars_after_restart', 2))
         self.signal_flip_confirm_left = 0
+        # bar index + throttle log cooldown
+        self._bar_idx = 0
+        self._last_cooldown_log_bar = -1
+        self._cd_logged_until_ts = None
 
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
@@ -464,6 +470,7 @@ class CoinTrader:
         if last_ts > self.last_bar_close_ts:
             # terdeteksi bar baru yang SUDAH tutup
             self.last_bar_close_ts = last_ts
+            self._bar_idx += 1
             if self.pending_skip_entries > 0:
                 self.pending_skip_entries = max(0, self.pending_skip_entries - 1)
                 self._log(f"STARTUP SKIP: tunda entry {self.pending_skip_entries} bar lagi")
@@ -705,7 +712,20 @@ class CoinTrader:
             close_side = 'SELL' if self.pos.side == 'LONG' else 'BUY'
             cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
             self.exec.market_close(self.symbol, close_side, self.pos.qty, client_id=cid)
-        self._log(f"EXIT {reason} price={price:.6f}")
+        # hitung ROI untuk deteksi exit profit/loss
+        roi_frac = 0.0
+        try:
+            lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
+            if self.pos.side and self.pos.entry and self.pos.qty and lev > 0:
+                init_margin = safe_div((self.pos.entry * self.pos.qty), lev)
+                if init_margin > 0:
+                    if self.pos.side == 'LONG':
+                        roi_frac = safe_div(((price - self.pos.entry) * self.pos.qty), init_margin)
+                    else:
+                        roi_frac = safe_div(((self.pos.entry - price) * self.pos.qty), init_margin)
+        except Exception:
+            roi_frac = 0.0
+        self._log(f"EXIT {reason} price={price:.6f} roi={roi_frac*100:.2f}%")
         self.pos = Position()  # reset
         base_cd = _to_int(self.config.get('cooldown_seconds', DEFAULTS['cooldown_seconds']), DEFAULTS['cooldown_seconds'])
         mul = 1.0
@@ -715,11 +735,23 @@ class CoinTrader:
             mul = _to_float(self.config.get('cooldown_mul_trailing', 1.0), 1.0)
         elif 'Max hold' in (reason or '') or 'early' in (reason or '').lower():
             mul = _to_float(self.config.get('cooldown_mul_early_stop', 1.0), 1.0)
-        cd = max(0, int(base_cd * mul))
+        # Jika profit dan diizinkan, bisa tanpa cooldown
+        if _to_bool(self.config.get('no_cooldown_on_profit', DEFAULTS['no_cooldown_on_profit']),
+                    DEFAULTS['no_cooldown_on_profit']) and roi_frac > 0:
+            cd = 0
+        else:
+            cd = max(0, int(base_cd * mul))
+        # selalu tahan N bar setelah exit untuk kurangi over-trading
+        self.pending_skip_entries = max(self.pending_skip_entries,
+                                        _to_int(self.config.get('min_bars_between_entries',
+                                                                DEFAULTS['min_bars_between_entries']),
+                                                DEFAULTS['min_bars_between_entries']))
         base = float(kw.get('now_ts', time.time()))
-        self.cooldown_until_ts = base + cd
+        self.cooldown_until_ts = (base + cd) if cd > 0 else None
+        self._cd_logged_until_ts = None
         try:
-            self._log(f"COOLDOWN until {pd.Timestamp.utcfromtimestamp(self.cooldown_until_ts).isoformat()}")
+            if self.cooldown_until_ts:
+                self._log(f"COOLDOWN until {pd.Timestamp.utcfromtimestamp(self.cooldown_until_ts).isoformat()}")
         except Exception:
             pass
 
@@ -751,8 +783,12 @@ class CoinTrader:
 
         # ---- Cooldown berdasar virtual clock ----
         if self._cooldown_active(now_ts):
+            # throttle log: hanya sekali per bar / saat target berubah
             if self.verbose:
-                print(f"[{self.symbol}] COOLDOWN aktif s/d {pd.to_datetime(self.cooldown_until_ts, unit='s', utc=True)}")
+                if (self._last_cooldown_log_bar != self._bar_idx) or (self._cd_logged_until_ts != self.cooldown_until_ts):
+                    print(f"[{self.symbol}] COOLDOWN aktif s/d {pd.to_datetime(self.cooldown_until_ts, unit='s', utc=True)}")
+                    self._last_cooldown_log_bar = self._bar_idx
+                    self._cd_logged_until_ts = self.cooldown_until_ts
             return 0.0
 
         try:
