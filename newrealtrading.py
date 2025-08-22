@@ -757,10 +757,11 @@ class CoinTrader:
             min_atr_threshold = _to_float(filters_cfg.get('min_atr_threshold', self.config.get('min_atr_pct', DEFAULTS['min_atr_pct'])), DEFAULTS['min_atr_pct'])
             max_body_over_atr = _to_float(filters_cfg.get('max_body_over_atr', self.config.get('max_body_atr', DEFAULTS['max_body_atr'])), DEFAULTS['max_body_atr'])
             min_bb_width = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
+            # default OFF; hormati alias lama untuk kompatibilitas
             atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled',
-                                           filters_cfg.get('atr', True)))
+                                           filters_cfg.get('atr', False)))
             body_filter_enabled = bool(filters_cfg.get('body_filter_enabled',
-                                           filters_cfg.get('body', True)))
+                                           filters_cfg.get('body', False)))
 
             atr_ok = (last['atr_pct'] >= min_atr_threshold) and (
                 last['atr_pct'] <= _to_float(self.config.get('max_atr_pct', DEFAULTS['max_atr_pct']), DEFAULTS['max_atr_pct'])
