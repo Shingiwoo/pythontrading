@@ -10,12 +10,18 @@
 import os, sys, time, json, math, csv, argparse, random, string
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
+import warnings
 
 import pandas as pd
 import numpy as np
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=".*is deprecated and will be removed in a future version.*",
+)
 from filelock import FileLock, Timeout
 
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
@@ -380,6 +386,7 @@ def main():
     ap.add_argument("--no-body-filter", action="store_true", help="Disable body candle filter")
     ap.add_argument("--ml-override", action="store_true", help="Allow ML to bypass filters when triggered")
     args = ap.parse_args()
+    htf_arg = args.htf.strip().lower() if args.htf is not None else None
 
     if not args.instance_id:
         args.instance_id = "bot" + ''.join(random.choices(string.ascii_uppercase, k=2))
@@ -394,7 +401,7 @@ def main():
     rules = {
         "risk_pct": args.risk_pct,
         "ml_thr": args.ml_thr,
-        "htf": args.htf,
+        "htf": htf_arg,
         "heikin": bool(args.heikin),
         "fee_bps": args.fee_bps,
         "slip_bps": args.slip_bps,
@@ -424,10 +431,10 @@ def main():
         ml_cfg.setdefault("weight", float(os.getenv("ML_WEIGHT", "1.5")))
         filters["atr_filter_enabled"] = not args.no_atr_filter
         filters["body_filter_enabled"] = not args.no_body_filter
-        if args.htf and args.htf.lower() == "off":
+        if htf_arg and htf_arg == "off":
             merged["use_htf_filter"] = 0
-        elif args.htf:
-            merged["htf"] = args.htf
+        elif htf_arg:
+            merged["htf"] = htf_arg
         merged["heikin"] = rules["heikin"]
         merged["taker_fee"] = rules["fee_bps"] / 10000.0
         merged["SLIPPAGE_PCT"] = rules["slip_bps"] * 0.01
