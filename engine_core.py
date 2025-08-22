@@ -4,7 +4,9 @@ from typing import Dict, Any, Tuple, Optional, Union, Any
 import numpy as np
 import pandas as pd
 from ta.trend import EMAIndicator, SMAIndicator, MACD
-from ta.momentum import RSIIndicator
+from ta.momentum import RSIIndicator, StochRSIIndicator
+from ta.volatility import BollingerBands
+from ta.volume import VolumeWeightedAveragePrice
 
 # --- helpers (top-level util) ---
 Numeric = Union[float, int, np.floating, np.integer]
@@ -142,25 +144,35 @@ def merge_config(symbol: str, base_cfg: Dict[str, Any]) -> Dict[str, Any]:
 # -----------------------------------------------------
 # Indikator & sinyal sederhana
 # -----------------------------------------------------
-def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
+def compute_indicators(
+    df: pd.DataFrame,
+    heikin: bool = False,
+    *,
+    vwap_enabled: bool = False,
+    stoch_enabled: bool = False,
+) -> pd.DataFrame:
     d = df.copy()
 
     # (opsional) Heikin Ashi
     if heikin:
         ha = d.copy()
-        ha['ha_close'] = (pd.to_numeric(ha['open'], errors='coerce') + 
-                          pd.to_numeric(ha['high'], errors='coerce') + 
-                          pd.to_numeric(ha['low'], errors='coerce') + 
-                          pd.to_numeric(ha['close'], errors='coerce')) / 4
+        ha['ha_close'] = (
+            pd.to_numeric(ha['open'], errors='coerce')
+            + pd.to_numeric(ha['high'], errors='coerce')
+            + pd.to_numeric(ha['low'], errors='coerce')
+            + pd.to_numeric(ha['close'], errors='coerce')
+        ) / 4
         ha['ha_open'] = pd.to_numeric(ha['open'], errors='coerce').shift(1)
-        ha.loc[ha.index[0], 'ha_open'] = (pd.to_numeric(ha.loc[ha.index[0], 'open'], errors='coerce') + 
-                                          pd.to_numeric(ha.loc[ha.index[0], 'close'], errors='coerce')) / 2
-        ha['ha_high']  = ha[['high','ha_open','ha_close']].max(axis=1)
-        ha['ha_low']   = ha[['low','ha_open','ha_close']].min(axis=1)
-        d[['open','high','low','close']] = ha[['ha_open','ha_high','ha_low','ha_close']]
+        ha.loc[ha.index[0], 'ha_open'] = (
+            pd.to_numeric(ha.loc[ha.index[0], 'open'], errors='coerce')
+            + pd.to_numeric(ha.loc[ha.index[0], 'close'], errors='coerce')
+        ) / 2
+        ha['ha_high'] = ha[['high', 'ha_open', 'ha_close']].max(axis=1)
+        ha['ha_low'] = ha[['low', 'ha_open', 'ha_close']].min(axis=1)
+        d[['open', 'high', 'low', 'close']] = ha[['ha_open', 'ha_high', 'ha_low', 'ha_close']]
 
     # EMA/MA, MACD, RSI
-    d['ema_20'] = EMAIndicator(d['close'], 20).ema_indicator()
+    d['ema_22'] = EMAIndicator(d['close'], 22).ema_indicator()
     d['ma_22'] = SMAIndicator(d['close'], 22).sma_indicator()
     macd = MACD(d['close'])
     d['macd'] = macd.macd()
@@ -169,41 +181,93 @@ def compute_indicators(df: pd.DataFrame, heikin: bool = False) -> pd.DataFrame:
 
     # ATR (EMA Wilder-ish) & normalisasi
     prev_close = d['close'].shift(1)
-    tr = pd.concat([(d['high']-d['low']).abs(), (d['high']-prev_close).abs(), (d['low']-prev_close).abs()], axis=1).max(axis=1)
-    d['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean().fillna(0.0)
+    tr = pd.concat(
+        [
+            (d['high'] - d['low']).abs(),
+            (d['high'] - prev_close).abs(),
+            (d['low'] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    d['atr'] = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().fillna(0.0)
     d['atr_pct'] = (d['atr'] / d['close']).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    # Bollinger Band width (persentase)
+    bb = BollingerBands(d['close'])
+    width = bb.bollinger_hband() - bb.bollinger_lband()
+    mid = bb.bollinger_mavg().replace(0, np.nan)
+    d['bb_width_pct'] = (width / mid).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
     # body/ATR + alias
     d['body'] = (d['close'] - d['open']).abs()
     d['body_to_atr'] = (d['body'] / d['atr']).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    d['body_atr']    = d['body_to_atr']  # alias untuk backward compat
+    d['body_atr'] = d['body_to_atr']  # alias untuk kompatibilitas
+
+    # VWAP opsional
+    if vwap_enabled and 'volume' in d.columns:
+        vwap = VolumeWeightedAveragePrice(
+            high=d['high'], low=d['low'], close=d['close'], volume=d['volume']
+        )
+        d['vwap'] = vwap.volume_weighted_average_price()
+
+    # StochRSI opsional
+    if stoch_enabled:
+        stoch = StochRSIIndicator(d['close'])
+        d['stoch_rsi'] = stoch.stochrsi()
+
     return d
 
 
 USE_BACKTEST_ENTRY_LOGIC = bool(int(os.getenv("USE_BACKTEST_ENTRY_LOGIC", "1")))
 
 
-def compute_base_signals_backtest(df: pd.DataFrame) -> tuple[bool, bool]:
-    ema_now, ema_prev = df['ema_20'].iloc[-1], df['ema_20'].iloc[-2]
-    ma_now, ma_prev = df['ma_22'].iloc[-1], df['ma_22'].iloc[-2]
-    macd_now, macd_sig = df['macd'].iloc[-1], df['macd_signal'].iloc[-1]
-    rsi_now = df['rsi'].iloc[-1]
-    long_base = (ema_prev <= ma_prev) and (ema_now > ma_now) and (macd_now > macd_sig) and (10 <= rsi_now <= 45)
-    short_base = (ema_prev >= ma_prev) and (ema_now < ma_now) and (macd_now < macd_sig) and (70 <= rsi_now <= 90)
-    logging.getLogger(__name__).info(
-        f"BASE ema_20={ema_now:.6f} ma22={ma_now:.6f} macd={macd_now:.6f} sig={macd_sig:.6f} rsi={rsi_now:.2f} -> L={long_base} S={short_base}"
-    )
-    return bool(long_base), bool(short_base)
+def _rsi_pullback(rsi: float, side: str) -> bool:
+    if side == 'LONG':
+        return 10 <= rsi <= 45
+    else:
+        return 70 <= rsi <= 90
 
 
-def compute_base_signals_live(df: pd.DataFrame) -> tuple[bool, bool]:
+def _rsi_midrange(rsi: float, side: str) -> bool:
+    if side == 'LONG':
+        return 40 <= rsi <= 70
+    else:
+        return 30 <= rsi <= 60
+
+
+def compute_base_signals(df: pd.DataFrame, coin_cfg: Dict[str, Any] | None = None) -> tuple[bool, bool]:
+    """Hitung sinyal dasar berbasis tren EMA vs SMA dan rentang RSI.
+    rsi_mode default PULLBACK.
+    """
+    coin_cfg = coin_cfg or {}
     last = df.iloc[-1]
-    long_base = (last.get('ema_20', 0) > last.get('ma_22', 0)) and (last.get('macd', 0) > last.get('macd_signal', 0)) and (last.get('rsi', 50) <= 45)
-    short_base = (last.get('ema_20', 0) < last.get('ma_22', 0)) and (last.get('macd', 0) < last.get('macd_signal', 0)) and (last.get('rsi', 50) >= 70)
-    return bool(long_base), bool(short_base)
+    ema = last.get('ema_22', 0)
+    ma = last.get('ma_22', 0)
+    rsi_now = float(last.get('rsi', 50))
+    trend_up = ema > ma
+    trend_dn = ema < ma
+    mode = str(coin_cfg.get('rsi_mode', 'PULLBACK')).upper()
+    if mode == 'MIDRANGE':
+        long_ok = trend_up and _rsi_midrange(rsi_now, 'LONG')
+        short_ok = trend_dn and _rsi_midrange(rsi_now, 'SHORT')
+    else:
+        long_ok = trend_up and _rsi_pullback(rsi_now, 'LONG')
+        short_ok = trend_dn and _rsi_pullback(rsi_now, 'SHORT')
+    logging.getLogger(__name__).info(
+        f"BASE ema22={ema:.6f} ma22={ma:.6f} rsi={rsi_now:.2f} mode={mode} -> L={long_ok} S={short_ok}"
+    )
+    return bool(long_ok), bool(short_ok)
 
 
-ML_WEIGHT = float(os.getenv("ML_WEIGHT", "1.2"))
+def compute_base_signals_backtest(df: pd.DataFrame, coin_cfg: Dict[str, Any] | None = None) -> tuple[bool, bool]:
+    return compute_base_signals(df, coin_cfg)
+
+
+def compute_base_signals_live(df: pd.DataFrame, coin_cfg: Dict[str, Any] | None = None) -> tuple[bool, bool]:
+    return compute_base_signals(df, coin_cfg)
+
+
+ML_WEIGHT = float(os.getenv("ML_WEIGHT", "1.0"))
 
 
 def get_coin_ml_params(symbol: str, coin_config: dict) -> dict:
@@ -221,9 +285,9 @@ def get_coin_ml_params(symbol: str, coin_config: dict) -> dict:
 def make_decision(df: pd.DataFrame, symbol: str, coin_cfg: dict, ml_up_prob: float | None) -> Optional[str]:
     params = get_coin_ml_params(symbol, coin_cfg)
     if USE_BACKTEST_ENTRY_LOGIC:
-        long_base, short_base = compute_base_signals_backtest(df)
+        long_base, short_base = compute_base_signals_backtest(df, coin_cfg)
     else:
-        long_base, short_base = compute_base_signals_live(df)
+        long_base, short_base = compute_base_signals_live(df, coin_cfg)
     score_long = 1.0 if long_base else 0.0
     score_short = 1.0 if short_base else 0.0
     if params["enabled"] and ml_up_prob is not None:
@@ -261,17 +325,22 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
     min_atr = _to_float(coin_cfg.get('min_atr_pct', 0.0), 0.0)
     max_atr = _to_float(coin_cfg.get('max_atr_pct', 1.0), 1.0)
     max_body = _to_float(coin_cfg.get('max_body_atr', 999.0), 999.0)
+    min_bb = _to_float(coin_cfg.get('filters', {}).get('min_bb_width', 0.0), 0.0)
+
     atr_ok = (ind['atr_pct'] >= min_atr) and (ind['atr_pct'] <= max_atr)
 
     body_val = ind.get('body_to_atr', ind.get('body_atr'))
     body_ok = (float(body_val) <= max_body) if body_val is not None else False
-    if not atr_ok or not body_ok:
+    bb_val = float(ind.get('bb_width_pct', 0.0))
+    bb_ok = bb_val >= min_bb
+    if not atr_ok or not body_ok or not bb_ok:
         logging.getLogger(__name__).info(
-            f"[{coin_cfg.get('symbol', '?')}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} price={ind.get('close')}"
+            f"[{coin_cfg.get('symbol', '?')}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} bb_ok={bb_ok} price={ind.get('close')}"
         )
-    return atr_ok, body_ok, {
+    return atr_ok and bb_ok, body_ok, {
         'atr_pct': float(ind['atr_pct']),
-        'body_to_atr': float(body_val) if body_val is not None else float('nan')
+        'body_to_atr': float(body_val) if body_val is not None else float('nan'),
+        'bb_width_pct': bb_val,
     }
 
 def decide_base(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Dict[str, bool]:
