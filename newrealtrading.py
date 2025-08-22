@@ -522,11 +522,9 @@ class CoinTrader:
                 trailing_step_val = DEFAULTS['trailing_step']
         trailing_step = self._clamp_pos(trailing_step_val, ts_min)
         safe_trigger = max(trailing_trigger, safe_buffer_pct + trailing_step)
-        # ATR-aware guard (opsional)
         atr_pct = getattr(self, "_last_atr_pct", None)
         if isinstance(atr_pct, (int, float)) and atr_pct > 0:
-            cap = max(safe_trigger, min(safe_trigger * 1.25, (atr_pct * 100.0) * 1.6))
-            safe_trigger = max(safe_trigger, cap)
+            safe_trigger = max(safe_trigger, min(safe_trigger * 1.15, (atr_pct * 100.0) * 1.3))
         return safe_trigger, trailing_step
 
     def _size_position(self, price: float, sl: float, balance: float) -> float:
@@ -922,7 +920,7 @@ class CoinTrader:
                     lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
                     roi_frac = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
                     trigger = False
-                    if time_stop_only_if_loss == 1 and roi_frac < 0:
+                    if time_stop_only_if_loss == 1 and roi_frac <= 0:
                         trigger = True
                     if min_roi >= 0 and roi_frac < min_roi:
                         trigger = True
