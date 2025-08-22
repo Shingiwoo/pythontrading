@@ -58,40 +58,39 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
     except Exception:
         pass
 
-    # Hook kumpulkan trades & PnL dummy
+    # Hook kumpulkan trades
     trades: list[dict] = []
-    trader._entry_count = 0
-    trader._exit_count = 0
-    orig_enter = nrt.CoinTrader._enter_position
-    orig_exit = nrt.CoinTrader._exit_position
+    orig_enter = trader._enter_position
+    orig_exit = trader._exit_position
 
-    def _enter_wrap(self, side: str, price: float, atr: float, available_balance: float, **kw) -> float:
-        self._entry_count += 1
-        used = orig_enter(self, side, price, atr, available_balance, **kw)
-        return used
-
-    def _exit_wrap(self, price: float, reason: str = "Exit", **kw) -> None:
-        pos = self.pos
-        ts = kw.get("now_ts")
-        exit_time = nrt._to_dt_safe(ts)
-        if pos.side and pos.entry and pos.qty:
-            pnl = (price - pos.entry) * pos.qty if pos.side == "LONG" else (pos.entry - price) * pos.qty
+    def _enter_wrap(side: str, price: float, atr: float, available_balance: float, **kw) -> float:
+        ok = orig_enter(side, price, atr, available_balance, **kw)
+        if ok and trader.pos.side:
             trades.append({
-                "symbol": symbol,
-                "side": pos.side,
-                "entry_price": float(pos.entry),
-                "exit_price": float(price),
-                "qty": float(pos.qty),
-                "pnl": float(pnl),
-                "reason": reason,
-                "entry_time": pos.entry_time,
-                "exit_time": exit_time,
+                "entry_ts": trader.pos.entry_time.isoformat() if trader.pos.entry_time is not None else None,
+                "side": trader.pos.side,
+                "entry": trader.pos.entry,
+                "qty": trader.pos.qty,
+                "sl_init": trader.pos.sl,
+                "tsl_init": trader.pos.trailing_sl,
             })
-        self._exit_count += 1
-        return orig_exit(self, price, reason, **kw)
+        return ok
 
-    nrt.CoinTrader._enter_position = _enter_wrap
-    nrt.CoinTrader._exit_position = _exit_wrap
+    def _exit_wrap(price: float, reason: str = "Exit", **kw) -> None:
+        before = trades[-1] if trades else None
+        orig_exit(price, reason, **kw)
+        if before and before.get("exit") is None:
+            before["exit_ts"] = pd.Timestamp.utcnow().isoformat()
+            before["exit"] = price
+            before["reason"] = reason
+            before["pnl"] = (
+                (price - before["entry"]) * before["qty"]
+                if before["side"] == "LONG"
+                else (before["entry"] - price) * before["qty"]
+            )
+
+    trader._enter_position = _enter_wrap
+    trader._exit_position = _exit_wrap
 
     # Replay loop
     t0 = time.time()
@@ -104,38 +103,42 @@ def run_dry(symbol: str, csv_path: str, coin_config_path: str, steps_limit: int,
 
     # Ringkasan
     trades_df = pd.DataFrame(trades)
-    if not trades_df.empty:
-        wins = (trades_df["pnl"] > 0).sum()
-        losses = (trades_df["pnl"] <= 0).sum()
+    closed_df = trades_df.dropna(subset=["exit"]) if not trades_df.empty else trades_df
+    if not closed_df.empty:
+        wins = (closed_df["pnl"] > 0).sum()
+        losses = (closed_df["pnl"] <= 0).sum()
         pf = (
-            trades_df.loc[trades_df["pnl"] > 0, "pnl"].sum()
-            / abs(trades_df.loc[trades_df["pnl"] <= 0, "pnl"].sum())
+            closed_df.loc[closed_df["pnl"] > 0, "pnl"].sum()
+            / abs(closed_df.loc[closed_df["pnl"] <= 0, "pnl"].sum())
             if losses > 0
             else np.inf
         )
-        wr = (trades_df["pnl"] > 0).mean() * 100
-        avg_pnl = trades_df["pnl"].mean()
+        wr = (closed_df["pnl"] > 0).mean() * 100
+        avg_pnl = closed_df["pnl"].mean()
     else:
         wins = losses = 0
         pf = np.nan
         wr = 0.0
         avg_pnl = 0.0
 
+    entries = len(trades)
+    exits = len(closed_df)
+
     summary = {
         "symbol": symbol,
         "rows_total": len(df),
         "warmup_index": start_i,
         "steps_executed": steps,
-        "entries": trader._entry_count,
-        "exits": trader._exit_count,
+        "entries": entries,
+        "exits": exits,
         "last_position": trader.pos.side,
-        "trades": len(trades),
+        "trades": exits,
         "win_rate_pct": round(float(wr), 2),
         "profit_factor": float(pf) if pf == np.inf else (round(float(pf), 2) if not np.isnan(pf) else None),
         "avg_pnl": round(float(avg_pnl), 6),
         "elapsed_sec": round(elapsed, 2),
     }
-    return summary, trades_df
+    return summary, closed_df
 
 
 def main():

@@ -337,9 +337,8 @@ class JournaledCoinTrader(CoinTrader):
         return used
 
     def _exit_position(self, price: float, reason: str = "Exit", **kw) -> None:
-        if self.pos.side:
-            self.journal.on_exit(self.symbol, price, reason)
-        return super()._exit_position(price, reason, **kw)
+        super()._exit_position(price, reason, **kw)
+        self.journal.on_exit(self.symbol, price, reason)
 
 # -----------------------------
 # Live runner

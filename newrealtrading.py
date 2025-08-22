@@ -378,7 +378,8 @@ DEFAULTS = {
     "trailing_trigger": 0.7,   # %
     "trailing_step": 0.45,     # %
     "max_hold_seconds": 3600,
-    "min_roi_to_close_by_time": 0.005,
+    "time_stop_only_if_loss": 0,
+    "min_roi_to_close_by_time": -1.0,
     # lot size & precision (opsional, jika tersedia dari exchange info)
     "stepSize": 0.0,
     "minQty": 0.0,
@@ -446,8 +447,10 @@ class CoinTrader:
         ts_now = float(now_ts) if now_ts is not None else time.time()
         return bool(self.cooldown_until_ts and ts_now < float(self.cooldown_until_ts))
 
-    def _to_dt(self, now_ts: Optional[float] = None) -> pd.Timestamp:
-        return _to_dt_safe(now_ts)
+    def _to_dt(self, ts: float | int | None) -> pd.Timestamp:
+        if ts is None:
+            return pd.Timestamp.utcnow().tz_localize("UTC")
+        return pd.to_datetime(float(ts), unit="s", utc=True)
 
     def _clamp_pos(self, x: float, min_x: float = 1e-9) -> float:
         return x if (x is not None and x > min_x) else min_x
@@ -708,20 +711,26 @@ class CoinTrader:
             self._log(f"error MARKET ENTRY: {e}")
             return 0.0
 
-    def _should_exit(self, price: float) -> Tuple[bool, Optional[str]]:
+    def _should_exit(
+        self,
+        *,
+        price: float | None = None,
+        high: float | None = None,
+        low: float | None = None,
+    ) -> tuple[bool, str | None]:
         if not self.pos.side:
             return False, None
-        # trailing/hard SL
-        if self.pos.side=='LONG':
-            if self.pos.trailing_sl is not None and price <= self.pos.trailing_sl:
-                return True, 'Hit Trailing SL'
-            if (self.pos.sl is not None) and price <= self.pos.sl:
-                return True, 'Hit Hard SL'
+        stop = self.pos.trailing_sl if self.pos.trailing_sl is not None else self.pos.sl
+        if self.pos.side == "LONG":
+            if low is not None and stop is not None and low <= stop:
+                return True, "TRAILING_SL" if self.pos.trailing_sl is not None else "HARD_SL"
+            if price is not None and stop is not None and price <= stop:
+                return True, "TRAILING_SL" if self.pos.trailing_sl is not None else "HARD_SL"
         else:
-            if self.pos.trailing_sl is not None and price >= self.pos.trailing_sl:
-                return True, 'Hit Trailing SL'
-            if (self.pos.sl is not None) and price >= self.pos.sl:
-                return True, 'Hit Hard SL'
+            if high is not None and stop is not None and high >= stop:
+                return True, "TRAILING_SL" if self.pos.trailing_sl is not None else "HARD_SL"
+            if price is not None and stop is not None and price >= stop:
+                return True, "TRAILING_SL" if self.pos.trailing_sl is not None else "HARD_SL"
         return False, None
 
     def _exit_position(self, price: float, reason: str = 'Exit', **kw) -> None:
@@ -750,11 +759,12 @@ class CoinTrader:
         self.pos = Position()  # reset
         base_cd = _to_int(self.config.get('cooldown_seconds', DEFAULTS['cooldown_seconds']), DEFAULTS['cooldown_seconds'])
         mul = 1.0
-        if 'Hard SL' in (reason or ''):
+        ru = (reason or '').upper()
+        if ru == 'HARD_SL':
             mul = _to_float(self.config.get('cooldown_mul_hard_sl', 1.0), 1.0)
-        elif 'Trailing' in (reason or ''):
+        elif ru == 'TRAILING_SL':
             mul = _to_float(self.config.get('cooldown_mul_trailing', 1.0), 1.0)
-        elif 'Max hold' in (reason or '') or 'early' in (reason or '').lower():
+        elif ru == 'TIME_STOP' or 'EARLY' in ru:
             mul = _to_float(self.config.get('cooldown_mul_early_stop', 1.0), 1.0)
         # Jika profit dan diizinkan, bisa tanpa cooldown
         if _to_bool(self.config.get('no_cooldown_on_profit', DEFAULTS['no_cooldown_on_profit']),
@@ -790,6 +800,8 @@ class CoinTrader:
         self._on_new_bar(last_ts)
         last = df.iloc[-1]
         price = float(last['close'])
+        bar_high = float(last['high'])
+        bar_low = float(last['low'])
         htf = str(self.config.get('htf', '1h'))
         if not math.isfinite(price):
             raise ValueError("Non-finite price")
@@ -816,14 +828,19 @@ class CoinTrader:
             if self.pending_skip_entries > 0:
                 self._apply_breakeven(price)
                 self._update_trailing(price)
+                ex, reason = self._should_exit(price=price, high=bar_high, low=bar_low)
+                if ex:
+                    exit_price = self.pos.trailing_sl or self.pos.sl or price
+                    self._exit_position(exit_price, reason or 'Exit', now_ts=now_ts)
                 return 0.0
 
             if self.pos.side:
                 self._apply_breakeven(price)
                 self._update_trailing(price)
-                ex, rs = self._should_exit(price)
+                ex, rs = self._should_exit(price=price, high=bar_high, low=bar_low)
                 if ex:
-                    self._exit_position(price, rs or 'Exit', now_ts=now_ts)
+                    exit_price = self.pos.trailing_sl or self.pos.sl or price
+                    self._exit_position(exit_price, rs or 'Exit', now_ts=now_ts)
                     return 0.0
 
             atr_ok, body_ok, meta = apply_filters(last, self.config)
@@ -874,44 +891,30 @@ class CoinTrader:
             decision = make_decision(df, self.symbol, self.config, up_prob, atr_ok=atr_ok, body_ok=body_ok, meta=meta)
             long_sig = decision == 'LONG'
             short_sig = decision == 'SHORT'
-            # Update SL/TS saat pegang posisi
-            if self.pos.side:
-                self._apply_breakeven(price)
-                self._update_trailing(price)
-                ex, reason = self._should_exit(price)
-                if ex:
-                    self._exit_position(price, reason or 'Exit', now_ts=now_ts)
-                    return 0.0
 
-            # ---- Time-stop (selaras backtest) ----
-            max_hold = _to_int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)), 3600)
-            min_roi  = _to_float(self.config.get("min_roi_to_close_by_time", DEFAULTS.get("min_roi_to_close_by_time", 0.005)), 0.005)
+            # ---- Time-stop ----
+            max_hold = int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)))
+            time_stop_only_if_loss = int(self.config.get("time_stop_only_if_loss", 0))
+            min_roi = float(self.config.get("min_roi_to_close_by_time", DEFAULTS.get("min_roi_to_close_by_time", -1.0)))
 
             if self.pos.side and self.pos.entry_time and max_hold > 0:
                 now_dt = self._to_dt(now_ts)
-                elapsed = (now_dt - self.pos.entry_time).total_seconds()
-                lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
-                if self.pos.entry is not None and self.pos.qty is not None:
-                    init_margin = safe_div((self.pos.entry * self.pos.qty), lev)
-                    if self.pos.side == "LONG":
-                        roi_frac = safe_div(((price - self.pos.entry) * self.pos.qty), init_margin)
-                    else:
-                        roi_frac = safe_div(((self.pos.entry - price) * self.pos.qty), init_margin)
-
-                    only_if_loss = _to_bool(self.config.get('time_stop_only_if_loss', 0), False)
-                    if elapsed >= max_hold:
-                        if only_if_loss:
-                            if roi_frac <= 0:
-                                self._exit_position(price, f"Max hold reached (loss, ROI {roi_frac*100:.2f}% )", now_ts=now_ts)
-                                return 0.0
-                            else:
-                                self.pos.entry_time = now_dt
+                elapsed_seconds = (now_dt - self.pos.entry_time).total_seconds()
+                if elapsed_seconds >= max_hold:
+                    lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
+                    roi_frac = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
+                    if time_stop_only_if_loss:
+                        if roi_frac <= 0:
+                            self._exit_position(price, "TIME_STOP", now_ts=now_ts)
+                            return 0.0
                         else:
-                            if roi_frac >= min_roi:
-                                self._exit_position(price, f"Max hold reached (ROI {roi_frac*100:.2f}%)", now_ts=now_ts)
-                                return 0.0
-                            else:
-                                self.pos.entry_time = now_dt
+                            self.pos.entry_time = now_dt
+                    else:
+                        if min_roi < 0 or roi_frac >= min_roi:
+                            self._exit_position(price, "TIME_STOP", now_ts=now_ts)
+                            return 0.0
+                        else:
+                            self.pos.entry_time = now_dt
             # --------------------------------------
             used = 0.0
             # Entry baru

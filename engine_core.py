@@ -343,6 +343,8 @@ def make_decision(
     last = df.iloc[-1]
     if atr_ok is None or body_ok is None or meta is None:
         atr_ok, body_ok, meta = apply_filters(last, coin_cfg)
+    if not atr_ok or not body_ok:
+        return None
 
     long_base = long_base and atr_ok and body_ok
     short_base = short_base and atr_ok and body_ok
