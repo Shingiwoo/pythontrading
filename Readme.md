@@ -71,7 +71,7 @@ BINANCE_API_SECRET=YOUR_SECRET
 INSTANCE_ID=botA
 # ML & scoring (opsional)
 USE_ML=1
-SCORE_THRESHOLD=1.2
+SCORE_THRESHOLD=2.0  # 1.0 = OR, 2.0 = AND
 ML_MIN_TRAIN_BARS=400
 ML_RETRAIN_EVERY=5000
 ```
@@ -167,7 +167,7 @@ python papertrade.py \
 * Menjamin presisi **LOT\_SIZE** dan **MIN\_NOTIONAL** sesuai exchange.
 * **Balance** dipisah per simbol (simulasi saldo lokal).
 
-**Argumen utama**: `--risk_pct`, `--ml-thr`, `--ml-override`, `--no-atr-filter`, `--no-body-filter`, `--htf`, `--heikin`, `--fee_bps`, `--slip_bps`, `--max-concurrent`, `--limit_bars`, `--timeout`, `--retries`, `--verbose`.
+**Argumen utama**: `--risk_pct`, `--ml-thr` (1.0=OR, 2.0=AND, default 2.0), `--ml-override`, `--no-atr-filter`, `--no-body-filter`, `--htf`, `--heikin`, `--fee_bps`, `--slip_bps`, `--max-concurrent`, `--limit_bars`, `--timeout`, `--retries`, `--verbose`.
 
 ---
 
@@ -283,7 +283,7 @@ python newrealtrading.py \
 * **CLI utama** — argumen penting:
 
   * `--live-paper`, `--symbols`, `--interval`, `--balance`, `--coin_config`, `--instance-id`, `--logs_dir`,
-  * `--risk_pct`, `--ml-thr`, `--htf`, `--heikin`, `--fee_bps`, `--slip_bps`, `--max-concurrent`, `--limit_bars`, `--timeout`, `--retries`, `--verbose`.
+  * `--risk_pct`, `--ml-thr` (1.0=OR, 2.0=AND, default 2.0), `--htf`, `--heikin`, `--fee_bps`, `--slip_bps`, `--max-concurrent`, `--limit_bars`, `--timeout`, `--retries`, `--verbose`.
 
 ### tools\_dryrun\_summary.py
 
