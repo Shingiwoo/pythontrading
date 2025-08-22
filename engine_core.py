@@ -340,22 +340,15 @@ def make_decision(df: pd.DataFrame, symbol: str, coin_cfg: dict, ml_up_prob: flo
     return decision
 
 def htf_trend_ok(side: str, base_df: pd.DataFrame, htf: str = '1h') -> bool:
-    """
-    Gate HTF: pakai EMA22 vs SMA22 pada timeframe lebih tinggi (default 1H).
-    LONG diijinkan jika EMA22 >= SMA22; SHORT jika EMA22 <= SMA22.
-    Jika data HTF belum cukup, kembalikan True (jangan blokir).
-    """
     try:
-        d = base_df.set_index('timestamp')[['close']].copy()
+        tmp = base_df.set_index('timestamp')[['close']].copy()
         res = str(htf).upper()
-        htf_close = d['close'].resample(res).last().dropna()
-        if len(htf_close) < 30:  # ~cukup untuk EMA/SMA22
+        htf_close = tmp['close'].resample(res).last().dropna()
+        if len(htf_close) < 210:
             return True
-        ema22 = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
-        sma22 = htf_close.rolling(22).mean().iloc[-1]
-        if np.isnan(ema22) or np.isnan(sma22):
-            return True
-        return (ema22 >= sma22) if side == 'LONG' else (ema22 <= sma22)
+        ema50 = htf_close.ewm(span=20, adjust=False).mean().iloc[-1]
+        ema200 = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
+        return (ema50 >= ema200) if side == 'LONG' else (ema50 <= ema200)
     except Exception:
         return True
 def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool, Dict[str, Any]]:
