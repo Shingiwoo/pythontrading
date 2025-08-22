@@ -47,7 +47,7 @@
       "use_macd_confirm": false,
       "rsi_mode": "PULLBACK",
       "rsi_long_max": 45.0,
-      "rsi_short_min": 70.0,
+      "rsi_short_min": 60.0,
       "cooldown_seconds": 0,
       "use_breakeven": 0,
       "trailing_trigger": 9999,
@@ -60,13 +60,13 @@
         "body_filter_enabled": false,
         "min_bb_width": 0.0
       },
-      "ml": { "enabled": true, "strict": false, "score_threshold": 1.0, "weight": 1.0 }
+      "ml": { "enabled": true, "strict": false, "score_threshold": 2.0, "weight": 1.5 }
     },
     "SCALP-ADA-15M-STRICT": {
       "use_macd_confirm": true,
       "rsi_mode": "PULLBACK",
       "rsi_long_max": 45.0,
-      "rsi_short_min": 70.0,
+      "rsi_short_min": 60.0,
       "cooldown_seconds": 0,
       "use_breakeven": 0,
       "trailing_trigger": 9999,
@@ -79,7 +79,7 @@
         "body_filter_enabled": false,
         "min_bb_width": 0.0
       },
-      "ml": { "enabled": true, "strict": false, "score_threshold": 1.0, "weight": 1.0 }
+      "ml": { "enabled": true, "strict": false, "score_threshold": 2.0, "weight": 1.5 }
     }
   },
   "SYMBOL_DEFAULTS": {
@@ -96,7 +96,7 @@
     "no_cooldown_on_profit": 1
   },
   "ADAUSDT": {
-    "use_preset": "SCALP-ADA-15M",
+    "use_preset": "SCALP-ADA-15M-STRICT",
     "leverage": 15,
     "risk_per_trade": 0.08,
     "taker_fee": 0.0005,
@@ -107,6 +107,8 @@
     "max_body_atr": 2.5,
     "use_htf_filter": 0,
     "cooldown_seconds": 900,
+    "rsi_long_max": 45.0,
+    "rsi_short_min": 60.0,
     "sl_mode": "ATR",
     "sl_pct": 0.008,
     "sl_atr_mult": 1.8,
@@ -123,10 +125,12 @@
       ]
     },
     "ml": {
-      "strict": true,
+      "enabled": true,
+      "strict": false,
       "up_prob_long": 0.55,
       "down_prob_short": 0.45,
-      "score_threshold": 1.0
+      "score_threshold": 2.0,
+      "weight": 1.5
     },
     "use_breakeven": 1,
     "be_trigger_pct": 0.004,

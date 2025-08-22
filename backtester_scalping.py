@@ -9,7 +9,7 @@ from ta.volatility import BollingerBands
 from ta.momentum import RSIIndicator
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
-from engine_core import apply_breakeven_sl
+from engine_core import apply_breakeven_sl, make_decision, compute_base_signals
 
 """
 ============================================================
@@ -270,18 +270,28 @@ if selected_file:
 
     for i in range(1, len(df)):
         row = df.iloc[i]
-        sc_long = 0.0; sc_short = 0.0
-        # base scoring
-        if row['ema'] > row['ma'] and row['macd'] > row['macd_signal'] and (10 <= row['rsi'] <= 45):
-            sc_long += 1
-        if row['ema'] < row['ma'] and row['macd'] < row['macd_signal'] and (70 <= row['rsi'] <= 90):
-            sc_short += 1
+        sub = df.iloc[: i + 1]
+        up_prob = None
         if use_ml:
-            sc_long += (1 if row['ml_signal']==1 else 0)
-            sc_short += (1 if row['ml_signal']==0 else 0)
+            up_prob = 0.6 if row.get('ml_signal') == 1 else 0.4
+        cfg_loop = {
+            'rsi_long_max': 45.0,
+            'rsi_short_min': 60.0,
+            'use_macd_confirm': True,
+            'ml': {
+                'enabled': use_ml,
+                'strict': False,
+                'score_threshold': float(score_threshold),
+                'weight': 1.0,
+                'up_prob_long': 0.55,
+                'down_prob_short': 0.45
+            }
+        }
+        decision = make_decision(sub, symbol or 'SYM', cfg_loop, up_prob)
+        long_raw = decision == 'LONG'
+        short_raw = decision == 'SHORT'
 
-        long_raw = sc_long >= float(score_threshold)
-        short_raw = sc_short >= float(score_threshold)
+        long_base, short_base = compute_base_signals(sub, cfg_loop)
 
         atr_pct_now = float(row['atr_pct'] or 0)
         body_to_atr_now = float(row['body_to_atr'] or 0)
@@ -289,10 +299,9 @@ if selected_file:
 
         blocked_reasons_long = []
         blocked_reasons_short = []
-        # Jika base tidak lolos threshold
-        if not long_raw and sc_long>0:
+        if not long_raw and long_base:
             blocked_reasons_long.append('score_below_threshold')
-        if not short_raw and sc_short>0:
+        if not short_raw and short_base:
             blocked_reasons_short.append('score_below_threshold')
 
         # Filters
@@ -317,7 +326,7 @@ if selected_file:
         # Set sinyal akhir
         if long_raw:
             df.loc[i,'long_signal'] = True
-        elif sc_long>0 and debug_mode:
+        elif long_base and debug_mode:
             debug_rows.append({
                 'timestamp': row['timestamp'], 'price': float(row['close']), 'side': 'LONG',
                 'atr_pct': atr_pct_now, 'body_to_atr': body_to_atr_now,
@@ -326,7 +335,7 @@ if selected_file:
 
         if short_raw:
             df.loc[i,'short_signal'] = True
-        elif sc_short>0 and debug_mode:
+        elif short_base and debug_mode:
             debug_rows.append({
                 'timestamp': row['timestamp'], 'price': float(row['close']), 'side': 'SHORT',
                 'atr_pct': atr_pct_now, 'body_to_atr': body_to_atr_now,
@@ -522,8 +531,16 @@ if selected_file:
 
     # ---------- Diagnostics ----------
     with st.expander("📟 Diagnostics (cek kenapa nggak entry)", expanded=False):
-        base_long = int(((df['ema']>df['ma']) & (df['macd']>df['macd_signal']) & df['rsi'].between(40,60)).sum())
-        base_short = int(((df['ema']<df['ma']) & (df['macd']<df['macd_signal']) & df['rsi'].between(30,60)).sum())
+        base_long = base_short = 0
+        for i in range(1, len(df)):
+            lb, sb = compute_base_signals(
+                df.iloc[: i + 1],
+                {'rsi_long_max': 45.0, 'rsi_short_min': 60.0, 'use_macd_confirm': True}
+            )
+            if lb:
+                base_long += 1
+            if sb:
+                base_short += 1
         atr_ok = int((df['atr_pct'].between(min_atr_pct, max_atr_pct)).sum())
         st.write({
             "total_bar": int(len(df)),
