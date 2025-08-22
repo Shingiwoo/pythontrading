@@ -365,7 +365,7 @@ def main():
     ap.add_argument("--instance-id", default=None)
     ap.add_argument("--logs_dir", default=None)
     ap.add_argument("--risk_pct", type=float, default=None, help="Override risk_per_trade (contoh: 0.01)")
-    ap.add_argument("--ml-thr", type=float, default=2.0, help="Threshold odds ML")
+    ap.add_argument("--ml-thr", type=float, default=1.20, help="Threshold odds ML")
     ap.add_argument("--htf", default=None, help="Higher timeframe (contoh: 1h)")
     ap.add_argument("--heikin", action="store_true", help="Gunakan Heikin-Ashi")
     ap.add_argument("--fee_bps", type=float, default=10.0, help="Biaya taker per sisi (bps)")

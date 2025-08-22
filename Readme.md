@@ -71,9 +71,9 @@ BINANCE_API_SECRET=YOUR_SECRET
 INSTANCE_ID=botA
 # ML & scoring (opsional)
 USE_ML=1
-SCORE_THRESHOLD=2.0
+SCORE_THRESHOLD=1.2
 ML_MIN_TRAIN_BARS=400
-ML_RETRAIN_EVERY=120
+ML_RETRAIN_EVERY=5000
 ```
 
 > `INSTANCE_ID` dipakai untuk `newClientOrderId` dan pemisahan log multi‑bot.
@@ -235,7 +235,7 @@ python newrealtrading.py \
 ### ml\_signal\_plugin.py
 
 * **`MLParams` (dataclass)** — parameter: `use_ml`, `score_threshold`, `min_train_bars`, `lookahead`, `retrain_every_bars`, `up_prob_thres`, `down_prob_thres`.
-* **`MLSignal(coin_cfg=None, thr=2.0, htf=None, heikin=False, model_path=None, device='cpu')`**
+* **`MLSignal(coin_cfg=None, thr=1.2, htf=None, heikin=False, model_path=None, device='cpu')`**
 
   * `fit_if_needed(df)` — build dataset (fit **RandomForest** bila perlu).
   * `predict_up_prob(df)` — probabilitas naik (kelas=1) di bar terakhir.

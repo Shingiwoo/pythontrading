@@ -376,7 +376,7 @@ DEFAULTS = {
 
 ENV_DEFAULTS = {
     "SLIPPAGE_PCT": 0.02,  # % per sisi
-    "SCORE_THRESHOLD": 2.0,
+    "SCORE_THRESHOLD": 1.2,
 }
 
 # ============================
@@ -830,7 +830,7 @@ class CoinTrader:
                 print(f"[{self.symbol}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} bb_ok={bb_ok} price={price} pos={self.pos.side or 'None'}")
 
             # HTF filter (opsional)
-            if to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
+            if _to_bool(self.config.get('use_htf_filter', DEFAULTS['use_htf_filter']), DEFAULTS['use_htf_filter']):
                 if last['ema_22'] > last['ma_22'] and not htf_trend_ok('LONG', df, htf=htf):
                     long_htf_ok = False
                 else:
@@ -842,13 +842,9 @@ class CoinTrader:
             else:
                 long_htf_ok = short_htf_ok = True
 
-            long_raw, short_raw = compute_base_signals_backtest(df, self.config)
-            if long_raw and not long_htf_ok:
-                self._log('htf_filter_blocked LONG')
-            if short_raw and not short_htf_ok:
-                self._log('htf_filter_blocked SHORT')
-            long_base = long_raw and long_htf_ok and atr_ok and body_ok and bb_ok
-            short_base = short_raw and short_htf_ok and atr_ok and body_ok and bb_ok
+            long_base, short_base = compute_base_signals_backtest(df, self.config)
+            long_base = long_base and long_htf_ok and atr_ok and body_ok and bb_ok
+            short_base = short_base and short_htf_ok and atr_ok and body_ok and bb_ok
 
             if self.rehydrated and self.pos.side:
                 lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])

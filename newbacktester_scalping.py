@@ -240,8 +240,8 @@ def main():
     os.environ.setdefault("USE_ML", "1")
     os.environ.setdefault("SCORE_THRESHOLD", "2.0")
     os.environ.setdefault("ML_MIN_TRAIN_BARS", "400")
-    os.environ.setdefault("ML_RETRAIN_EVERY", "120")
-    os.environ.setdefault("ML_WEIGHT", "1.5")
+    os.environ.setdefault("ML_RETRAIN_EVERY", "5000")
+    os.environ.setdefault("ML_WEIGHT", "1.0")
 
     summary, trades_df = run_backtest(args)
 
