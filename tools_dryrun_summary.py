@@ -14,7 +14,7 @@ python tools_dryrun_summary.py \
   --out ADA_dryrun_trades_500.csv
 
 Tips percepat:
-export USE_ML=1; export SCORE_THRESHOLD=1.2; export ML_RETRAIN_EVERY=5000
+export USE_ML=1; export SCORE_THRESHOLD=2.0; export ML_RETRAIN_EVERY=5000
 """
 from __future__ import annotations
 import os, sys, time, argparse, json
@@ -54,7 +54,15 @@ def _enter_wrap(self, side: str, price: float, atr: float, available_balance: fl
 
 
 def _exit_wrap(self, price: float, reason: str = "Exit", **kw) -> None:
+    prev_cd = getattr(self, "cooldown_until_ts", None)
     _orig_exit(self, price, reason, **kw)
+    try:
+        if getattr(self, "cooldown_until_ts", None) and self.cooldown_until_ts != prev_cd:
+            now_ts = kw.get("now_ts") or time.time()
+            dur = int(self.cooldown_until_ts - now_ts)
+            print(f"[{self.symbol}] COOLDOWN set {dur}s karena {reason}")
+    except Exception:
+        pass
     try:
         self._journal.append(
             {
@@ -195,14 +203,14 @@ def main():
     ap.add_argument("--balance", type=float, default=20.0)
     ap.add_argument("--out", default=None, help="Path CSV untuk menyimpan trades")
     ap.add_argument("--use-ml", type=int, choices=[0,1], default=None)
-    ap.add_argument("--ml-thr", type=float, default=None)
+    ap.add_argument("--ml-thr", type=float, default=None, help="Threshold odds ML (1.0=OR, 2.0=AND)")
     ap.add_argument("--trailing-step", type=float, default=None)
     ap.add_argument("--trailing-trigger", type=float, default=None)
     args = ap.parse_args()
 
     # saran env untuk speed
     os.environ.setdefault("USE_ML", "1")
-    os.environ.setdefault("SCORE_THRESHOLD", "1.0")
+    os.environ.setdefault("SCORE_THRESHOLD", "2.0")
     os.environ.setdefault("ML_MIN_TRAIN_BARS", "400")
     os.environ.setdefault("ML_RETRAIN_EVERY", "5000")
 

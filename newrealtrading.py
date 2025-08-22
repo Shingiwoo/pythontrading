@@ -378,7 +378,7 @@ DEFAULTS = {
     "trailing_trigger": 0.7,   # %
     "trailing_step": 0.45,     # %
     "max_hold_seconds": 3600,
-    "time_stop_only_if_loss": 0,
+    "time_stop_only_if_loss": 1,
     "min_roi_to_close_by_time": -1.0,
     # lot size & precision (opsional, jika tersedia dari exchange info)
     "stepSize": 0.0,
@@ -437,6 +437,8 @@ class CoinTrader:
         self._bar_idx = 0
         self._last_cooldown_log_bar = -1
         self._cd_logged_until_ts = None
+        self._journal: List[dict] = []  # untuk tools_dryrun_summary (rekonstruksi trade)
+        self._last_atr_pct: float | None = None
 
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
@@ -520,6 +522,11 @@ class CoinTrader:
                 trailing_step_val = DEFAULTS['trailing_step']
         trailing_step = self._clamp_pos(trailing_step_val, ts_min)
         safe_trigger = max(trailing_trigger, safe_buffer_pct + trailing_step)
+        # ATR-aware guard (opsional)
+        atr_pct = getattr(self, "_last_atr_pct", None)
+        if isinstance(atr_pct, (int, float)) and atr_pct > 0:
+            cap = max(safe_trigger, min(safe_trigger * 1.25, (atr_pct * 100.0) * 1.6))
+            safe_trigger = max(safe_trigger, cap)
         return safe_trigger, trailing_step
 
     def _size_position(self, price: float, sl: float, balance: float) -> float:
@@ -774,6 +781,8 @@ class CoinTrader:
             cd = 0
         else:
             cd = max(0, int(base_cd * mul))
+        bar_sec = int(self.config.get('bar_seconds', 900))
+        cd = min(cd, bar_sec * 2)
         # selalu tahan N bar setelah exit untuk kurangi over-trading
         self.pending_skip_entries = max(self.pending_skip_entries,
                                         _to_int(self.config.get('min_bars_between_entries',
@@ -784,7 +793,8 @@ class CoinTrader:
         self._cd_logged_until_ts = None
         try:
             if self.cooldown_until_ts:
-                self._log(f"COOLDOWN until {pd.Timestamp.utcfromtimestamp(self.cooldown_until_ts).isoformat()}")
+                dur = int(self.cooldown_until_ts - base)
+                self._log(f"COOLDOWN {ru} {dur}s sampai {pd.Timestamp.utcfromtimestamp(self.cooldown_until_ts).isoformat()}")
         except Exception:
             pass
 
@@ -808,6 +818,7 @@ class CoinTrader:
         if not math.isfinite(price):
             raise ValueError("Non-finite price")
         atr = float(last['atr']) if not pd.isna(last['atr']) else 0.0
+        self._last_atr_pct = float(last.get('atr_pct', 0.0))
 
         up_prob = None
         if self.ml.use_ml:
@@ -901,7 +912,7 @@ class CoinTrader:
 
             # ---- Time-stop ----
             max_hold = int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)))
-            time_stop_only_if_loss = int(self.config.get("time_stop_only_if_loss", 0))
+            time_stop_only_if_loss = int(self.config.get("time_stop_only_if_loss", DEFAULTS.get("time_stop_only_if_loss", 1)))
             min_roi = float(self.config.get("min_roi_to_close_by_time", DEFAULTS.get("min_roi_to_close_by_time", -1.0)))
 
             if self.pos.side and self.pos.entry_time and max_hold > 0:
@@ -910,18 +921,17 @@ class CoinTrader:
                 if elapsed_seconds >= max_hold:
                     lev = _to_int(self.config.get("leverage", DEFAULTS["leverage"]), DEFAULTS["leverage"])
                     roi_frac = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
-                    if time_stop_only_if_loss:
-                        if roi_frac <= 0:
-                            self._exit_position(price, "TIME_STOP", now_ts=now_ts)
-                            return 0.0
-                        else:
-                            self.pos.entry_time = now_dt
+                    trigger = False
+                    if time_stop_only_if_loss == 1 and roi_frac < 0:
+                        trigger = True
+                    if min_roi >= 0 and roi_frac < min_roi:
+                        trigger = True
+                    if trigger:
+                        self._log(f"TIME_STOP roi={roi_frac*100:.2f}% dur={elapsed_seconds:.0f}s")
+                        self._exit_position(price, "TIME_STOP", now_ts=now_ts)
+                        return 0.0
                     else:
-                        if min_roi < 0 or roi_frac >= min_roi:
-                            self._exit_position(price, "TIME_STOP", now_ts=now_ts)
-                            return 0.0
-                        else:
-                            self.pos.entry_time = now_dt
+                        self.pos.entry_time = now_dt
             # --------------------------------------
             used = 0.0
             # Entry baru
