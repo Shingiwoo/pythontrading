@@ -2,6 +2,9 @@
 ml_signal_plugin.py — Plugin ML untuk live trading (selaras backtester)
 PATCH 2025-08-11: _build_latest_features kini mengembalikan DataFrame (bukan ndarray)
 untuk menghindari warning: "X does not have valid feature names" saat predict.
+
+Plugin ini hanya menghitung probabilitas arah (up_prob). Penilaian skor akhir dan
+keputusan masuk dilakukan di engine_core.make_decision.
 """
 from __future__ import annotations
 import time, os
@@ -16,7 +19,7 @@ from engine_core import SAFE_EPS
 @dataclass
 class MLParams:
     use_ml: bool = False
-    score_threshold: float = 1.0
+    score_threshold: float = 2.0
     min_train_bars: int = 400
     lookahead: int = 5
     retrain_every_bars: int = 120
@@ -63,7 +66,7 @@ class MLSignal:
 
         self.params = MLParams(
             use_ml=_getb('USE_ML', False),
-            score_threshold=_getf('SCORE_THRESHOLD', 1.0),
+            score_threshold=_getf('SCORE_THRESHOLD', 2.0),
             min_train_bars=_geti('ML_MIN_TRAIN_BARS', 400),
             lookahead=_geti('ML_LOOKAHEAD', 5),
             retrain_every_bars=_geti('ML_RETRAIN_EVERY', 120),
@@ -99,6 +102,8 @@ class MLSignal:
         proba = min(max(float(proba), SAFE_EPS), 1 - SAFE_EPS)
         return proba
 
+    # Fungsi warisan: tidak lagi dipakai karena skor final dihitung di
+    # engine_core.make_decision. Tetap disediakan untuk kompatibilitas lama.
     def score_and_decide(self, base_long: bool, base_short: bool, up_prob: Optional[float] = None) -> Tuple[bool, bool]:
         th = float(self.params.score_threshold)
         sc_long = 1.0 if base_long else 0.0

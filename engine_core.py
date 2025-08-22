@@ -297,7 +297,7 @@ def compute_base_signals_live(df: pd.DataFrame, coin_cfg: Dict[str, Any] | None 
     return compute_base_signals(df, coin_cfg)
 
 
-ML_WEIGHT = float(os.getenv("ML_WEIGHT", "1.0"))
+ML_WEIGHT = float(os.getenv("ML_WEIGHT", "1.5"))
 
 
 def get_coin_ml_params(symbol: str, coin_config: dict) -> dict:
@@ -307,7 +307,7 @@ def get_coin_ml_params(symbol: str, coin_config: dict) -> dict:
         "strict": bool(d.get("strict", False)),
         "up_prob": float(d.get("up_prob_long", 0.55)),
         "down_prob": float(d.get("down_prob_short", 0.45)),
-        "score_threshold": float(d.get("score_threshold", 1.0)),
+        "score_threshold": float(d.get("score_threshold", 2.0)),
         "weight": float(d.get("weight", ML_WEIGHT)),
     }
 
