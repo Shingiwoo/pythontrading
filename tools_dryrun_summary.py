@@ -207,14 +207,40 @@ def run_dry(
                     score_long += params["weight"]
                 if short_base and up_prob <= params["down_prob"]:
                     score_short += params["weight"]
+            filt_cfg = trader.config.get('filters') if isinstance(trader.config.get('filters'), dict) else {}
+            adx_penalized = False
+            if filt_cfg.get('adx_filter_enabled', False):
+                min_adx = float(filt_cfg.get('min_adx', 0.0))
+                adx_val = float(meta.get('adx', 0.0))
+                if adx_val < min_adx:
+                    if str(filt_cfg.get('adx_mode', 'soft')).lower() == 'soft':
+                        pen = float(filt_cfg.get('adx_penalty', 0.25))
+                        score_long -= pen
+                        score_short -= pen
+                        adx_penalized = True
+                    else:
+                        long_base = short_base = False
+                        score_long = score_short = 0.0
             tw_cfg = trader.config
             twap15_ok_long = twap15_ok_short = True
+            trend_long_ok = trend_short_ok = True
             htf_bonus_long = htf_bonus_short = False
             if bool(tw_cfg.get("use_twap_indicator", False)):
                 twap15_w = int(tw_cfg.get("twap_15m_window", 20))
                 k_atr = float(tw_cfg.get("twap_atr_k", 0.4))
                 twap15 = rolling_twap(sub["close"], twap15_w).iloc[-1]
-                dev = float(twap15 - sub["close"].iloc[-1])
+                price_now = float(sub["close"].iloc[-1])
+                ema22_now = float(last_ind.get('ema_22', 0.0))
+                mode = str(tw_cfg.get("twap15_trend_mode", "any_of")).lower()
+                long_cond = [(price_now >= twap15), (ema22_now >= twap15)]
+                short_cond = [(price_now <= twap15), (ema22_now <= twap15)]
+                if mode == "all_of":
+                    trend_long_ok = all(long_cond)
+                    trend_short_ok = all(short_cond)
+                else:
+                    trend_long_ok = any(long_cond)
+                    trend_short_ok = any(short_cond)
+                dev = float(twap15 - price_now)
                 atrv = float(last_ind.get("atr", 0.0))
                 twap15_ok_long = (dev >= k_atr * atrv)
                 twap15_ok_short = (-dev >= k_atr * atrv)
@@ -230,6 +256,12 @@ def run_dry(
                     price_htf = htf_close.iloc[-1]
                     htf_bonus_long = (price_htf >= htwap) and (ema22_htf >= htwap)
                     htf_bonus_short = (price_htf <= htwap) and (ema22_htf <= htwap)
+                if long_base and not trend_long_ok:
+                    long_base = False
+                    score_long = 0.0
+                if short_base and not trend_short_ok:
+                    short_base = False
+                    score_short = 0.0
                 if long_base and not twap15_ok_long:
                     long_base = False
                     score_long = 0.0
@@ -264,6 +296,18 @@ def run_dry(
                                 reasons.append("ML")
                             if side == "SHORT" and up_prob > params["down_prob"]:
                                 reasons.append("ML")
+                    if side == "LONG" and not trend_long_ok:
+                        reasons.append("twap15_trend_fail")
+                    if side == "SHORT" and not trend_short_ok:
+                        reasons.append("twap15_trend_fail")
+                    if adx_penalized:
+                        reasons.append("adx_low_penalty")
+                    pos = getattr(trader, 'pos', None)
+                    be_armed = False
+                    tsl_armed = False
+                    if pos:
+                        be_armed = bool(pos.sl and pos.entry is not None and ((pos.side == 'LONG' and pos.sl >= pos.entry) or (pos.side == 'SHORT' and pos.sl <= pos.entry)))
+                        tsl_armed = bool(getattr(pos, 'trailing_sl', None))
                     reasons_rows.append(
                         {
                             "timestamp": ts_iso,
@@ -271,6 +315,8 @@ def run_dry(
                             "atr_ok": atr_ok,
                             "body_ok": body_ok,
                             "twap15_ok": twap15_ok_long if side == "LONG" else twap15_ok_short,
+                            "twap15_trend_ok": trend_long_ok if side == "LONG" else trend_short_ok,
+                            "adx_penalized": adx_penalized,
                             "ltf_ok": True,
                             "htf_twap_bonus": htf_bonus_long if side == "LONG" else htf_bonus_short,
                             "score_long_after_bonus": score_long,
@@ -280,6 +326,8 @@ def run_dry(
                             "ml_prob": up_prob,
                             "score_long": score_long,
                             "score_short": score_short,
+                            "be_armed": be_armed,
+                            "tsl_armed": tsl_armed,
                             "reason_list": ";".join(reasons) if reasons else "-",
                         }
                     )
