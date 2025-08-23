@@ -622,7 +622,7 @@ class CoinTrader:
             return
         be_mult = float(cfg.get('arm_atr_mult', 0.6))
         if regime == 'TREND':
-            be_mult = 0.5
+            be_mult = min(be_mult, 0.5)
         be_arm = be_mult * atr
         pnl = abs(price - self.pos.entry)
         if pnl >= be_arm:
@@ -940,6 +940,7 @@ class CoinTrader:
             bb_width_chop_max=float(reg_cfg.get('bb_width_chop_max', 0.010)),
         )
         regime = get_regime(df, th) if reg_cfg.get('enabled', False) else 'CHOP'
+        self.last_regime = regime
 
         up_prob = None
         if self.ml.use_ml:
