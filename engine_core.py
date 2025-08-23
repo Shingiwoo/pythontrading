@@ -3,7 +3,7 @@ from typing import Dict, Any, Tuple, Optional, Union, Any
 
 import numpy as np
 import pandas as pd
-from ta.trend import EMAIndicator, SMAIndicator, MACD
+from ta.trend import EMAIndicator, SMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.volatility import BollingerBands
 from ta.volume import VolumeWeightedAveragePrice
@@ -412,13 +412,16 @@ def make_decision(
 
     long_base = long_base and atr_ok and body_ok
     short_base = short_base and atr_ok and body_ok
+    
+    # Inisialisasi htf_close dengan None
+    htf_close = None    
 
     # HTF gating
     _htf = _coerce_htf_cfg(coin_cfg)
     htf_tf = _htf.get("timeframe")
-    htf_close = mtf_get_close(symbol, htf_tf)
     long_htf_ok = short_htf_ok = True
-    if _htf.get("enabled"):
+    if _htf.get("enabled") and htf_tf is not None:
+        htf_close = mtf_get_close(symbol, htf_tf)
         if htf_close is not None and len(htf_close) >= max(_htf.get("ema_period",22), _htf.get("sma_period",22)):
             ema_htf = htf_close.ewm(span=_htf.get("ema_period",22), adjust=False).mean().iloc[-1]
             sma_htf = htf_close.rolling(_htf.get("sma_period",22)).mean().iloc[-1]
@@ -433,6 +436,7 @@ def make_decision(
                 short_htf_ok = ema_htf <= sma_htf
         elif not _htf.get("fallback_pass", True):
             long_htf_ok = short_htf_ok = False
+
     long_base = long_base and long_htf_ok
     short_base = short_base and short_htf_ok
 
@@ -458,7 +462,7 @@ def make_decision(
     reasons.append(f"regime={regime}")
     _filt = coin_cfg.get('filters') if isinstance(coin_cfg.get('filters'), dict) else {}
     adx_now = None
-    if _filt.get("adx_filter_enabled", False):
+    if _filt and _filt.get("adx_filter_enabled", False):
         min_adx = float(_filt.get("min_adx", 16.0))
         adx_series = compute_adx(df, int(_filt.get("adx_period", 14)))
         adx_now = float(adx_series.iloc[-1]) if len(adx_series) else 0.0

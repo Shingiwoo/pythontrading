@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from dataclasses import dataclass
 
 @dataclass
@@ -9,23 +10,35 @@ class RegimeThresholds:
     bb_width_chop_max: float = 0.010
 
 def compute_adx(df: pd.DataFrame, period: int) -> pd.Series:
-    high = df['high']
-    low = df['low']
-    close = df['close']
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+    
     up = high.diff()
     down = -low.diff()
-    plus_dm = up.where((up > down) & (up > 0), 0.0)
-    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    
+    # Use numpy where for more explicit type handling
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    
+    # Convert back to pandas Series if needed
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+    
+    # Rest of the calculation remains the same
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (close.shift() - low).abs()
     ], axis=1).max(axis=1)
+    
     atr = tr.ewm(alpha=1/period, adjust=False).mean()
     plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
     minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
+    
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    
     return adx
 
 def compute_bb_width(close: pd.Series, period: int=20) -> pd.Series:

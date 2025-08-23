@@ -948,7 +948,7 @@ class CoinTrader:
                     print(f"[{self.symbol}] COOLDOWN aktif s/d {_to_dt_safe(self.cooldown_until_ts)}")
                     self._last_cooldown_log_bar = self._bar_idx
                     self._cd_logged_until_ts = self.cooldown_until_ts
-            return 0.0
+            return 0.0     
 
         try:
             if self.pending_skip_entries > 0:
@@ -984,10 +984,19 @@ class CoinTrader:
                 if self.invalidated_bars >= 2:
                     lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
                     roi_frac = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
-                    be_active = (
-                        (self.pos.trailing_sl is not None) or
-                        (self.pos.sl is not None and ((self.pos.side == 'LONG' and self.pos.sl >= self.pos.entry) or (self.pos.side == 'SHORT' and self.pos.sl <= self.pos.entry)))
-                    )
+                    
+                    # Handle None values explicitly
+                    sl_active = False
+                    if self.pos.sl is not None and self.pos.entry is not None:
+                        sl_value = float(self.pos.sl)
+                        entry_value = float(self.pos.entry)
+                        if self.pos.side == 'LONG':
+                            sl_active = sl_value >= entry_value
+                        elif self.pos.side == 'SHORT':
+                            sl_active = sl_value <= entry_value
+                    
+                    be_active = (self.pos.trailing_sl is not None) or sl_active
+                    
                     if be_active or roi_frac <= 0:
                         self._exit_position(price, 'invalidated_signal_exit', now_ts=now_ts)
                         self.invalidated_bars = 0

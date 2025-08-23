@@ -210,12 +210,13 @@ def run_dry(
                     score_short += params["weight"]
             filt_cfg = trader.config.get('filters') if isinstance(trader.config.get('filters'), dict) else {}
             adx_penalized = False
-            if filt_cfg.get('adx_filter_enabled', False):
+            if filt_cfg and filt_cfg.get("adx_filter_enabled", False):
                 min_adx = float(filt_cfg.get('min_adx', 0.0))
-                adx_val = float(meta.get('adx', 0.0))
+                adx_val = float(meta.get('adx', 0.0)) if meta else 0.0
                 if adx_val < min_adx:
-                    if str(filt_cfg.get('adx_mode', 'soft')).lower() == 'soft':
-                        pen = float(filt_cfg.get('adx_penalty', 0.25))
+                    adx_mode = str(filt_cfg.get('adx_mode', 'soft')).lower() if filt_cfg else 'soft'
+                    if adx_mode == 'soft':
+                        pen = float(filt_cfg.get('adx_penalty', 0.25)) if filt_cfg else 0.25
                         score_long -= pen
                         score_short -= pen
                         adx_penalized = True
