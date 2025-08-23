@@ -4,13 +4,13 @@
       "heikin": false,
       "rsi_mode": "PULLBACK",
       "rsi_long_max": 45.0,
-      "rsi_short_min": 70.0,
+      "rsi_short_min": 75.0,
       "use_macd_confirm": true,
 
       "use_htf_filter": 0,
       "startup_skip_bars": 0,
       "min_bars_between_entries": 2,
-      "cooldown_seconds": 240,
+      "cooldown_seconds": 300,
       "no_cooldown_on_profit": 1,
 
       "leverage": 15,
@@ -22,7 +22,7 @@
       "max_body_atr": 1.75,
 
       "sl_mode": "ATR",
-      "sl_atr_mult": 1.8,
+      "sl_atr_mult": 2.1,
       "sl_min_pct": 0.012,
       "sl_max_pct": 0.035,
 
@@ -50,7 +50,7 @@
         "body_filter_enabled": true,
         "min_atr_threshold": 0.003,
         "max_body_over_atr": 1.75,
-        "min_bb_width": 0.004
+        "min_bb_width": 0.008
       }
     },
     "SCALP-ADA-15M-LEGACY": {
@@ -114,7 +114,7 @@
 
     "margin_type": "ISOLATED",
 
-    "cooldown_mul_hard_sl": 2.5,
+    "cooldown_mul_hard_sl": 3.0,
     "cooldown_mul_trailing": 1.0,
     "cooldown_mul_early_stop": 1.2,
 
@@ -129,14 +129,24 @@
     "twap_15m_window": 20,
     "twap_5m_window": 36,
     "twap_1m_window": 120,
-    "twap_atr_k": 0.4,
+    "twap_atr_k": 0.6,
 
     "twap_exec_enabled": true,
     "twap_child_count": 4,
     "twap_duration_sec": 90,
     "twap_child_timeout_sec": 10,
     "twap_post_only": true,
-    "twap_force_market_on_timeout": true
+    "twap_force_market_on_timeout": true,
+
+    "htf": {
+      "enabled": true,
+      "timeframe": "4h",
+      "method": "ema_vs_sma",
+      "ema_period": 22,
+      "sma_period": 22,
+      "rule": "long_ema>=sma;short_ema<=sma",
+      "fallback_pass": true
+    }
   },
   "DOGEUSDT": {
     "leverage": 15,
