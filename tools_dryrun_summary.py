@@ -35,6 +35,7 @@ from engine_core import (
     get_coin_ml_params,
     rolling_twap,
     _coerce_htf_cfg,
+    _norm_resample_freq,
 )
 
 warnings.filterwarnings(
@@ -69,10 +70,10 @@ def _enter_wrap(self, side: str, price: float, atr: float, available_balance: fl
 def _exit_wrap(self, price: float, reason: str = "Exit", now_ts: int | None = None, **kw) -> None:
     prev_cd = getattr(self, "cooldown_until_ts", None)
     _orig_exit(self, price, reason, now_ts=now_ts, **kw)
+    now_ts_i = int(now_ts or kw.get("now_ts") or time.time())
     try:
         if getattr(self, "cooldown_until_ts", None) and self.cooldown_until_ts != prev_cd:
-            now_ts = now_ts or kw.get("now_ts") or time.time()
-            dur = int(self.cooldown_until_ts - now_ts)
+            dur = int(self.cooldown_until_ts - now_ts_i)
             print(f"[{self.symbol}] COOLDOWN set {dur}s karena {reason}")
     except Exception:
         pass
@@ -82,7 +83,7 @@ def _exit_wrap(self, price: float, reason: str = "Exit", now_ts: int | None = No
                 "t": "exit",
                 "reason": str(reason),
                 "price": float(price),
-                "ts": int(now_ts or kw.get("now_ts") or time.time()),
+                "ts": now_ts_i,
             }
         )
     except Exception:
@@ -91,6 +92,29 @@ def _exit_wrap(self, price: float, reason: str = "Exit", now_ts: int | None = No
 
 nrt.CoinTrader._enter_position = _enter_wrap
 nrt.CoinTrader._exit_position = _exit_wrap
+
+
+def ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Pastikan df berindex timestamp (UTC) untuk operasi resample."""
+    out = df
+    if "timestamp" in out.columns:
+        # Pastikan kolom time sudah UTC-aware
+        ts = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+        out = out.copy()
+        out["timestamp"] = ts
+        out = out.set_index("timestamp")
+        # Drop bar yang timestamp-nya invalid
+        out = out[~out.index.isna()]
+    else:
+        # Jika index belum DateTimeIndex, konversi
+        if not isinstance(out.index, pd.DatetimeIndex):
+            out = out.copy()
+            out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
+            out = out[~out.index.isna()]
+    # Sort & pastikan monotonic
+    if not out.index.is_monotonic_increasing:
+        out = out.sort_index()
+    return out
 
 
 def run_dry(
@@ -135,7 +159,7 @@ def run_dry(
     t0 = time.time()
     steps = 0
     for i in range(start_i, min(len(df) - 1, start_i + steps_limit)):
-        sub = df.iloc[: i + 1].copy()
+        sub = df.loc[: df.index[i]].copy()
         # ambil close time bar terakhir sebagai jam virtual
         last_ts = sub["timestamp"].iloc[-1]
         try:
@@ -181,8 +205,10 @@ def run_dry(
                 twap15_ok_long = (dev >= k_atr * atrv)
                 twap15_ok_short = (-dev >= k_atr * atrv)
                 _htf = _coerce_htf_cfg(tw_cfg)
-                htf_tf = _htf["timeframe"]
-                htf_close = sub["close"].resample(htf_tf).last().dropna()
+                htf_tf = _htf.get("timeframe") or "1h"
+                sub_dt = ensure_dt_index(sub)
+                htf_tf = _norm_resample_freq(htf_tf, "1h")
+                htf_close = sub_dt["close"].resample(htf_tf).last().dropna()
                 if len(htf_close) >= 30:
                     htwap = rolling_twap(htf_close, 22).iloc[-1]
                     ema22_htf = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
