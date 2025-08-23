@@ -447,6 +447,8 @@ def make_decision(
     reasons: list[str] = []
     _filt = coin_cfg.get('filters') if isinstance(coin_cfg.get('filters'), dict) else {}
     if bool(_filt.get('adx_filter_enabled')) and float(meta.get('adx', 0.0)) < float(_filt.get('min_adx', 0.0)):
+        score_long -= 0.2
+        score_short -= 0.2
         reasons.append('adx_low')
 
     tw_cfg = coin_cfg
@@ -471,8 +473,8 @@ def make_decision(
         twap15 = rolling_twap(df["close"], twap15_w).iloc[-1]
         price_now = float(last["close"])
         ema22_now = float(last.get('ema_22', 0.0))
-        trend_long_ok = (price_now >= twap15) and (ema22_now >= twap15)
-        trend_short_ok = (price_now <= twap15) and (ema22_now <= twap15)
+        trend_long_ok = (price_now >= twap15) or (ema22_now >= twap15)
+        trend_short_ok = (price_now <= twap15) or (ema22_now <= twap15)
         if long_base and not trend_long_ok:
             long_base = False
             score_long = 0.0
@@ -589,17 +591,14 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
 
     atr_ok = (atr_pct >= min_atr) and (atr_pct <= max_atr) and (bb_width_pct >= min_bb)
     body_ok = body_to_atr <= max_body
-    adx_ok = adx_val >= min_adx
+    adx_ok = adx_val >= min_adx if adx_filter_enabled else True
 
     if not atr_filter_enabled:
         atr_ok = True
     if not body_filter_enabled:
         body_ok = True
-    if not adx_filter_enabled:
-        adx_ok = True
-    atr_ok = atr_ok and adx_ok
 
-    if not atr_ok or not body_ok:
+    if (not atr_ok or not body_ok) or (adx_filter_enabled and not adx_ok):
         logging.getLogger(__name__).info(
             f"[{coin_cfg.get('symbol', '?')}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} adx={adx_val:.2f} "
             f"bb_width_pct={bb_width_pct:.4f} atr_pct={atr_pct:.4f} body_to_atr={body_to_atr:.4f}"
