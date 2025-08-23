@@ -10,6 +10,8 @@
             "startup_skip_bars": 0,
             "min_bars_between_entries": 2,
             "cooldown_seconds": 300,
+            "cooldown_mul_hard_sl": 3.0,
+            "cooldown_max_seconds": 900,
             "no_cooldown_on_profit": 1,
             "leverage": 15,
             "risk_per_trade": 0.06,
@@ -29,6 +31,12 @@
             "break_even": {
                 "enabled": true,
                 "arm_atr_mult": 0.6
+            },
+            "bracket_exit": {
+                "enabled": true,
+                "tp1_atr_mult": 0.8,
+                "tp2_atr_mult": 1.6,
+                "tp1_size_frac": 0.5
             },
             "max_hold_seconds": 3600,
             "time_stop_only_if_loss": 1,
@@ -144,12 +152,27 @@
         "twap_force_market_on_timeout": true,
         "htf": {
             "enabled": true,
-            "timeframe": "4h",
+            "timeframe": "1h",
             "method": "ema_vs_sma",
             "ema_period": 22,
             "sma_period": 22,
             "rule": "long_ema>=sma;short_ema<=sma",
             "fallback_pass": true
+        },
+        "regime": {
+            "enabled": true,
+            "adx_period": 14,
+            "bb_period": 20,
+            "trend_threshold": 20.0,
+            "bb_width_chop_max": 0.010
+        },
+        "entry": {
+            "buffer_atr_mult": 0.12,
+            "confirm_bars": 2,
+            "allow_countertrend_short": false
+        },
+        "execution": {
+            "twap": { "enabled": false }
         },
         "cooldown_max_seconds": 900,
         "filters": {
