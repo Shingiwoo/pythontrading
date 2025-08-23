@@ -400,7 +400,6 @@ def make_decision(
     body_ok: bool | None = None,
     meta: Dict[str, Any] | None = None,
 ) -> Optional[str]:
-    params = get_coin_ml_params(symbol, coin_cfg)
     if USE_BACKTEST_ENTRY_LOGIC:
         long_base, short_base = compute_base_signals_backtest(df, coin_cfg)
     else:
@@ -443,11 +442,6 @@ def make_decision(
     score_long = 1.0 if long_base else 0.0
     score_short = 1.0 if short_base else 0.0
     ml_ready = (ml_up_prob is not None)
-    if params["enabled"] and ml_ready:
-        if long_base and ml_up_prob >= params["up_prob"]:
-            score_long += params["weight"]
-        if short_base and ml_up_prob <= params["down_prob"]:
-            score_short += params["weight"]
 
     reasons: list[str] = []
     allow = True
@@ -499,59 +493,55 @@ def make_decision(
                 atr = 0.0
         twap15_series = rolling_twap(df["close"], twap15_w)
         twap15 = twap15_series.iloc[-1]
-        ema22_series = df["close"].ewm(span=22, adjust=False).mean()
         price_now = float(last["close"])
-        mode = str(coin_cfg.get("twap15_trend_mode", "any_of")).lower()
-
-        long_cond = [(price_now >= twap15), (float(ema22_series.iloc[-1]) >= twap15)]
-        short_cond = [(price_now <= twap15), (float(ema22_series.iloc[-1]) <= twap15)]
-        if mode == "all_of":
-            trend_long_ok = all(long_cond)
-            trend_short_ok = all(short_cond)
+        cfg_adp = coin_cfg.get("twap_adaptive", {})
+        if cfg_adp.get("enabled", False):
+            if regime == "TREND":
+                k = float(cfg_adp["trend"].get("twap_atr_k", 0.40))
+                buffer_mult = float(cfg_adp["trend"].get("buffer_atr_mult", 0.08))
+                confirm_bars = int(cfg_adp["trend"].get("confirm_bars", 1))
+            else:
+                k = float(cfg_adp["chop"].get("twap_atr_k", 0.70))
+                buffer_mult = float(cfg_adp["chop"].get("buffer_atr_mult", 0.00))
+                confirm_bars = int(cfg_adp["chop"].get("confirm_bars", 0))
         else:
-            trend_long_ok = any(long_cond)
-            trend_short_ok = any(short_cond)
-
-        dev = float(twap15 - price_now)
-        twap15_dev_long = (dev >= k_atr * atr)
-        twap15_dev_short = (-dev >= k_atr * atr)
-
+            k = float(coin_cfg.get("twap_atr_k", 0.55))
+            entry_cfg = coin_cfg.get("entry", {})
+            buffer_mult = float(entry_cfg.get("buffer_atr_mult", 0.12))
+            confirm_bars = int(entry_cfg.get("confirm_bars", 2))
         entry_cfg = coin_cfg.get("entry", {})
-        buf = float(entry_cfg.get("buffer_atr_mult", 0.12)) * atr
-        confirm = int(entry_cfg.get("confirm_bars", 2))
         allow_ct_short = bool(entry_cfg.get("allow_countertrend_short", False))
 
-        def confirmed(side: str) -> bool:
-            if confirm <= 0:
-                return True
-            if len(df) < confirm:
-                return False
-            closes = df["close"].iloc[-confirm:]
-            tseg = twap15_series.iloc[-confirm:]
-            esem = ema22_series.iloc[-confirm:]
-            if mode == "all_of":
-                if side == "LONG":
-                    cond = (closes >= tseg) & (closes >= esem)
-                else:
-                    cond = (closes <= tseg) & (closes <= esem)
+        buffer = buffer_mult * atr
+
+        def twap_ok(side: str) -> bool:
+            if side == "LONG":
+                return price_now >= twap15 + (buffer if regime == "TREND" else -k * atr)
             else:
-                if side == "LONG":
-                    cond = (closes >= tseg) | (closes >= esem)
-                else:
-                    cond = (closes <= tseg) | (closes <= esem)
-            return bool(cond.all())
+                return price_now <= twap15 - (buffer if regime == "TREND" else -k * atr)
+
+        def confirmed(side: str) -> bool:
+            if confirm_bars <= 0:
+                return True
+            if len(df) < confirm_bars:
+                return False
+            closes = df["close"].iloc[-confirm_bars:]
+            if side == "LONG":
+                return bool((closes >= twap15).all())
+            else:
+                return bool((closes <= twap15).all())
 
         if regime == "TREND":
-            if long_base and not (trend_long_ok and price_now >= twap15 + buf and confirmed("LONG")):
+            if long_base and not (twap_ok("LONG") and confirmed("LONG")):
                 long_base = False
                 score_long = 0.0
                 reasons.append("trend_confirm_fail")
-            if short_base and not (trend_short_ok and price_now <= twap15 - buf and confirmed("SHORT")):
+            if short_base and not (twap_ok("SHORT") and confirmed("SHORT")):
                 short_base = False
                 score_short = 0.0
                 reasons.append("trend_confirm_fail")
         else:
-            if long_base and not twap15_dev_long:
+            if long_base and not twap_ok("LONG"):
                 long_base = False
                 score_long = 0.0
                 reasons.append("twap15_dev_fail")
@@ -560,7 +550,7 @@ def make_decision(
                     short_base = False
                     score_short = 0.0
                     reasons.append("ct_short_disabled")
-                elif not twap15_dev_short:
+                elif not twap_ok("SHORT"):
                     short_base = False
                     score_short = 0.0
                     reasons.append("twap15_dev_fail")
@@ -585,13 +575,33 @@ def make_decision(
         if short_base and short_bonus_ok:
             score_short += tw_bonus
             reasons.append("twap_htf_bonus")
-    # Fallback: jika strict=False & ML belum siap → izinkan base-only (thr=1.0)
-    thr = params["score_threshold"]
-    if not params["strict"] and not ml_ready:
-        thr = 1.0
-    if params["strict"] and not ml_ready:
-        logging.getLogger(__name__).info(f"[{symbol}] ML_WARMUP: menunda hingga model siap (strict).")
-        return None
+    score_rule_only = max(score_long, score_short)
+    ml_cfg = coin_cfg.get("ml", {})
+    cond = ml_cfg.get("conditional_relax", {})
+    ml_thr = float(ml_cfg.get("score_threshold", 2.0))
+    if cond.get("enabled", False):
+        gate = float(cond.get("rule_score_gate", 1.7))
+        relaxed = float(cond.get("relaxed_threshold", 1.3))
+        if score_rule_only >= gate:
+            ml_thr = relaxed
+    ml_weight = float(ml_cfg.get("weight", 1.0))
+    ml_prob_long = ml_up_prob if ml_up_prob is not None else 0.0
+    ml_prob_short = 1 - ml_prob_long
+    if long_base:
+        if (ml_prob_long * ml_weight) >= ml_thr:
+            score_long += ml_prob_long * ml_weight
+        else:
+            long_base = False
+            score_long = 0.0
+            reasons.append("ml_gate_fail")
+    if short_base:
+        if (ml_prob_short * ml_weight) >= ml_thr:
+            score_short += ml_prob_short * ml_weight
+        else:
+            short_base = False
+            score_short = 0.0
+            reasons.append("ml_gate_fail")
+    thr = ml_thr
     decision = None
     if score_long >= thr and score_long > score_short:
         decision = "LONG"
@@ -606,7 +616,8 @@ def make_decision(
     logging.getLogger(__name__).info(
         f"[{symbol}] DECISION ema22={ema:.6f} ma22={ma:.6f} rsi={rsi:.2f} base(L={long_base},S={short_base}) "
         f"atr_ok={atr_ok} body_ok={body_ok} bb_width_pct={bb_width:.4f} "
-        f"ml_up_prob={ml_up_prob} thr={thr} score(L={score_long:.2f},S={score_short:.2f}) reasons={reasons} -> {decision}"
+        f"ml_up_prob={ml_up_prob} score_rule={score_rule_only:.2f} ml_thr={ml_thr:.2f} "
+        f"score(L={score_long:.2f},S={score_short:.2f}) reasons={reasons} -> {decision}"
     )
     return decision
 

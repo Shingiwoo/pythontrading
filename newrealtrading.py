@@ -50,6 +50,8 @@ from engine_core import (
     as_scalar, apply_filters, rolling_twap
 )
 
+from regime import RegimeThresholds, get_regime
+
 from exchanges import binance_adapter as bnx
 
 INSTANCE_ID = os.getenv("INSTANCE_ID", "bot")
@@ -610,7 +612,7 @@ class CoinTrader:
         sl_pct = max(sl_min, min(sl_pct, sl_max))
         return entry * (1 - sl_pct) if side=='LONG' else entry * (1 + sl_pct)
 
-    def _apply_breakeven(self, price: float, atr: float) -> None:
+    def _apply_breakeven(self, price: float, atr: float, regime: Optional[str] = None) -> None:
         cfg = self.config.get('break_even', {})
         if not cfg.get('enabled', False):
             return
@@ -618,7 +620,10 @@ class CoinTrader:
             return
         if self.pos.be_armed:
             return
-        be_arm = float(cfg.get('arm_atr_mult', 0.6)) * atr
+        be_mult = float(cfg.get('arm_atr_mult', 0.6))
+        if regime == 'TREND':
+            be_mult = 0.5
+        be_arm = be_mult * atr
         pnl = abs(price - self.pos.entry)
         if pnl >= be_arm:
             self.pos.sl = self.pos.entry
@@ -927,6 +932,14 @@ class CoinTrader:
             raise ValueError("Non-finite price")
         atr = float(last['atr']) if not pd.isna(last['atr']) else 0.0
         self._last_atr_pct = float(last.get('atr_pct', 0.0))
+        reg_cfg = self.config.get('regime', {})
+        th = RegimeThresholds(
+            adx_period=int(reg_cfg.get('adx_period', 14)),
+            bb_period=int(reg_cfg.get('bb_period', 20)),
+            trend_threshold=float(reg_cfg.get('trend_threshold', 20.0)),
+            bb_width_chop_max=float(reg_cfg.get('bb_width_chop_max', 0.010)),
+        )
+        regime = get_regime(df, th) if reg_cfg.get('enabled', False) else 'CHOP'
 
         up_prob = None
         if self.ml.use_ml:
@@ -952,7 +965,7 @@ class CoinTrader:
 
         try:
             if self.pending_skip_entries > 0:
-                self._apply_breakeven(price, atr)
+                self._apply_breakeven(price, atr, regime)
                 self._update_trailing(price, atr)
                 self._check_bracket_exit(price, atr)
                 ex, reason = self._should_exit(price=price, high=bar_high, low=bar_low)
@@ -962,7 +975,7 @@ class CoinTrader:
                 return 0.0
 
             if self.pos.side:
-                self._apply_breakeven(price, atr)
+                self._apply_breakeven(price, atr, regime)
                 self._update_trailing(price, atr)
                 self._check_bracket_exit(price, atr)
                 ex, rs = self._should_exit(price=price, high=bar_high, low=bar_low)
@@ -1043,7 +1056,7 @@ class CoinTrader:
             if self.signal_flip_confirm_left > 0:
                 self._log(f"SIGNAL CONFIRM: menunggu {self.signal_flip_confirm_left} bar utk validasi flip")
                 if self.pos.side:
-                    self._apply_breakeven(price, atr)
+                    self._apply_breakeven(price, atr, regime)
                     self._update_trailing(price, atr)
                     self._check_bracket_exit(price, atr)
                 return 0.0
