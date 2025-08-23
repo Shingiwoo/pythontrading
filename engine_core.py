@@ -3,7 +3,7 @@ from typing import Dict, Any, Tuple, Optional, Union, Any
 
 import numpy as np
 import pandas as pd
-from ta.trend import EMAIndicator, SMAIndicator, MACD
+from ta.trend import EMAIndicator, SMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.volatility import BollingerBands
 from ta.volume import VolumeWeightedAveragePrice
@@ -275,6 +275,13 @@ def compute_indicators(
     mid = bb.bollinger_mavg().replace(0, np.nan)
     d['bb_width_pct'] = (width / mid).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
+    # ADX sederhana
+    try:
+        adx = ADXIndicator(high=d['high'], low=d['low'], close=d['close'])
+        d['adx'] = adx.adx().fillna(0.0)
+    except Exception:
+        d['adx'] = 0.0
+
     # body/ATR + alias
     d['body'] = (d['close'] - d['open']).abs()
     d['body_to_atr'] = (d['body'] / d['atr']).replace([np.inf, -np.inf], 0.0).fillna(0.0)
@@ -397,13 +404,36 @@ def make_decision(
         long_base, short_base = compute_base_signals_backtest(df, coin_cfg)
     else:
         long_base, short_base = compute_base_signals_live(df, coin_cfg)
-
     last = df.iloc[-1]
+    update_cache(symbol, df)
     if atr_ok is None or body_ok is None or meta is None:
         atr_ok, body_ok, meta = apply_filters(last, coin_cfg)
 
     long_base = long_base and atr_ok and body_ok
     short_base = short_base and atr_ok and body_ok
+
+    # HTF gating
+    _htf = _coerce_htf_cfg(coin_cfg)
+    htf_tf = _htf.get("timeframe")
+    htf_close = mtf_get_close(symbol, htf_tf)
+    long_htf_ok = short_htf_ok = True
+    if _htf.get("enabled"):
+        if htf_close is not None and len(htf_close) >= max(_htf.get("ema_period",22), _htf.get("sma_period",22)):
+            ema_htf = htf_close.ewm(span=_htf.get("ema_period",22), adjust=False).mean().iloc[-1]
+            sma_htf = htf_close.rolling(_htf.get("sma_period",22)).mean().iloc[-1]
+            rules = str(_htf.get("rule", "")).lower().split(';')
+            if "long_ema>=sma" in rules:
+                long_htf_ok = ema_htf >= sma_htf
+            if "long_ema<=sma" in rules:
+                long_htf_ok = ema_htf <= sma_htf
+            if "short_ema>=sma" in rules:
+                short_htf_ok = ema_htf >= sma_htf
+            if "short_ema<=sma" in rules:
+                short_htf_ok = ema_htf <= sma_htf
+        elif not _htf.get("fallback_pass", True):
+            long_htf_ok = short_htf_ok = False
+    long_base = long_base and long_htf_ok
+    short_base = short_base and short_htf_ok
 
     score_long = 1.0 if long_base else 0.0
     score_short = 1.0 if short_base else 0.0
@@ -425,8 +455,6 @@ def make_decision(
     k_atr = float(tw_cfg.get("twap_atr_k", 0.4))
 
     if use_twap:
-        update_cache(symbol, df)
-        last = df.iloc[-1]
         atr = float(last.get("atr") or 0.0)
         if atr <= 0.0:
             try:
@@ -447,9 +475,6 @@ def make_decision(
         ltf_ok_long = True
         ltf_ok_short = True
         # HTF bonus
-        _htf = _coerce_htf_cfg(coin_cfg)
-        htf_tf = _htf["timeframe"]
-        htf_close = mtf_get_close(symbol, htf_tf)
         if htf_close is not None and len(htf_close) >= 30:
             htwap = rolling_twap(htf_close, 22).iloc[-1]
             ema22_htf = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
@@ -538,23 +563,30 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
     min_bb = _to_float(filters_cfg.get('min_bb_width', 0.0), 0.0)
     atr_filter_enabled = bool(filters_cfg.get('atr_filter_enabled', filters_cfg.get('atr', False)))
     body_filter_enabled = bool(filters_cfg.get('body_filter_enabled', filters_cfg.get('body', False)))
+    adx_filter_enabled = bool(filters_cfg.get('adx_filter_enabled', False))
+    min_adx = _to_float(filters_cfg.get('min_adx', 0.0), 0.0)
 
     atr_pct = float(ind.get('atr_pct', 0.0))
     bb_width_pct = float(ind.get('bb_width_pct', 0.0))
     body_val = ind.get('body_to_atr', ind.get('body_atr'))
     body_to_atr = float(body_val) if body_val is not None else float('nan')
+    adx_val = float(ind.get('adx', 0.0))
 
     atr_ok = (atr_pct >= min_atr) and (atr_pct <= max_atr) and (bb_width_pct >= min_bb)
     body_ok = body_to_atr <= max_body
+    adx_ok = adx_val >= min_adx
 
     if not atr_filter_enabled:
         atr_ok = True
     if not body_filter_enabled:
         body_ok = True
+    if not adx_filter_enabled:
+        adx_ok = True
+    atr_ok = atr_ok and adx_ok
 
     if not atr_ok or not body_ok:
         logging.getLogger(__name__).info(
-            f"[{coin_cfg.get('symbol', '?')}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} "
+            f"[{coin_cfg.get('symbol', '?')}] FILTER INFO atr_ok={atr_ok} body_ok={body_ok} adx={adx_val:.2f} "
             f"bb_width_pct={bb_width_pct:.4f} atr_pct={atr_pct:.4f} body_to_atr={body_to_atr:.4f}"
         )
 
@@ -562,6 +594,7 @@ def apply_filters(ind: pd.Series, coin_cfg: Dict[str, Any]) -> Tuple[bool, bool,
         'atr_pct': atr_pct,
         'bb_width_pct': bb_width_pct,
         'body_to_atr': body_to_atr,
+        'adx': adx_val,
     }
     return atr_ok, body_ok, meta
 
