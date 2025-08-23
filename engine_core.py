@@ -140,6 +140,47 @@ def meets_min_notional(sym_cfg: Dict[str, Any], price: float, qty: float) -> boo
     min_not = _to_float(sym_cfg.get("minNotional", 0), 0)
     return (price * qty) >= min_not if min_not > 0 else True
 
+
+def _coerce_htf_cfg(coin_cfg: dict) -> dict:
+    """
+    Terima berbagai format HTF di coin_config:
+    - dict: {"enabled": bool, "timeframe": "1h"/"4h", "ema_period": int, "sma_period": int, ...}
+    - string: "1h" / "4h" → diasumsikan enabled=True dengan default period
+    - legacy: gunakan "use_htf_filter" (0/1) dan "htf_tf" (jika ada)
+    """
+    try:
+        v = coin_cfg.get("htf", None)
+        d = {
+            "enabled": bool(coin_cfg.get("use_htf_filter", False)),
+            "timeframe": str(coin_cfg.get("htf_tf", "1h")).strip().lower(),
+            "ema_period": 22,
+            "sma_period": 22,
+            "rule": "long_ema>=sma;short_ema<=sma",
+            "fallback_pass": True,
+        }
+        if isinstance(v, str):
+            d["enabled"] = True
+            d["timeframe"] = v.strip().lower()
+            return d
+        if isinstance(v, dict):
+            d.update(v)
+            d["timeframe"] = str(d.get("timeframe", "1h")).strip().lower()
+            d["ema_period"] = int(d.get("ema_period", 22))
+            d["sma_period"] = int(d.get("sma_period", 22))
+            if "fallback_pass" not in d:
+                d["fallback_pass"] = True
+            return d
+        return d
+    except Exception:
+        return {
+            "enabled": False,
+            "timeframe": "1h",
+            "ema_period": 22,
+            "sma_period": 22,
+            "rule": "long_ema>=sma;short_ema<=sma",
+            "fallback_pass": True,
+        }
+
 # -----------------------------------------------------
 # Config loader & merger
 # -----------------------------------------------------
@@ -399,7 +440,8 @@ def make_decision(
         ltf_ok_long = True
         ltf_ok_short = True
         # HTF bonus
-        htf_tf = str(coin_cfg.get("htf", {}).get("timeframe", "1h")).lower()
+        _htf = _coerce_htf_cfg(coin_cfg)
+        htf_tf = _htf["timeframe"]
         htf_close = mtf_get_close(symbol, htf_tf)
         if htf_close is not None and len(htf_close) >= 30:
             htwap = rolling_twap(htf_close, 22).iloc[-1]

@@ -34,6 +34,7 @@ from engine_core import (
     apply_filters,
     get_coin_ml_params,
     rolling_twap,
+    _coerce_htf_cfg,
 )
 
 warnings.filterwarnings(
@@ -65,12 +66,12 @@ def _enter_wrap(self, side: str, price: float, atr: float, available_balance: fl
     return float(used_margin or 0.0)
 
 
-def _exit_wrap(self, price: float, reason: str = "Exit", **kw) -> None:
+def _exit_wrap(self, price: float, reason: str = "Exit", now_ts: int | None = None, **kw) -> None:
     prev_cd = getattr(self, "cooldown_until_ts", None)
-    _orig_exit(self, price, reason, **kw)
+    _orig_exit(self, price, reason, now_ts=now_ts, **kw)
     try:
         if getattr(self, "cooldown_until_ts", None) and self.cooldown_until_ts != prev_cd:
-            now_ts = kw.get("now_ts") or time.time()
+            now_ts = now_ts or kw.get("now_ts") or time.time()
             dur = int(self.cooldown_until_ts - now_ts)
             print(f"[{self.symbol}] COOLDOWN set {dur}s karena {reason}")
     except Exception:
@@ -81,7 +82,7 @@ def _exit_wrap(self, price: float, reason: str = "Exit", **kw) -> None:
                 "t": "exit",
                 "reason": str(reason),
                 "price": float(price),
-                "ts": int((kw.get("now_ts") or time.time())),
+                "ts": int(now_ts or kw.get("now_ts") or time.time()),
             }
         )
     except Exception:
@@ -141,7 +142,7 @@ def run_dry(
             if isinstance(last_ts, pd.Timestamp):
                 last_close_s = int(last_ts.tz_convert("UTC").timestamp())
             else:
-                last_close_s = int(pd.to_datetime(last_ts, utc=True).timestamp())
+                last_close_s = int(pd.to_datetime(int(last_ts), utc=True).timestamp())
         except Exception:
             # fallback aman
             last_close_s = int(pd.Timestamp.utcnow().tz_localize("UTC").timestamp())
@@ -179,7 +180,8 @@ def run_dry(
                 atrv = float(last_ind.get("atr", 0.0))
                 twap15_ok_long = (dev >= k_atr * atrv)
                 twap15_ok_short = (-dev >= k_atr * atrv)
-                htf_tf = str(tw_cfg.get("htf", {}).get("timeframe", "1h")).lower()
+                _htf = _coerce_htf_cfg(tw_cfg)
+                htf_tf = _htf["timeframe"]
                 htf_close = sub["close"].resample(htf_tf).last().dropna()
                 if len(htf_close) >= 30:
                     htwap = rolling_twap(htf_close, 22).iloc[-1]
@@ -205,7 +207,7 @@ def run_dry(
                 decision_dbg = "LONG"
             elif score_short >= thr and score_short > score_long:
                 decision_dbg = "SHORT"
-            ts_iso = pd.to_datetime(last_ts, utc=True).isoformat()
+            ts_iso = pd.to_datetime(int(last_ts), utc=True).isoformat()
             for side, base_flag in (("LONG", long_base0), ("SHORT", short_base0)):
                 if base_flag and decision_dbg != side:
                     reasons = []
@@ -254,11 +256,11 @@ def run_dry(
         elif ev.get("t") == "exit" and current:
             trades.append(
                 {
-                    "entry_ts": pd.to_datetime(current["ts"], unit="s", utc=True).isoformat(),
+                    "entry_ts": pd.to_datetime(int(current["ts"]), unit="s", utc=True).isoformat(),
                     "side": current.get("side"),
                     "entry": current.get("price"),
                     "qty": current.get("qty", 0.0),
-                    "exit_ts": pd.to_datetime(ev["ts"], unit="s", utc=True).isoformat(),
+                    "exit_ts": pd.to_datetime(int(ev["ts"]), unit="s", utc=True).isoformat(),
                     "exit": ev.get("price"),
                     "reason": ev.get("reason", "Exit"),
                     "pnl": (
