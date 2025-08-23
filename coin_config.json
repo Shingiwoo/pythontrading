@@ -174,7 +174,7 @@
                 "confirm_bars": 0
             },
             "chop": {
-                "twap_atr_k": 0.70,
+                "twap_atr_k": 0.50,
                 "buffer_atr_mult": 0.00,
                 "confirm_bars": 0
             }
