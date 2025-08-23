@@ -40,6 +40,14 @@ def to_scalar(x: Optional[Any], *, how: str = "last", default: float = 0.0) -> f
     return as_scalar(x) if x is not None else default
 
 
+def compute_adx(df: pd.DataFrame, period: int = 14) -> Optional[pd.Series]:
+    try:
+        ind = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=period)
+        return ind.adx()
+    except Exception:
+        return None
+
+
 def to_bool(x: Union[bool, ArrayLike]) -> bool:
     if isinstance(x, (pd.Series, np.ndarray)):
         if len(x) == 0:
@@ -445,11 +453,27 @@ def make_decision(
             score_short += params["weight"]
 
     reasons: list[str] = []
+    allow = True
     _filt = coin_cfg.get('filters') if isinstance(coin_cfg.get('filters'), dict) else {}
-    if bool(_filt.get('adx_filter_enabled')) and float(meta.get('adx', 0.0)) < float(_filt.get('min_adx', 0.0)):
-        score_long -= 0.2
-        score_short -= 0.2
-        reasons.append('adx_low')
+    if _filt.get("adx_filter_enabled", False):
+        min_adx = float(_filt.get("min_adx", 0.0))
+        adx_series = compute_adx(df, 14)
+        adx_now = float(adx_series.iloc[-1]) if adx_series is not None and len(adx_series) else 999.0
+        if adx_now < min_adx:
+            if str(_filt.get("adx_mode", "soft")).lower() == "soft":
+                penalty = float(_filt.get("adx_penalty", 0.25))
+                score_long -= penalty
+                score_short -= penalty
+                reasons.append("adx_low_penalty")
+            else:
+                reasons.append("adx_low")
+                allow = False
+
+    if not allow:
+        long_base = False
+        short_base = False
+        score_long = 0.0
+        score_short = 0.0
 
     tw_cfg = coin_cfg
     use_twap = bool(tw_cfg.get("use_twap_indicator", False))
@@ -473,16 +497,23 @@ def make_decision(
         twap15 = rolling_twap(df["close"], twap15_w).iloc[-1]
         price_now = float(last["close"])
         ema22_now = float(last.get('ema_22', 0.0))
-        trend_long_ok = (price_now >= twap15) or (ema22_now >= twap15)
-        trend_short_ok = (price_now <= twap15) or (ema22_now <= twap15)
+        mode = str(coin_cfg.get("twap15_trend_mode", "any_of")).lower()
+        long_cond = [(price_now >= twap15), (ema22_now >= twap15)]
+        short_cond = [(price_now <= twap15), (ema22_now <= twap15)]
+        if mode == "all_of":
+            trend_long_ok = all(long_cond)
+            trend_short_ok = all(short_cond)
+        else:
+            trend_long_ok = any(long_cond)
+            trend_short_ok = any(short_cond)
         if long_base and not trend_long_ok:
             long_base = False
             score_long = 0.0
-            reasons.append('twap15_trend_fail')
+            reasons.append("twap15_trend_fail")
         if short_base and not trend_short_ok:
             short_base = False
             score_short = 0.0
-            reasons.append('twap15_trend_fail')
+            reasons.append("twap15_trend_fail")
         dev = float(twap15 - price_now)
         twap15_ok_long = (dev >= k_atr * atr)
         twap15_ok_short = (-dev >= k_atr * atr)
@@ -674,7 +705,8 @@ def apply_breakeven_sl(side: str,
                        tick_size: float = 0.0,
                        min_gap_pct: float = 0.0001,
                        be_trigger_r: float = 0.0,
-                       be_trigger_pct: float = 0.0) -> float | None:
+                       be_trigger_pct: float = 0.0,
+                       be_trigger_abs: float = 0.0) -> float | None:
     """
     Hitung SL BE baru bila trigger terpenuhi. Mengembalikan SL baru atau sl lama.
     - BE R-multiple: aktif hanya jika posisi sudah profit sesuai arah.
@@ -684,6 +716,13 @@ def apply_breakeven_sl(side: str,
     if entry is None or side not in ('LONG', 'SHORT'):
         return sl
     gap = max(tick_size or 0.0, abs(price) * (min_gap_pct or 0.0))
+
+    # 0) Absolute profit trigger
+    if be_trigger_abs and be_trigger_abs > 0:
+        move = (price - entry) if side == 'LONG' else (entry - price)
+        if move >= be_trigger_abs:
+            target = max(sl or 0.0, entry) if side == 'LONG' else min(sl or 1e18, entry)
+            return min(target, price - gap) if side == 'LONG' else max(target, price + gap)
 
     # 1) R-based (prioritas jika > 0)
     if be_trigger_r and be_trigger_r > 0:
@@ -755,22 +794,37 @@ def init_stops(side: str, entry: float, ind: pd.Series, coin_cfg: Dict[str, Any]
     return {'sl': sl, 'tsl': None}
 
 def step_trailing(side: str, bar: pd.Series, prev_state: Dict[str, Optional[float]], ind: pd.Series, coin_cfg: Dict[str, Any]) -> Optional[float]:
-    trigger = _to_float(coin_cfg.get('trailing_trigger', 0.7), 0.7)
-    step = _to_float(coin_cfg.get('trailing_step', 0.45), 0.45)
+    trail_cfg = coin_cfg.get("trailing") if isinstance(coin_cfg.get("trailing"), dict) else None
     entry = prev_state.get('entry', 0.0)
     price = float(bar['close'])
     if entry is None or price is None or entry == 0:
-        profit_pct = 0.0
+        profit = 0.0
     else:
-        profit_pct = safe_div((price - entry), entry) * 100 if side == 'LONG' else safe_div((entry - price), entry) * 100
-    if profit_pct < trigger:
-        return prev_state.get('tsl')
-    if side=='LONG':
-        new_tsl = price*(1-step/100)
-        return max(prev_state.get('tsl') or prev_state.get('sl') or 0.0, new_tsl)
+        profit = (price - entry) if side == 'LONG' else (entry - price)
+    if trail_cfg and trail_cfg.get("enabled", True):
+        atr = float(ind.get('atr', 0.0))
+        trig = float(trail_cfg.get("trigger_atr_mult", 0.8)) * atr
+        step_abs = float(trail_cfg.get("step_atr_mult", 0.35)) * atr
+        if profit < trig:
+            return prev_state.get('tsl')
+        if side == 'LONG':
+            new_tsl = price - step_abs
+            return max(prev_state.get('tsl') or prev_state.get('sl') or 0.0, new_tsl)
+        else:
+            new_tsl = price + step_abs
+            return min(prev_state.get('tsl') or prev_state.get('sl') or 1e18, new_tsl)
     else:
-        new_tsl = price*(1+step/100)
-        return min(prev_state.get('tsl') or prev_state.get('sl') or 1e18, new_tsl)
+        trigger = _to_float(coin_cfg.get('trailing_trigger', 0.7), 0.7)
+        step = _to_float(coin_cfg.get('trailing_step', 0.45), 0.45)
+        profit_pct = safe_div(profit, entry) * 100 if entry else 0.0
+        if profit_pct < trigger:
+            return prev_state.get('tsl')
+        if side == 'LONG':
+            new_tsl = price*(1-step/100)
+            return max(prev_state.get('tsl') or prev_state.get('sl') or 0.0, new_tsl)
+        else:
+            new_tsl = price*(1+step/100)
+            return min(prev_state.get('tsl') or prev_state.get('sl') or 1e18, new_tsl)
 
 def maybe_move_to_BE(side: str, entry: float, tsl: Optional[float], rule: Dict[str, Any]) -> Optional[float]:
     be = _to_float(rule.get('be_trigger_pct', 0.0), 0.0)

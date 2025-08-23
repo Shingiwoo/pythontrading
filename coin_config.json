@@ -21,11 +21,15 @@
             "sl_atr_mult": 2.1,
             "sl_min_pct": 0.012,
             "sl_max_pct": 0.035,
-            "use_breakeven": 1,
-            "be_trigger_pct": 0.004,
-            "be_min_gap_pct": 0.0001,
-            "trailing_trigger": 2.2,
-            "trailing_step": 0.25,
+            "trailing": {
+                "enabled": true,
+                "trigger_atr_mult": 0.8,
+                "step_atr_mult": 0.35
+            },
+            "break_even": {
+                "enabled": true,
+                "arm_atr_mult": 0.6
+            },
             "max_hold_seconds": 3600,
             "time_stop_only_if_loss": 1,
             "min_roi_to_close_by_time": -1.0,
@@ -44,7 +48,9 @@
                 "max_body_over_atr": 1.75,
                 "min_bb_width": 0.008,
                 "adx_filter_enabled": true,
-                "min_adx": 18.0
+                "min_adx": 16.0,
+                "adx_mode": "soft",
+                "adx_penalty": 0.25
             }
         },
         "SCALP-ADA-15M-LEGACY": {
@@ -128,7 +134,8 @@
         "twap_15m_window": 20,
         "twap_5m_window": 36,
         "twap_1m_window": 120,
-        "twap_atr_k": 0.6,
+        "twap_atr_k": 0.55,
+        "twap15_trend_mode": "any_of",
         "twap_exec_enabled": true,
         "twap_child_count": 4,
         "twap_duration_sec": 90,
@@ -144,9 +151,12 @@
             "rule": "long_ema>=sma;short_ema<=sma",
             "fallback_pass": true
         },
+        "cooldown_max_seconds": 900,
         "filters": {
             "adx_filter_enabled": true,
-            "min_adx": 18.0
+            "min_adx": 16.0,
+            "adx_mode": "soft",
+            "adx_penalty": 0.25
         }
     },
     "DOGEUSDT": {
