@@ -218,9 +218,12 @@ def run_dry(
                 atrv = float(last_ind.get("atr", 0.0))
                 twap15_ok_long = (dev >= k_atr * atrv)
                 twap15_ok_short = (-dev >= k_atr * atrv)
-                htf_tf = htf_timeframe(cfg_by_sym[symbol]) or "1h"
+                htf_tf = htf_timeframe(trader.config) or "1h"
                 htf_tf = _norm_resample_freq(htf_tf, "1h")
-                htf_close = sub_dt["close"].resample(htf_tf).last().dropna()
+                try:
+                    htf_close = sub_dt["close"].resample(htf_tf).last().dropna()
+                except Exception:
+                    htf_close = sub_dt["close"].resample("1h").last().dropna()
                 if len(htf_close) >= 30:
                     htwap = rolling_twap(htf_close, 22).iloc[-1]
                     ema22_htf = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
