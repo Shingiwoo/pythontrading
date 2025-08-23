@@ -342,7 +342,7 @@ class JournaledCoinTrader(CoinTrader):
     def _apply_breakeven(self, price: float) -> None:
         return super()._apply_breakeven(price)
 
-    def _enter_position(self, side: str, price: float, atr: float, available_balance: float, **kw) -> float:
+    def _enter_position(self, side, price, atr, available_balance, **kw):
         before_qty = getattr(self.pos, "qty", 0.0) or 0.0
         used = super()._enter_position(side, price, atr, available_balance, **kw)
         if self.pos.side and self.pos.qty > 0 and self.pos.qty != before_qty:
@@ -356,8 +356,8 @@ class JournaledCoinTrader(CoinTrader):
             )
         return used
 
-    def _exit_position(self, price: float, reason: str = "Exit", **kw) -> None:
-        super()._exit_position(price, reason, **kw)
+    def _exit_position(self, price, reason: str = "UNKNOWN", now_ts: int | None = None, **kw) -> None:
+        super()._exit_position(price, reason, now_ts=now_ts, **kw)
         self.journal.on_exit(self.symbol, price, reason)
 
 # -----------------------------
