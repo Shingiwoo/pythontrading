@@ -391,6 +391,8 @@ def main():
     ap.add_argument("--heikin", action="store_true", help="Gunakan Heikin-Ashi")
     ap.add_argument("--fee_bps", type=float, default=10.0, help="Biaya taker per sisi (bps)")
     ap.add_argument("--slip_bps", type=float, default=0.0, help="Slippage per sisi (bps)")
+    ap.add_argument("--twap-indicator", action="store_true", help="Aktifkan filter TWAP")
+    ap.add_argument("--twap-exec", action="store_true", help="Simulasi eksekusi TWAP")
     ap.add_argument("--max-concurrent", type=int, default=0, help="Batasi jumlah posisi aktif lintas-simbol (0=tanpa batas)")
     ap.add_argument("--limit_bars", type=int, default=600, help="Kline limit pull (<= 1500)")
     ap.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds")
@@ -457,6 +459,10 @@ def main():
         merged["heikin"] = rules["heikin"]
         merged["taker_fee"] = rules["fee_bps"] / 10000.0
         merged["SLIPPAGE_PCT"] = rules["slip_bps"] * 0.01
+        if args.twap_indicator:
+            merged["use_twap_indicator"] = True
+        if args.twap_exec:
+            merged["twap_exec_enabled"] = True
         cfg_by_sym[s] = merged
 
     journal = Journal(os.path.dirname(args.logs_dir), args.instance_id, cfg_by_sym, args.balance)

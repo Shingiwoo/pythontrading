@@ -33,6 +33,7 @@ from engine_core import (
     compute_base_signals_backtest,
     apply_filters,
     get_coin_ml_params,
+    rolling_twap,
 )
 
 warnings.filterwarnings(
@@ -167,6 +168,35 @@ def run_dry(
                     score_long += params["weight"]
                 if short_base and up_prob <= params["down_prob"]:
                     score_short += params["weight"]
+            tw_cfg = trader.config
+            twap15_ok_long = twap15_ok_short = True
+            htf_bonus_long = htf_bonus_short = False
+            if bool(tw_cfg.get("use_twap_indicator", False)):
+                twap15_w = int(tw_cfg.get("twap_15m_window", 20))
+                k_atr = float(tw_cfg.get("twap_atr_k", 0.4))
+                twap15 = rolling_twap(sub["close"], twap15_w).iloc[-1]
+                dev = float(twap15 - sub["close"].iloc[-1])
+                atrv = float(last_ind.get("atr", 0.0))
+                twap15_ok_long = (dev >= k_atr * atrv)
+                twap15_ok_short = (-dev >= k_atr * atrv)
+                htf_tf = str(tw_cfg.get("htf", {}).get("timeframe", "1h")).lower()
+                htf_close = sub["close"].resample(htf_tf).last().dropna()
+                if len(htf_close) >= 30:
+                    htwap = rolling_twap(htf_close, 22).iloc[-1]
+                    ema22_htf = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
+                    price_htf = htf_close.iloc[-1]
+                    htf_bonus_long = (price_htf >= htwap) and (ema22_htf >= htwap)
+                    htf_bonus_short = (price_htf <= htwap) and (ema22_htf <= htwap)
+                if long_base and not twap15_ok_long:
+                    long_base = False
+                    score_long = 0.0
+                if short_base and not twap15_ok_short:
+                    short_base = False
+                    score_short = 0.0
+                if long_base and htf_bonus_long:
+                    score_long += 0.2
+                if short_base and htf_bonus_short:
+                    score_short += 0.2
             thr = params["score_threshold"]
             if not params["strict"] and up_prob is None:
                 thr = 1.0
@@ -198,6 +228,11 @@ def run_dry(
                             "side": side,
                             "atr_ok": atr_ok,
                             "body_ok": body_ok,
+                            "twap15_ok": twap15_ok_long if side == "LONG" else twap15_ok_short,
+                            "ltf_ok": True,
+                            "htf_twap_bonus": htf_bonus_long if side == "LONG" else htf_bonus_short,
+                            "score_long_after_bonus": score_long,
+                            "score_short_after_bonus": score_short,
                             "base_long": bool(long_base0),
                             "base_short": bool(short_base0),
                             "ml_prob": up_prob,

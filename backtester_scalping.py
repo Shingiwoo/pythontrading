@@ -69,6 +69,9 @@ leverage = st.sidebar.slider("Leverage", 1, 125, 15)
 taker_fee = st.sidebar.number_input("Taker Fee", value=DEFAULT_TAKER_FEE, format="%.6f")
 slippage_pct = st.sidebar.slider("Slippage (%)", 0.0, 0.3, 0.02, step=0.01)
 
+use_twap_indicator = st.sidebar.checkbox("TWAP indikator", value=cfgb("use_twap_indicator", False))
+twap_exec_enabled = st.sidebar.checkbox("TWAP eksekusi", value=cfgb("twap_exec_enabled", False))
+
 with st.sidebar.expander("⚙️ LOT_SIZE & Precision"):
     lot_step = st.number_input("stepSize (LOT_SIZE)", value=0.0, min_value=0.0, format="%.10f")
     min_qty = st.number_input("minQty (LOT_SIZE)", value=0.0, min_value=0.0, format="%.10f")
@@ -113,6 +116,9 @@ def cfgb(key: str, fallback: bool) -> bool:
 leverage = cfgi("leverage", leverage)
 risk_per_trade = cfgf("risk_per_trade", risk_per_trade)
 taker_fee = cfgf("taker_fee", taker_fee)
+
+sym_cfg["use_twap_indicator"] = use_twap_indicator
+sym_cfg["twap_exec_enabled"] = twap_exec_enabled
 
 st.sidebar.header("📏 Param SCALPING (Presisi Entri v2)")
 min_atr_pct = st.sidebar.number_input("min_atr_pct", value=cfgf("min_atr_pct", 0.003))

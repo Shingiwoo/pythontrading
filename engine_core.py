@@ -7,6 +7,7 @@ from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.volatility import BollingerBands
 from ta.volume import VolumeWeightedAveragePrice
+from mtf_cache import update_cache, get_series as mtf_get_close
 
 # --- helpers (top-level util) ---
 Numeric = Union[float, int, np.floating, np.integer]
@@ -52,6 +53,18 @@ def safe_div(a: Any, b: Any, default: float = 0.0) -> float:
     if bb == 0.0 or np.isnan(bb):
         return default
     return aa / bb
+
+
+def norm_freq(freq: str, default: str = "15min") -> str:
+    f = (freq or default).strip().lower()
+    if f.endswith("m") and not f.endswith("min"):
+        if not f.endswith(("ms", "us")):
+            f = f[:-1] + "min"
+    return f
+
+
+def rolling_twap(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window=window, min_periods=max(2, window // 2)).mean()
 
 
 def floor_to_step(x: Any, step: Any) -> float:
@@ -352,6 +365,66 @@ def make_decision(
             score_long += params["weight"]
         if short_base and ml_up_prob <= params["down_prob"]:
             score_short += params["weight"]
+
+    reasons: list[str] = []
+
+    tw_cfg = coin_cfg
+    use_twap = bool(tw_cfg.get("use_twap_indicator", False))
+    tw_bonus = 0.2
+    twap15_w = int(tw_cfg.get("twap_15m_window", 20))
+    twap5_w = int(tw_cfg.get("twap_5m_window", 36))
+    twap1_w = int(tw_cfg.get("twap_1m_window", 120))
+    k_atr = float(tw_cfg.get("twap_atr_k", 0.4))
+
+    if use_twap:
+        update_cache(symbol, df)
+        last = df.iloc[-1]
+        atr = float(last.get("atr") or 0.0)
+        if atr <= 0.0:
+            try:
+                hi = df["high"]
+                lo = df["low"]
+                cl = df["close"]
+                tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (cl.shift() - lo).abs()], axis=1).max(axis=1)
+                atr = float(tr.rolling(14).mean().iloc[-1])
+            except Exception:
+                atr = 0.0
+        twap15 = rolling_twap(df["close"], twap15_w).iloc[-1]
+        dev = float(twap15 - last["close"])
+        twap15_ok_long = (dev >= k_atr * atr)
+        twap15_ok_short = (-dev >= k_atr * atr)
+
+        twap5 = mtf_get_close(symbol, "5min")
+        twap1 = mtf_get_close(symbol, "1min")
+        ltf_ok_long = True
+        ltf_ok_short = True
+        # HTF bonus
+        htf_tf = str(coin_cfg.get("htf", {}).get("timeframe", "1h")).lower()
+        htf_close = mtf_get_close(symbol, htf_tf)
+        if htf_close is not None and len(htf_close) >= 30:
+            htwap = rolling_twap(htf_close, 22).iloc[-1]
+            ema22_htf = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
+            price_htf = htf_close.iloc[-1]
+            long_bonus_ok = (price_htf >= htwap) and (ema22_htf >= htwap)
+            short_bonus_ok = (price_htf <= htwap) and (ema22_htf <= htwap)
+        else:
+            long_bonus_ok = short_bonus_ok = False
+
+        if long_base and not twap15_ok_long:
+            long_base = False
+            score_long = 0.0
+            reasons.append("twap15_dev_fail")
+        if short_base and not twap15_ok_short:
+            short_base = False
+            score_short = 0.0
+            reasons.append("twap15_dev_fail")
+
+        if long_base and long_bonus_ok:
+            score_long += tw_bonus
+            reasons.append("twap_htf_bonus")
+        if short_base and short_bonus_ok:
+            score_short += tw_bonus
+            reasons.append("twap_htf_bonus")
     # Fallback: jika strict=False & ML belum siap → izinkan base-only (thr=1.0)
     thr = params["score_threshold"]
     if not params["strict"] and not ml_ready:
@@ -373,7 +446,7 @@ def make_decision(
     logging.getLogger(__name__).info(
         f"[{symbol}] DECISION ema22={ema:.6f} ma22={ma:.6f} rsi={rsi:.2f} base(L={long_base},S={short_base}) "
         f"atr_ok={atr_ok} body_ok={body_ok} bb_width_pct={bb_width:.4f} "
-        f"ml_up_prob={ml_up_prob} thr={thr} score(L={score_long:.2f},S={score_short:.2f}) -> {decision}"
+        f"ml_up_prob={ml_up_prob} thr={thr} score(L={score_long:.2f},S={score_short:.2f}) reasons={reasons} -> {decision}"
     )
     return decision
 
