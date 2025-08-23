@@ -511,17 +511,39 @@ def make_decision(
             entry_cfg = coin_cfg.get("entry", {})
             buffer_mult = float(entry_cfg.get("buffer_atr_mult", 0.12))
             confirm_bars = int(entry_cfg.get("confirm_bars", 2))
+        reasons.append(f"regime={regime}")
         reasons.append(f"k_used={k}")
         reasons.append(f"buffer_used={buffer_mult}")
         reasons.append(f"confirm_bars_used={confirm_bars}")
         entry_cfg = coin_cfg.get("entry", {})
         allow_ct_short = bool(entry_cfg.get("allow_countertrend_short", False))
         buf = buffer_mult * atr
+        long_bonus_ok = short_bonus_ok = False
+        if htf_close is not None and len(htf_close) >= 30:
+            htwap = rolling_twap(htf_close, 22).iloc[-1]
+            ema22_htf = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
+            price_htf = htf_close.iloc[-1]
+            long_bonus_ok = (price_htf >= htwap) and (ema22_htf >= htwap)
+            short_bonus_ok = (price_htf <= htwap) and (ema22_htf <= htwap)
         twap15_ok_long = twap15_ok_short = True
         if regime == "TREND":
-            twap15_ok_long = price_now >= twap15 + buf
-            twap15_ok_short = price_now <= twap15 - buf
+            # PR6.3 — dukung any_of: (price vs TWAP) ATAU (EMA22 vs TWAP)
+            mode = str(coin_cfg.get("twap15_trend_mode", "any_of")).lower()
+            ema22_now = float(last.get("ema_22", 0.0))
+            cond_long = [(price_now >= twap15 + buf), (ema22_now >= twap15)]
+            cond_short = [(price_now <= twap15 - buf), (ema22_now <= twap15)]
+            if mode == "all_of":
+                twap15_ok_long = all(cond_long)
+                twap15_ok_short = all(cond_short)
+            else:  # default any_of
+                twap15_ok_long = any(cond_long)
+                twap15_ok_short = any(cond_short)
+            reasons.append(f"twap15_trend_mode={mode}")
+            reasons.append(
+                f"ema22_now_vs_twap={'LONG' if ema22_now >= twap15 else 'SHORT'}"
+            )
         else:
+            # CHOP: mean-reversion berbasis deviasi ATR dari TWAP
             twap15_ok_long = price_now <= twap15 - k * atr
             twap15_ok_short = price_now >= twap15 + k * atr
         if long_base and not twap15_ok_long:
@@ -548,6 +570,13 @@ def make_decision(
             reasons.append("trend_confirm_fail")
             short_base = False
             score_short = 0.0
+        # Jika gagal TWAP tapi HTF mendukung kuat, override ringan
+        if long_base and not twap15_ok_long and regime == "TREND" and long_bonus_ok:
+            twap15_ok_long = True
+            reasons.append("twap15_override_htf_bonus")
+        if short_base and not twap15_ok_short and regime == "TREND" and short_bonus_ok:
+            twap15_ok_short = True
+            reasons.append("twap15_override_htf_bonus")
         if regime != "TREND" and short_base and not allow_ct_short:
             short_base = False
             score_short = 0.0
@@ -557,14 +586,6 @@ def make_decision(
         ltf_ok_long = True
         ltf_ok_short = True
         # HTF bonus
-        if htf_close is not None and len(htf_close) >= 30:
-            htwap = rolling_twap(htf_close, 22).iloc[-1]
-            ema22_htf = htf_close.ewm(span=22, adjust=False).mean().iloc[-1]
-            price_htf = htf_close.iloc[-1]
-            long_bonus_ok = (price_htf >= htwap) and (ema22_htf >= htwap)
-            short_bonus_ok = (price_htf <= htwap) and (ema22_htf <= htwap)
-        else:
-            long_bonus_ok = short_bonus_ok = False
         if long_base and long_bonus_ok:
             score_long += tw_bonus
             reasons.append("twap_htf_bonus")
