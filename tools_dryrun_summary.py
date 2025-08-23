@@ -34,8 +34,8 @@ from engine_core import (
     apply_filters,
     get_coin_ml_params,
     rolling_twap,
-    _coerce_htf_cfg,
     _norm_resample_freq,
+    htf_timeframe,
 )
 
 warnings.filterwarnings(
@@ -117,6 +117,19 @@ def ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def to_utc_epoch_and_iso(ts_like):
+    """Kembalikan (epoch_seconds:int, iso_utc:str) dari berbagai tipe ts (Timestamp/str/num)."""
+    import pandas as pd
+    ts = ts_like
+    if isinstance(ts, pd.Timestamp):
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None or ts.tz is None else ts.tz_convert("UTC")
+        return int(ts.timestamp()), ts.isoformat()
+    ts = pd.to_datetime(ts, utc=True, errors="coerce")
+    if ts.tzinfo is None or ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    return int(ts.timestamp()), ts.isoformat()
+
+
 def run_dry(
     symbol: str,
     csv_path: str,
@@ -138,12 +151,14 @@ def run_dry(
     # warmup supaya indikator & ML siap
     min_train = int(float(os.getenv("ML_MIN_TRAIN_BARS", "400")))
     warmup = max(300, min_train + 10)
-    start_i = min(warmup, len(df) - 1)
+    start_i_val = min(warmup, len(df) - 1)
+    start_i: int = int(start_i_val)
 
     mgr = nrt.TradingManager(coin_config_path, [symbol])
     trader = mgr.traders[symbol]
     trader._log = lambda *args, **kwargs: None  # matikan log biar cepat
     trader._journal = []
+    cfg_by_sym = {symbol: trader.config}
     reasons_rows: list[dict] = [] if debug_reasons else []
 
     # Pre-fit ML sekali di warmup (opsional, untuk speed)
@@ -160,16 +175,15 @@ def run_dry(
     steps = 0
     for i in range(start_i, min(len(df) - 1, start_i + steps_limit)):
         sub = df.loc[: df.index[i]].copy()
-        # ambil close time bar terakhir sebagai jam virtual
-        last_ts = sub["timestamp"].iloc[-1]
-        try:
-            if isinstance(last_ts, pd.Timestamp):
-                last_close_s = int(last_ts.tz_convert("UTC").timestamp())
-            else:
-                last_close_s = int(pd.to_datetime(int(last_ts), utc=True).timestamp())
-        except Exception:
-            # fallback aman
+        sub_dt = ensure_dt_index(sub)
+
+        last_ts_val = sub_dt.index[-1] if len(sub_dt.index) else None
+        if last_ts_val is not None:
+            last_close_s, ts_iso = to_utc_epoch_and_iso(last_ts_val)
+        else:
             last_close_s = int(pd.Timestamp.utcnow().tz_localize("UTC").timestamp())
+            ts_iso = pd.Timestamp.utcnow().tz_localize("UTC").isoformat()
+
         trader.check_trading_signals(sub, balance, now_ts=last_close_s)
 
         if debug_reasons:
@@ -204,9 +218,7 @@ def run_dry(
                 atrv = float(last_ind.get("atr", 0.0))
                 twap15_ok_long = (dev >= k_atr * atrv)
                 twap15_ok_short = (-dev >= k_atr * atrv)
-                _htf = _coerce_htf_cfg(tw_cfg)
-                htf_tf = _htf.get("timeframe") or "1h"
-                sub_dt = ensure_dt_index(sub)
+                htf_tf = htf_timeframe(cfg_by_sym[symbol]) or "1h"
                 htf_tf = _norm_resample_freq(htf_tf, "1h")
                 htf_close = sub_dt["close"].resample(htf_tf).last().dropna()
                 if len(htf_close) >= 30:
@@ -233,7 +245,6 @@ def run_dry(
                 decision_dbg = "LONG"
             elif score_short >= thr and score_short > score_long:
                 decision_dbg = "SHORT"
-            ts_iso = pd.to_datetime(int(last_ts), utc=True).isoformat()
             for side, base_flag in (("LONG", long_base0), ("SHORT", short_base0)):
                 if base_flag and decision_dbg != side:
                     reasons = []
@@ -386,7 +397,7 @@ def main():
         args.symbol.upper(),
         args.csv,
         cfg_path,
-        args.steps,
+        int(args.steps),
         args.balance,
         debug_reasons=args.debug_reasons,
     )

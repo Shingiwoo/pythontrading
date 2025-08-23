@@ -181,6 +181,13 @@ def _coerce_htf_cfg(coin_cfg: dict) -> dict:
             "fallback_pass": True,
         }
 
+def htf_timeframe(coin_cfg: dict) -> str | None:
+    """Ambil timeframe HTF dari konfigurasi."""
+    try:
+        return _coerce_htf_cfg(coin_cfg).get("timeframe")
+    except Exception:
+        return None
+
 # -----------------------------------------------------
 # Config loader & merger
 # -----------------------------------------------------
