@@ -317,35 +317,40 @@ def run_dry(
                     tsl_moves = int(getattr(pos, 'tsl_moves', 0)) if pos else 0
                     tp1_hit = bool(getattr(pos, 'tp1_hit', False)) if pos else False
                     tp2_hit = bool(getattr(pos, 'tp2_hit', False)) if pos else False
-                    reasons_rows.append(
-                        {
-                            "timestamp": ts_iso,
-                            "side": side,
-                            "atr_ok": atr_ok,
-                            "body_ok": body_ok,
-                            "twap15_ok": twap15_ok_long if side == "LONG" else twap15_ok_short,
-                            "twap15_trend_ok": trend_long_ok if side == "LONG" else trend_short_ok,
-                            "adx_penalized": adx_penalized,
-                            "ltf_ok": True,
-                            "htf_twap_bonus": htf_bonus_long if side == "LONG" else htf_bonus_short,
-                            "score_long_after_bonus": score_long,
-                            "score_short_after_bonus": score_short,
-                            "base_long": bool(long_base0),
-                            "base_short": bool(short_base0),
-                            "ml_prob": up_prob,
-                            "score_long": score_long,
-                            "score_short": score_short,
-                            "regime": regime,
-                            "trend_confirm_fail": "trend_confirm_fail" in reasons,
-                            "ct_short_disabled": "ct_short_disabled" in reasons,
-                            "adx_low_penalty": "adx_low_penalty" in reasons,
-                            "tp1_hit": tp1_hit,
-                            "tp2_hit": tp2_hit,
-                            "be_armed": be_armed_flag,
-                            "tsl_moves": tsl_moves,
-                            "reason_list": ";".join(reasons) if reasons else "-",
-                        }
-                    )
+                    row = {
+                        "timestamp": ts_iso,
+                        "side": side,
+                        "atr_ok": atr_ok,
+                        "body_ok": body_ok,
+                        "twap15_ok": twap15_ok_long if side == "LONG" else twap15_ok_short,
+                        "twap15_trend_ok": trend_long_ok if side == "LONG" else trend_short_ok,
+                        "adx_penalized": adx_penalized,
+                        "ltf_ok": True,
+                        "htf_twap_bonus": htf_bonus_long if side == "LONG" else htf_bonus_short,
+                        "score_long_after_bonus": score_long,
+                        "score_short_after_bonus": score_short,
+                        "base_long": bool(long_base0),
+                        "base_short": bool(short_base0),
+                        "ml_prob": up_prob,
+                        "score_long": score_long,
+                        "score_short": score_short,
+                        "regime": regime,
+                        "trend_confirm_fail": "trend_confirm_fail" in reasons,
+                        "ct_short_disabled": "ct_short_disabled" in reasons,
+                        "adx_low_penalty": "adx_low_penalty" in reasons,
+                        "tp1_hit": tp1_hit,
+                        "tp2_hit": tp2_hit,
+                        "be_armed": be_armed_flag,
+                        "tsl_moves": tsl_moves,
+                        "reason_list": ";".join(reasons) if reasons else "-",
+                    }
+                    row["regime"] = locals().get("regime", None)
+                    row["k_used"] = locals().get("k", None)
+                    row["buffer_used"] = locals().get("buffer_mult", None)
+                    row["confirm_bars_used"] = locals().get("confirm_bars", None)
+                    row["score_rule_only"] = locals().get("score_rule_only", None)
+                    row["ml_thr_used"] = locals().get("ml_thr", None)
+                    reasons_rows.append(row)
         steps += 1
     elapsed = time.time() - t0
 
