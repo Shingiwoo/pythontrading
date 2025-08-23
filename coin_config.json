@@ -42,7 +42,7 @@
                 "body_filter_enabled": true,
                 "min_atr_threshold": 0.003,
                 "max_body_over_atr": 1.75,
-                "min_bb_width": 0.008,
+                "min_bb_width": 0.010,
                 "adx_filter_enabled": true,
                 "min_adx": 18.0
             }
@@ -128,7 +128,7 @@
         "twap_15m_window": 20,
         "twap_5m_window": 36,
         "twap_1m_window": 120,
-        "twap_atr_k": 0.6,
+        "twap_atr_k": 0.8,
         "twap_exec_enabled": true,
         "twap_child_count": 4,
         "twap_duration_sec": 90,

@@ -47,7 +47,7 @@ from engine_core import (
     load_coin_config, merge_config, compute_indicators as calculate_indicators,
     htf_trend_ok, r_multiple, apply_breakeven_sl, roi_frac_now, base_supports_side,
     safe_div, as_float, compute_base_signals_backtest, make_decision, round_to_tick,
-    as_scalar, apply_filters
+    as_scalar, apply_filters, rolling_twap
 )
 
 from exchanges import binance_adapter as bnx
@@ -482,6 +482,11 @@ class CoinTrader:
         self._cd_logged_until_ts = None
         self._journal: List[dict] = []  # untuk tools_dryrun_summary (rekonstruksi trade)
         self._last_atr_pct: float | None = None
+        self.invalidated_bars = 0
+        self.cooldown_escalated = False
+        self.last_hard_sl_bar = -1
+        self.hard_sl_streak = 0
+        self.cooldown_escalate_bars = int(self.config.get('cooldown_escalate_bars', 20))
 
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
@@ -819,10 +824,26 @@ class CoinTrader:
         ru = (reason or '').upper()
         if ru == 'HARD_SL':
             mul = _to_float(self.config.get('cooldown_mul_hard_sl', 1.0), 1.0)
+            if self.last_hard_sl_bar >= 0 and (self._bar_idx - self.last_hard_sl_bar) <= self.cooldown_escalate_bars:
+                self.hard_sl_streak += 1
+            else:
+                self.hard_sl_streak = 1
+            self.last_hard_sl_bar = self._bar_idx
+            if self.hard_sl_streak >= 2 and not self.cooldown_escalated:
+                mul *= 4.0
+                self.cooldown_escalated = True
+                self._log('cooldown_escalated')
         elif ru == 'TRAILING_SL':
             mul = _to_float(self.config.get('cooldown_mul_trailing', 1.0), 1.0)
+            self.hard_sl_streak = 0
         elif ru == 'TIME_STOP' or 'EARLY' in ru:
             mul = _to_float(self.config.get('cooldown_mul_early_stop', 1.0), 1.0)
+            self.hard_sl_streak = 0
+        else:
+            self.hard_sl_streak = 0
+        if roi_frac > 0:
+            self.cooldown_escalated = False
+            self.hard_sl_streak = 0
         # Jika profit dan diizinkan, bisa tanpa cooldown
         if _to_bool(self.config.get('no_cooldown_on_profit', DEFAULTS['no_cooldown_on_profit']),
                     DEFAULTS['no_cooldown_on_profit']) and roi_frac > 0:
@@ -908,6 +929,28 @@ class CoinTrader:
                     exit_price = self.pos.trailing_sl or self.pos.sl or price
                     self._exit_position(exit_price, rs or 'Exit', now_ts=now_ts)
                     return 0.0
+                twap_w = int(self.config.get('twap_15m_window', 20))
+                twap15 = rolling_twap(df['close'], twap_w).iloc[-1]
+                ema22 = float(last.get('ema_22', 0.0))
+                if self.pos.side == 'LONG':
+                    cond = price < twap15 and ema22 < twap15
+                else:
+                    cond = price > twap15 and ema22 > twap15
+                if cond:
+                    self.invalidated_bars += 1
+                else:
+                    self.invalidated_bars = 0
+                if self.invalidated_bars >= 2:
+                    lev = _to_int(self.config.get('leverage', DEFAULTS['leverage']), DEFAULTS['leverage'])
+                    roi_frac = roi_frac_now(self.pos.side, self.pos.entry, price, self.pos.qty, lev)
+                    be_active = (
+                        (self.pos.trailing_sl is not None) or
+                        (self.pos.sl is not None and ((self.pos.side == 'LONG' and self.pos.sl >= self.pos.entry) or (self.pos.side == 'SHORT' and self.pos.sl <= self.pos.entry)))
+                    )
+                    if be_active or roi_frac <= 0:
+                        self._exit_position(price, 'invalidated_signal_exit', now_ts=now_ts)
+                        self.invalidated_bars = 0
+                        return 0.0
 
             atr_ok, body_ok, meta = apply_filters(last, self.config)
             bb_val = meta.get('bb_width_pct', 0.0)

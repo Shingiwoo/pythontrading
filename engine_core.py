@@ -445,6 +445,9 @@ def make_decision(
             score_short += params["weight"]
 
     reasons: list[str] = []
+    _filt = coin_cfg.get('filters') if isinstance(coin_cfg.get('filters'), dict) else {}
+    if bool(_filt.get('adx_filter_enabled')) and float(meta.get('adx', 0.0)) < float(_filt.get('min_adx', 0.0)):
+        reasons.append('adx_low')
 
     tw_cfg = coin_cfg
     use_twap = bool(tw_cfg.get("use_twap_indicator", False))
@@ -466,7 +469,19 @@ def make_decision(
             except Exception:
                 atr = 0.0
         twap15 = rolling_twap(df["close"], twap15_w).iloc[-1]
-        dev = float(twap15 - last["close"])
+        price_now = float(last["close"])
+        ema22_now = float(last.get('ema_22', 0.0))
+        trend_long_ok = (price_now >= twap15) and (ema22_now >= twap15)
+        trend_short_ok = (price_now <= twap15) and (ema22_now <= twap15)
+        if long_base and not trend_long_ok:
+            long_base = False
+            score_long = 0.0
+            reasons.append('twap15_trend_fail')
+        if short_base and not trend_short_ok:
+            short_base = False
+            score_short = 0.0
+            reasons.append('twap15_trend_fail')
+        dev = float(twap15 - price_now)
         twap15_ok_long = (dev >= k_atr * atr)
         twap15_ok_short = (-dev >= k_atr * atr)
 
