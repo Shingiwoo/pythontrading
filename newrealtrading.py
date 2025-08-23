@@ -449,6 +449,10 @@ class Position:
     sl: Optional[float] = None
     trailing_sl: Optional[float] = None
     entry_time: Optional[pd.Timestamp] = None
+    tp1_hit: bool = False
+    tp2_hit: bool = False
+    be_armed: bool = False
+    tsl_moves: int = 0
 
 
 class CoinTrader:
@@ -606,32 +610,22 @@ class CoinTrader:
         sl_pct = max(sl_min, min(sl_pct, sl_max))
         return entry * (1 - sl_pct) if side=='LONG' else entry * (1 + sl_pct)
 
-    def _apply_breakeven(self, price: float) -> None:
-        if not _to_bool(self.config.get('use_breakeven', DEFAULTS['use_breakeven']), DEFAULTS['use_breakeven']):
+    def _apply_breakeven(self, price: float, atr: float) -> None:
+        cfg = self.config.get('break_even', {})
+        if not cfg.get('enabled', False):
             return
         if not (self.pos.side and self.pos.entry is not None):
             return
-        tick = _to_float(self.config.get('tickSize', 0.0), 0.0)
-        new_sl = apply_breakeven_sl(
-            side=self.pos.side,
-            entry=self.pos.entry,
-            price=price,
-            sl=self.pos.sl,
-            tick_size=tick,
-            min_gap_pct=_to_float(self.config.get('be_min_gap_pct', 0.0001), 0.0001),
-            be_trigger_r=_to_float(self.config.get('be_trigger_r', 0.0), 0.0),
-            be_trigger_pct=_to_float(self.config.get('be_trigger_pct', DEFAULTS['be_trigger_pct']),
-                                     DEFAULTS['be_trigger_pct'])
-        )
-        self.pos.sl = new_sl
-        tick = _to_float(self.config.get('tickSize', 0.0), 0.0)
-        if tick > 0 and self.pos.entry is not None and self.pos.sl is not None:
-            if self.pos.side == 'LONG':
-                self.pos.sl = max(self.pos.sl, self.pos.entry + 2.0 * tick)
-            else:
-                self.pos.sl = min(self.pos.sl, self.pos.entry - 2.0 * tick)
+        if self.pos.be_armed:
+            return
+        be_arm = float(cfg.get('arm_atr_mult', 0.6)) * atr
+        pnl = abs(price - self.pos.entry)
+        if pnl >= be_arm:
+            self.pos.sl = self.pos.entry
+            self.pos.be_armed = True
+            self._log('BE armed')
 
-    def _update_trailing(self, price: float) -> None:
+    def _update_trailing_old(self, price: float) -> None:
         safe_trigger, step = self._safe_trailing_params()
         if not (self.pos.entry and self.pos.side):
             return
@@ -667,6 +661,67 @@ class CoinTrader:
                         stop_side = "BUY"
                         cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
                         self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True, client_id=cid)
+
+
+    def _update_trailing(self, price: float, atr: float) -> None:
+        cfg = self.config.get('trailing', {})
+        if not cfg.get('enabled', False):
+            return
+        if not (self.pos.entry and self.pos.side):
+            return
+        trigger = float(cfg.get('trigger_atr_mult', 0.8)) * atr
+        step = float(cfg.get('step_atr_mult', 0.35)) * atr
+        pnl = price - self.pos.entry if self.pos.side == 'LONG' else self.pos.entry - price
+        if pnl >= trigger:
+            if self.pos.side == 'LONG':
+                new_ts = price - step
+                prev = self.pos.trailing_sl
+                self.pos.trailing_sl = max(self.pos.trailing_sl or self.pos.sl or 0.0, new_ts)
+            else:
+                new_ts = price + step
+                prev = self.pos.trailing_sl
+                self.pos.trailing_sl = min(self.pos.trailing_sl or self.pos.sl or 1e18, new_ts)
+            if self.pos.trailing_sl != prev:
+                self.pos.tsl_moves += 1
+                self._log(f"TRAIL {self.pos.side} -> {self.pos.trailing_sl:.6f} (prev={prev})")
+                if self.exec and self.pos.side and self.pos.qty and self.pos.trailing_sl:
+                    try:
+                        self.exec.cancel_all(self.symbol)
+                    except Exception:
+                        pass
+                    stop_side = 'SELL' if self.pos.side == 'LONG' else 'BUY'
+                    cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
+                    self.exec.stop_market(self.symbol, stop_side, self.pos.trailing_sl, self.pos.qty, reduce_only=True, client_id=cid)
+
+
+    def _check_bracket_exit(self, price: float, atr: float) -> bool:
+        cfg = self.config.get('bracket_exit', {})
+        if not cfg.get('enabled', False):
+            return False
+        if not (self.pos.side and self.pos.entry is not None and self.pos.qty):
+            return False
+        tp1 = self.pos.entry + cfg.get('tp1_atr_mult', 0.8) * atr if self.pos.side == 'LONG' else self.pos.entry - cfg.get('tp1_atr_mult', 0.8) * atr
+        tp2 = self.pos.entry + cfg.get('tp2_atr_mult', 1.6) * atr if self.pos.side == 'LONG' else self.pos.entry - cfg.get('tp2_atr_mult', 1.6) * atr
+        hit = False
+        now_ts = int(self._now_ts or time.time())
+        if not self.pos.tp1_hit and ((self.pos.side == 'LONG' and price >= tp1) or (self.pos.side == 'SHORT' and price <= tp1)):
+            size_to_close = self.pos.qty * cfg.get('tp1_size_frac', 0.5)
+            if self.exec:
+                side_close = 'SELL' if self.pos.side == 'LONG' else 'BUY'
+                cid = f"x-{self.instance_id}-{self.symbol}-{uuid4().hex[:8]}"
+                self.exec.market_close(self.symbol, side_close, size_to_close, client_id=cid)
+            self.pos.qty -= size_to_close
+            self.pos.sl = self.pos.entry
+            self.pos.be_armed = True
+            self.pos.tp1_hit = True
+            self._journal.append({'t': 'exit', 'reason': 'TP1', 'price': price, 'ts': now_ts})
+            hit = True
+        if (self.pos.side == 'LONG' and price >= tp2) or (self.pos.side == 'SHORT' and price <= tp2):
+            self.pos.tp2_hit = True
+            self._exit_position(price, reason='TP2', now_ts=now_ts)
+            self._journal.append({'t': 'exit', 'reason': 'TP2', 'price': price, 'ts': now_ts})
+            hit = True
+        return hit
 
 
     def _enter_position(self, side: str, price: float, atr: float, available_balance: float, **kw) -> float:
@@ -820,38 +875,22 @@ class CoinTrader:
         self._log(f"EXIT {reason} price={price:.6f} roi={roi_frac*100:.2f}%")
         self.pos = Position()  # reset
         base_cd = _to_int(self.config.get('cooldown_seconds', DEFAULTS['cooldown_seconds']), DEFAULTS['cooldown_seconds'])
-        mul = 1.0
+        max_cd = _to_int(self.config.get('cooldown_max_seconds', 900), 900)
+        mul_hard = _to_float(self.config.get('cooldown_mul_hard_sl', 1.0), 1.0)
         ru = (reason or '').upper()
+        cd = base_cd
         if ru == 'HARD_SL':
-            mul = _to_float(self.config.get('cooldown_mul_hard_sl', 1.0), 1.0)
-            if self.last_hard_sl_bar >= 0 and (self._bar_idx - self.last_hard_sl_bar) <= self.cooldown_escalate_bars:
-                self.hard_sl_streak += 1
-            else:
-                self.hard_sl_streak = 1
-            self.last_hard_sl_bar = self._bar_idx
-            if self.hard_sl_streak >= 2 and not self.cooldown_escalated:
-                mul *= 4.0
-                self.cooldown_escalated = True
-                self._log('cooldown_escalated')
-        elif ru == 'TRAILING_SL':
-            mul = _to_float(self.config.get('cooldown_mul_trailing', 1.0), 1.0)
+            self.hard_sl_streak += 1
+            cd = base_cd * (mul_hard if self.hard_sl_streak <= 2 else 1.0)
+        elif roi_frac > 0:
             self.hard_sl_streak = 0
-        elif ru == 'TIME_STOP' or 'EARLY' in ru:
-            mul = _to_float(self.config.get('cooldown_mul_early_stop', 1.0), 1.0)
-            self.hard_sl_streak = 0
+            cd = base_cd
         else:
             self.hard_sl_streak = 0
-        if roi_frac > 0:
-            self.cooldown_escalated = False
-            self.hard_sl_streak = 0
-        # Jika profit dan diizinkan, bisa tanpa cooldown
         if _to_bool(self.config.get('no_cooldown_on_profit', DEFAULTS['no_cooldown_on_profit']),
                     DEFAULTS['no_cooldown_on_profit']) and roi_frac > 0:
             cd = 0
-        else:
-            cd = max(0, int(base_cd * mul))
-        bar_sec = int(self.config.get('bar_seconds', 900))
-        cd = min(cd, bar_sec * 2)
+        cd = min(int(cd), max_cd)
         # selalu tahan N bar setelah exit untuk kurangi over-trading
         self.pending_skip_entries = max(self.pending_skip_entries,
                                         _to_int(self.config.get('min_bars_between_entries',
@@ -913,8 +952,9 @@ class CoinTrader:
 
         try:
             if self.pending_skip_entries > 0:
-                self._apply_breakeven(price)
-                self._update_trailing(price)
+                self._apply_breakeven(price, atr)
+                self._update_trailing(price, atr)
+                self._check_bracket_exit(price, atr)
                 ex, reason = self._should_exit(price=price, high=bar_high, low=bar_low)
                 if ex:
                     exit_price = self.pos.trailing_sl or self.pos.sl or price
@@ -922,8 +962,9 @@ class CoinTrader:
                 return 0.0
 
             if self.pos.side:
-                self._apply_breakeven(price)
-                self._update_trailing(price)
+                self._apply_breakeven(price, atr)
+                self._update_trailing(price, atr)
+                self._check_bracket_exit(price, atr)
                 ex, rs = self._should_exit(price=price, high=bar_high, low=bar_low)
                 if ex:
                     exit_price = self.pos.trailing_sl or self.pos.sl or price
@@ -993,8 +1034,9 @@ class CoinTrader:
             if self.signal_flip_confirm_left > 0:
                 self._log(f"SIGNAL CONFIRM: menunggu {self.signal_flip_confirm_left} bar utk validasi flip")
                 if self.pos.side:
-                    self._apply_breakeven(price)
-                    self._update_trailing(price)
+                    self._apply_breakeven(price, atr)
+                    self._update_trailing(price, atr)
+                    self._check_bracket_exit(price, atr)
                 return 0.0
 
             decision = make_decision(df, self.symbol, self.config, up_prob, atr_ok=atr_ok, body_ok=body_ok, meta=meta)

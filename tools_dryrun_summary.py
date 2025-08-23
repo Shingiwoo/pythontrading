@@ -37,6 +37,7 @@ from engine_core import (
     _norm_resample_freq,
     htf_timeframe,
 )
+from regime import RegimeThresholds, get_regime
 
 warnings.filterwarnings(
     "ignore",
@@ -302,12 +303,19 @@ def run_dry(
                         reasons.append("twap15_trend_fail")
                     if adx_penalized:
                         reasons.append("adx_low_penalty")
+                    reg_cfg = trader.config.get('regime', {})
+                    th = RegimeThresholds(
+                        adx_period=int(reg_cfg.get('adx_period', 14)),
+                        bb_period=int(reg_cfg.get('bb_period', 20)),
+                        trend_threshold=float(reg_cfg.get('trend_threshold', 20.0)),
+                        bb_width_chop_max=float(reg_cfg.get('bb_width_chop_max', 0.010)),
+                    )
+                    regime = get_regime(ind, th) if reg_cfg.get('enabled', False) else 'CHOP'
                     pos = getattr(trader, 'pos', None)
-                    be_armed = False
-                    tsl_armed = False
-                    if pos:
-                        be_armed = bool(pos.sl and pos.entry is not None and ((pos.side == 'LONG' and pos.sl >= pos.entry) or (pos.side == 'SHORT' and pos.sl <= pos.entry)))
-                        tsl_armed = bool(getattr(pos, 'trailing_sl', None))
+                    be_armed_flag = bool(getattr(pos, 'be_armed', False)) if pos else False
+                    tsl_moves = int(getattr(pos, 'tsl_moves', 0)) if pos else 0
+                    tp1_hit = bool(getattr(pos, 'tp1_hit', False)) if pos else False
+                    tp2_hit = bool(getattr(pos, 'tp2_hit', False)) if pos else False
                     reasons_rows.append(
                         {
                             "timestamp": ts_iso,
@@ -326,8 +334,14 @@ def run_dry(
                             "ml_prob": up_prob,
                             "score_long": score_long,
                             "score_short": score_short,
-                            "be_armed": be_armed,
-                            "tsl_armed": tsl_armed,
+                            "regime": regime,
+                            "trend_confirm_fail": "trend_confirm_fail" in reasons,
+                            "ct_short_disabled": "ct_short_disabled" in reasons,
+                            "adx_low_penalty": "adx_low_penalty" in reasons,
+                            "tp1_hit": tp1_hit,
+                            "tp2_hit": tp2_hit,
+                            "be_armed": be_armed_flag,
+                            "tsl_moves": tsl_moves,
                             "reason_list": ";".join(reasons) if reasons else "-",
                         }
                     )

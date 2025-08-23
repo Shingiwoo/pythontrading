@@ -3,11 +3,12 @@ from typing import Dict, Any, Tuple, Optional, Union, Any
 
 import numpy as np
 import pandas as pd
-from ta.trend import EMAIndicator, SMAIndicator, MACD, ADXIndicator
+from ta.trend import EMAIndicator, SMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.volatility import BollingerBands
 from ta.volume import VolumeWeightedAveragePrice
 from mtf_cache import update_cache, get_series as mtf_get_close
+from regime import RegimeThresholds, get_regime, compute_adx
 
 # --- helpers (top-level util) ---
 Numeric = Union[float, int, np.floating, np.integer]
@@ -38,14 +39,6 @@ SAFE_EPS = float(os.getenv("SAFE_EPS", "1e-9"))
 
 def to_scalar(x: Optional[Any], *, how: str = "last", default: float = 0.0) -> float:
     return as_scalar(x) if x is not None else default
-
-
-def compute_adx(df: pd.DataFrame, period: int = 14) -> Optional[pd.Series]:
-    try:
-        ind = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=period)
-        return ind.adx()
-    except Exception:
-        return None
 
 
 def to_bool(x: Union[bool, ArrayLike]) -> bool:
@@ -454,20 +447,26 @@ def make_decision(
 
     reasons: list[str] = []
     allow = True
+    reg_cfg = coin_cfg.get("regime", {})
+    th = RegimeThresholds(
+        adx_period=int(reg_cfg.get("adx_period", 14)),
+        bb_period=int(reg_cfg.get("bb_period", 20)),
+        trend_threshold=float(reg_cfg.get("trend_threshold", 20.0)),
+        bb_width_chop_max=float(reg_cfg.get("bb_width_chop_max", 0.010)),
+    )
+    regime = get_regime(df, th) if reg_cfg.get("enabled", False) else "CHOP"
+    reasons.append(f"regime={regime}")
     _filt = coin_cfg.get('filters') if isinstance(coin_cfg.get('filters'), dict) else {}
+    adx_now = None
     if _filt.get("adx_filter_enabled", False):
-        min_adx = float(_filt.get("min_adx", 0.0))
-        adx_series = compute_adx(df, 14)
-        adx_now = float(adx_series.iloc[-1]) if adx_series is not None and len(adx_series) else 999.0
+        min_adx = float(_filt.get("min_adx", 16.0))
+        adx_series = compute_adx(df, int(_filt.get("adx_period", 14)))
+        adx_now = float(adx_series.iloc[-1]) if len(adx_series) else 0.0
         if adx_now < min_adx:
-            if str(_filt.get("adx_mode", "soft")).lower() == "soft":
-                penalty = float(_filt.get("adx_penalty", 0.25))
-                score_long -= penalty
-                score_short -= penalty
-                reasons.append("adx_low_penalty")
-            else:
-                reasons.append("adx_low")
-                allow = False
+            penalty = float(_filt.get("adx_penalty", 0.25))
+            score_long -= penalty
+            score_short -= penalty
+            reasons.append("adx_low_penalty")
 
     if not allow:
         long_base = False
@@ -494,29 +493,73 @@ def make_decision(
                 atr = float(tr.rolling(14).mean().iloc[-1])
             except Exception:
                 atr = 0.0
-        twap15 = rolling_twap(df["close"], twap15_w).iloc[-1]
+        twap15_series = rolling_twap(df["close"], twap15_w)
+        twap15 = twap15_series.iloc[-1]
+        ema22_series = df["close"].ewm(span=22, adjust=False).mean()
         price_now = float(last["close"])
-        ema22_now = float(last.get('ema_22', 0.0))
         mode = str(coin_cfg.get("twap15_trend_mode", "any_of")).lower()
-        long_cond = [(price_now >= twap15), (ema22_now >= twap15)]
-        short_cond = [(price_now <= twap15), (ema22_now <= twap15)]
+
+        long_cond = [(price_now >= twap15), (float(ema22_series.iloc[-1]) >= twap15)]
+        short_cond = [(price_now <= twap15), (float(ema22_series.iloc[-1]) <= twap15)]
         if mode == "all_of":
             trend_long_ok = all(long_cond)
             trend_short_ok = all(short_cond)
         else:
             trend_long_ok = any(long_cond)
             trend_short_ok = any(short_cond)
-        if long_base and not trend_long_ok:
-            long_base = False
-            score_long = 0.0
-            reasons.append("twap15_trend_fail")
-        if short_base and not trend_short_ok:
-            short_base = False
-            score_short = 0.0
-            reasons.append("twap15_trend_fail")
+
         dev = float(twap15 - price_now)
-        twap15_ok_long = (dev >= k_atr * atr)
-        twap15_ok_short = (-dev >= k_atr * atr)
+        twap15_dev_long = (dev >= k_atr * atr)
+        twap15_dev_short = (-dev >= k_atr * atr)
+
+        entry_cfg = coin_cfg.get("entry", {})
+        buf = float(entry_cfg.get("buffer_atr_mult", 0.12)) * atr
+        confirm = int(entry_cfg.get("confirm_bars", 2))
+        allow_ct_short = bool(entry_cfg.get("allow_countertrend_short", False))
+
+        def confirmed(side: str) -> bool:
+            if confirm <= 0:
+                return True
+            if len(df) < confirm:
+                return False
+            closes = df["close"].iloc[-confirm:]
+            tseg = twap15_series.iloc[-confirm:]
+            esem = ema22_series.iloc[-confirm:]
+            if mode == "all_of":
+                if side == "LONG":
+                    cond = (closes >= tseg) & (closes >= esem)
+                else:
+                    cond = (closes <= tseg) & (closes <= esem)
+            else:
+                if side == "LONG":
+                    cond = (closes >= tseg) | (closes >= esem)
+                else:
+                    cond = (closes <= tseg) | (closes <= esem)
+            return bool(cond.all())
+
+        if regime == "TREND":
+            if long_base and not (trend_long_ok and price_now >= twap15 + buf and confirmed("LONG")):
+                long_base = False
+                score_long = 0.0
+                reasons.append("trend_confirm_fail")
+            if short_base and not (trend_short_ok and price_now <= twap15 - buf and confirmed("SHORT")):
+                short_base = False
+                score_short = 0.0
+                reasons.append("trend_confirm_fail")
+        else:
+            if long_base and not twap15_dev_long:
+                long_base = False
+                score_long = 0.0
+                reasons.append("twap15_dev_fail")
+            if short_base:
+                if not allow_ct_short:
+                    short_base = False
+                    score_short = 0.0
+                    reasons.append("ct_short_disabled")
+                elif not twap15_dev_short:
+                    short_base = False
+                    score_short = 0.0
+                    reasons.append("twap15_dev_fail")
 
         twap5 = mtf_get_close(symbol, "5min")
         twap1 = mtf_get_close(symbol, "1min")
@@ -531,15 +574,6 @@ def make_decision(
             short_bonus_ok = (price_htf <= htwap) and (ema22_htf <= htwap)
         else:
             long_bonus_ok = short_bonus_ok = False
-
-        if long_base and not twap15_ok_long:
-            long_base = False
-            score_long = 0.0
-            reasons.append("twap15_dev_fail")
-        if short_base and not twap15_ok_short:
-            short_base = False
-            score_short = 0.0
-            reasons.append("twap15_dev_fail")
 
         if long_base and long_bonus_ok:
             score_long += tw_bonus
