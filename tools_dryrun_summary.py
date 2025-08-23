@@ -178,11 +178,11 @@ def run_dry(
         sub_dt = ensure_dt_index(sub)
 
         last_ts_val = sub_dt.index[-1] if len(sub_dt.index) else None
-        if last_ts_val is not None:
-            last_close_s, ts_iso = to_utc_epoch_and_iso(last_ts_val)
-        else:
-            last_close_s = int(pd.Timestamp.utcnow().tz_localize("UTC").timestamp())
-            ts_iso = pd.Timestamp.utcnow().tz_localize("UTC").isoformat()
+        last_close_s, ts_iso = (
+            to_utc_epoch_and_iso(last_ts_val)
+            if last_ts_val is not None
+            else to_utc_epoch_and_iso(pd.Timestamp.utcnow())
+        )
 
         trader.check_trading_signals(sub, balance, now_ts=last_close_s)
 
