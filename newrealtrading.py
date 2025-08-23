@@ -354,8 +354,38 @@ class ExecutionClient:
                 return {}
             raise
 
+
+class TwapExecutor:
+    def __init__(self, client: ExecutionClient, symbol: str, cfg: Dict[str, Any], market_info: Dict[str, float]):
+        self.client = client
+        self.symbol = symbol
+        self.cfg = cfg
+        self.market_info = market_info
+
+    def run(self, side: str, total_qty: float, now_ts: int):
+        atr_pct = float(self.market_info.get("atr_pct", 0.0))
+        if atr_pct > 0.04:
+            return {"status": "skipped_atr"}
+        n = int(self.cfg.get("twap_child_count", 4))
+        duration = int(self.cfg.get("twap_duration_sec", 90))
+        qty_each = safe_div(total_qty, n)
+        side_binance = "BUY" if side == "LONG" else "SELL"
+        fills: list[float] = []
+        for i in range(n):
+            od = self.client.market_entry(self.symbol, side_binance, qty_each)
+            price_fill = float(od.get("avgPrice") or od.get("price") or self.market_info.get("price", 0.0))
+            fills.append(price_fill)
+            time.sleep(max(0.0, duration / n))
+        avg_fill = sum(fills) / len(fills) if fills else self.market_info.get("price", 0.0)
+        return {
+            "fill_ratio": 1.0,
+            "avg_fill_price": avg_fill,
+            "exec_mode": "twap",
+        }
+
 __all__ = [
     "ExecutionClient",
+    "TwapExecutor",
     "CoinTrader",
     "TradingManager",
     "floor_to_step",
@@ -711,15 +741,22 @@ class CoinTrader:
 
         try:
             cid = f"x-{os.getenv('INSTANCE_ID', 'bot')}-{self.symbol}-{uuid4().hex[:8]}"
-            od = self.exec.market_entry(self.symbol, side_binance, qty, client_id=cid) if self.exec else {}
-            if od:
-                fill_price = float(od.get('avgPrice') or od.get('price') or price)
-                self.pos.entry = fill_price
-            self._log(f"ENTRY {side} price={price} qty={qty:.6f}")
+            fill_price = price
+            if self.exec and bool(self.config.get('twap_exec_enabled', False)):
+                market_info = {"atr_pct": safe_div(atr, price), "price": price}
+                tw = TwapExecutor(self.exec, self.symbol, self.config, market_info)
+                res = tw.run(side, qty, int(now_ts or time.time()))
+                fill_price = float(res.get('avg_fill_price', price))
+            else:
+                od = self.exec.market_entry(self.symbol, side_binance, qty, client_id=cid) if self.exec else {}
+                if od:
+                    fill_price = float(od.get('avgPrice') or od.get('price') or price)
+            self.pos.entry = fill_price
+            self._log(f"ENTRY {side} price={fill_price} qty={qty:.6f}")
             if sl and self.exec:
                 stop_side = 'SELL' if side == 'LONG' else 'BUY'
                 self.exec.stop_market(self.symbol, stop_side, sl, qty, reduce_only=True, client_id=cid + "-sl")
-            return safe_div((price * qty), lev)
+            return safe_div((fill_price * qty), lev)
         except bnx.BinanceAPIException as e:
             if getattr(e, "code", None) == -2019:
                 self._log("WARN: Margin insufficient. Cooldown & skip.")

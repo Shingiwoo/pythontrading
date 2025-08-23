@@ -122,7 +122,21 @@
     "minQty": 1.0,
     "quantityPrecision": 0,
     "minNotional": 5.0,
-    "SLIPPAGE_PCT": 0.02
+    "SLIPPAGE_PCT": 0.02,
+
+    "use_twap_indicator": true,
+    "twap_anchor": "rolling",
+    "twap_15m_window": 20,
+    "twap_5m_window": 36,
+    "twap_1m_window": 120,
+    "twap_atr_k": 0.4,
+
+    "twap_exec_enabled": true,
+    "twap_child_count": 4,
+    "twap_duration_sec": 90,
+    "twap_child_timeout_sec": 10,
+    "twap_post_only": true,
+    "twap_force_market_on_timeout": true
   },
   "DOGEUSDT": {
     "leverage": 15,
