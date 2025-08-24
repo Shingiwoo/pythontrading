@@ -36,6 +36,7 @@ from engine_core import (
     rolling_twap,
     _norm_resample_freq,
     htf_timeframe,
+    merge_config,
 )
 from regime import RegimeThresholds, get_regime
 
@@ -134,7 +135,7 @@ def to_utc_epoch_and_iso(ts_like):
 def run_dry(
     symbol: str,
     csv_path: str,
-    coin_config_path: str,
+    coin_config: dict,
     steps_limit: int,
     balance: float,
     debug_reasons: bool = False,
@@ -155,8 +156,8 @@ def run_dry(
     start_i_val = min(warmup, len(df) - 1)
     start_i: int = int(start_i_val)
 
-    mgr = nrt.TradingManager(coin_config_path, [symbol])
-    trader = mgr.traders[symbol]
+    merged_cfg = merge_config(symbol, coin_config)
+    trader = nrt.CoinTrader(symbol, merged_cfg)
     trader._log = lambda *args, **kwargs: None  # matikan log biar cepat
     trader._journal = []
     cfg_by_sym = {symbol: trader.config}
@@ -433,6 +434,11 @@ def main():
     ap.add_argument("--trailing-step", type=float, default=None)
     ap.add_argument("--trailing-trigger", type=float, default=None)
     ap.add_argument("--debug-reasons", action="store_true")
+    ap.add_argument("--bypass-twap", action="store_true")
+    ap.add_argument("--bypass-htf", action="store_true")
+    ap.add_argument("--bypass-ml", action="store_true")
+    ap.add_argument("--bypass-filters", action="store_true")
+    ap.add_argument("--force-base-entry", action="store_true")
     args = ap.parse_args()
 
     # saran env untuk speed
@@ -446,28 +452,29 @@ def main():
     if args.ml_thr is not None:
         os.environ["SCORE_THRESHOLD"] = str(float(args.ml_thr))
 
-    cfg_path = args.coin_config
-    if args.trailing_step is not None or args.trailing_trigger is not None:
-        try:
-            with open(args.coin_config, "r") as f:
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
-        sym_cfg = cfg.get(args.symbol.upper(), {})
-        if args.trailing_step is not None:
-            sym_cfg["trailing_step"] = float(args.trailing_step)
-        if args.trailing_trigger is not None:
-            sym_cfg["trailing_trigger"] = float(args.trailing_trigger)
-        cfg[args.symbol.upper()] = sym_cfg
-        tmp_cfg_path = f"_tmp_{args.symbol.upper()}_cfg.json"
-        with open(tmp_cfg_path, "w") as f:
-            json.dump(cfg, f)
-        cfg_path = tmp_cfg_path
+    with open(args.coin_config, "r") as f:
+        cfg = json.load(f)
+    sym_cfg = cfg.setdefault(args.symbol.upper(), {})
+    dbg = sym_cfg.setdefault("debug", {})
+    if args.bypass_twap:
+        dbg["bypass_twap"] = True
+    if args.bypass_htf:
+        dbg["bypass_htf"] = True
+    if args.bypass_ml:
+        dbg["bypass_ml"] = True
+    if args.bypass_filters:
+        dbg["bypass_filters"] = True
+    if args.force_base_entry:
+        dbg["force_base_entry"] = True
+    if args.trailing_step is not None:
+        sym_cfg["trailing_step"] = float(args.trailing_step)
+    if args.trailing_trigger is not None:
+        sym_cfg["trailing_trigger"] = float(args.trailing_trigger)
 
     summary, trades_df, reasons_df = run_dry(
         args.symbol.upper(),
         args.csv,
-        cfg_path,
+        cfg,
         int(args.steps),
         args.balance,
         debug_reasons=args.debug_reasons,

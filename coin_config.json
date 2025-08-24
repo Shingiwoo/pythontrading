@@ -144,6 +144,13 @@
         "twap_1m_window": 120,
         "twap_atr_k": 0.55,
         "twap15_trend_mode": "any_of",
+        "debug": {
+            "bypass_twap": false,
+            "bypass_htf": false,
+            "bypass_ml": false,
+            "bypass_filters": false,
+            "force_base_entry": false
+        },
         "twap_exec_enabled": true,
         "twap_child_count": 4,
         "twap_duration_sec": 90,
