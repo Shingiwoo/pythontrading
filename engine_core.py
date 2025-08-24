@@ -453,7 +453,6 @@ def make_decision(
         bb_width_chop_max=float(reg_cfg.get("bb_width_chop_max", 0.010)),
     )
     regime = get_regime(df, th) if reg_cfg.get("enabled", False) else "CHOP"
-    reasons.append(f"regime={regime}")
 
     filt_cfg = coin_cfg.get("filters", {}) if isinstance(coin_cfg.get("filters"), dict) else {}
     if bool(filt_cfg.get("adx_filter_enabled", False)):
@@ -525,9 +524,10 @@ def make_decision(
             price_htf = htf_close.iloc[-1]
             long_bonus_ok = (price_htf >= htwap) and (ema22_htf >= htwap)
             short_bonus_ok = (price_htf <= htwap) and (ema22_htf <= htwap)
+        # >>> PR6.3-fixA START: TWAP TREND any_of
         twap15_ok_long = twap15_ok_short = True
         if regime == "TREND":
-            # PR6.3 — dukung any_of: (price vs TWAP) ATAU (EMA22 vs TWAP)
+            # any_of: (price vs TWAP+buffer) OR (EMA22 vs TWAP)
             mode = str(coin_cfg.get("twap15_trend_mode", "any_of")).lower()
             ema22_now = float(last.get("ema_22", 0.0))
             cond_long = [(price_now >= twap15 + buf), (ema22_now >= twap15)]
@@ -540,12 +540,13 @@ def make_decision(
                 twap15_ok_short = any(cond_short)
             reasons.append(f"twap15_trend_mode={mode}")
             reasons.append(
-                f"ema22_now_vs_twap={'LONG' if ema22_now >= twap15 else 'SHORT'}"
+                f"ema22_vs_twap={'LONG' if ema22_now >= twap15 else 'SHORT'}"
             )
         else:
             # CHOP: mean-reversion berbasis deviasi ATR dari TWAP
             twap15_ok_long = price_now <= twap15 - k * atr
             twap15_ok_short = price_now >= twap15 + k * atr
+        # >>> PR6.3-fixA END
         if long_base and not twap15_ok_long:
             reasons.append("twap15_ok=False")
             long_base = False
