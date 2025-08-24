@@ -493,6 +493,9 @@ class CoinTrader:
         self.last_hard_sl_bar = -1
         self.hard_sl_streak = 0
         self.cooldown_escalate_bars = int(self.config.get('cooldown_escalate_bars', 20))
+        self.last_block_reason: str = "-"
+        self.last_allow: bool = True
+        self.last_allow_reasons: list[str] = []
 
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
@@ -730,8 +733,15 @@ class CoinTrader:
 
 
     def _enter_position(self, side: str, price: float, atr: float, available_balance: float, **kw) -> float:
+        self.last_block_reason = "-"
+        now_ts = kw.get("now_ts")
+        if self.cooldown_until_ts and now_ts is not None and now_ts < self.cooldown_until_ts:
+            self._journal.append({"t": "enter_blocked", "reason": "cooldown_active", "cooldown_until": int(self.cooldown_until_ts)})
+            self.last_block_reason = "cooldown_active"
+            return 0.0
         if self.exec and self.account_guard and self.exec.has_position(self.symbol):
             self._log("SKIP entry: posisi masih terbuka di akun")
+            self.last_block_reason = "position_exists"
             return 0.0
 
         side_binance = "BUY" if side == "LONG" else "SELL"
@@ -750,6 +760,7 @@ class CoinTrader:
         margin = max(0.0, available_balance) * max(0.0, risk)
         if margin <= 0.0:
             self._log(f"SKIP entry: available={available_balance:.4f}, margin=0")
+            self.last_block_reason = "qty_zero"
             return 0.0
 
         raw_qty = safe_div((margin * lev), price)
@@ -759,7 +770,14 @@ class CoinTrader:
             step = _to_float(self.config.get('stepSize', 0.0), 0.0)
             qty = floor_to_step(raw_qty, step) if step > 0 else raw_qty
         if qty <= 0.0:
-            self._log(f"SKIP entry: qty setelah pembulatan LOT_SIZE = 0 (raw={raw_qty:.8f})")
+            self._journal.append({"t": "enter_blocked", "reason": "qty_zero", "price": price, "atr": atr})
+            self.last_block_reason = "qty_zero"
+            return 0.0
+
+        step_size = self.exec.get_step_size(self.symbol) if self.exec else _to_float(self.config.get('stepSize', 0.0), 0.0)
+        if step_size and qty < step_size:
+            self._journal.append({"t": "enter_blocked", "reason": "qty_below_step", "qty": qty, "step": step_size})
+            self.last_block_reason = "qty_below_step"
             return 0.0
 
         need = safe_div((price * qty), lev) * (1.0 + fee_buf)
@@ -772,10 +790,11 @@ class CoinTrader:
             if self.exec:
                 shrunk = self.exec.round_qty(self.symbol, as_scalar(max(0.0, max_qty_by_margin)))
             else:
-                step = _to_float(self.config.get('stepSize', 0.0), 0.0)
-                shrunk = floor_to_step(max(0.0, max_qty_by_margin), step) if step > 0 else max(0.0, max_qty_by_margin)
+                step_tmp = _to_float(self.config.get('stepSize', 0.0), 0.0)
+                shrunk = floor_to_step(max(0.0, max_qty_by_margin), step_tmp) if step_tmp > 0 else max(0.0, max_qty_by_margin)
             if shrunk <= 0:
                 self._log(f"SKIP entry: need={need:.4f} > available={live_avail:.4f}")
+                self.last_block_reason = "insufficient_margin"
                 return 0.0
             self._log(f"SHRINK qty {qty:.6f} -> {shrunk:.6f} (avail={live_avail:.4f}, need={need:.4f})")
             qty = shrunk
@@ -783,14 +802,15 @@ class CoinTrader:
 
         min_not = float(self.config.get("minNotional", 0.0) or 0.0)
         if min_not > 0 and price * qty < min_not:
-            step = self.exec.get_step_size(self.symbol) if self.exec else _to_float(self.config.get("stepSize", 0.0), 0.0)
+            step = step_size
             need_qty = safe_div(min_not, price)
             if step > 0:
                 need_qty = ceil_to_step(need_qty, step)
             if self.exec:
                 need_qty = self.exec.round_qty(self.symbol, as_scalar(need_qty))
             if to_scalar(safe_div((need_qty * price), lev) * (1.0 + fee_buf)) > live_avail:
-                self._log(f"SKIP entry: below MIN_NOTIONAL {min_not}, avail={live_avail:.2f}")
+                self._journal.append({"t": "enter_blocked", "reason": "notional_below_min", "notional": qty * price, "min_notional": min_not})
+                self.last_block_reason = "notional_below_min"
                 return 0.0
             qty = need_qty
 
@@ -800,6 +820,7 @@ class CoinTrader:
         eps = tick if tick > 0 else max(price, 1e-9) * 1e-6
         if not math.isfinite(dist) or dist <= eps:
             self._log(f"SKIP entry: SL==entry (dist={dist:.12f})")
+            self.last_block_reason = "sl_equals_entry"
             return 0.0
         now_ts = kw.get("now_ts", None)
         self.pos = Position(side=side, entry=price, qty=qty, sl=sl, trailing_sl=None, entry_time=self._to_dt(now_ts))
@@ -821,16 +842,20 @@ class CoinTrader:
             if sl and self.exec:
                 stop_side = 'SELL' if side == 'LONG' else 'BUY'
                 self.exec.stop_market(self.symbol, stop_side, sl, qty, reduce_only=True, client_id=cid + "-sl")
+            self.last_block_reason = "-"
             return safe_div((fill_price * qty), lev)
         except bnx.BinanceAPIException as e:
             if getattr(e, "code", None) == -2019:
                 self._log("WARN: Margin insufficient. Cooldown & skip.")
                 self.cooldown_until_ts = time.time() + int(self.config.get("cooldown_seconds", DEFAULTS.get("cooldown_seconds", 60)))
+                self.last_block_reason = "insufficient_margin"
                 return 0.0
             self._log(f"error MARKET ENTRY: {e}")
+            self.last_block_reason = "entry_error"
             return 0.0
         except Exception as e:
             self._log(f"error MARKET ENTRY: {e}")
+            self.last_block_reason = "entry_error"
             return 0.0
 
     def _should_exit(
@@ -956,13 +981,15 @@ class CoinTrader:
 
         # ---- Cooldown berdasar virtual clock ----
         if self._cooldown_active(now_ts):
-            # throttle log: hanya sekali per bar / saat target berubah
             if self.verbose:
                 if (self._last_cooldown_log_bar != self._bar_idx) or (self._cd_logged_until_ts != self.cooldown_until_ts):
                     print(f"[{self.symbol}] COOLDOWN aktif s/d {_to_dt_safe(self.cooldown_until_ts)}")
                     self._last_cooldown_log_bar = self._bar_idx
                     self._cd_logged_until_ts = self.cooldown_until_ts
-            return 0.0     
+            self.last_allow = False
+            self.last_allow_reasons = ["cooldown_ok"]
+            self.last_block_reason = "cooldown_active"
+            return 0.0
 
         try:
             if self.pending_skip_entries > 0:
@@ -1062,9 +1089,25 @@ class CoinTrader:
                     self._check_bracket_exit(price, atr)
                 return 0.0
 
-            decision = make_decision(df, self.symbol, self.config, up_prob, atr_ok=atr_ok, body_ok=body_ok, meta=meta)
-            long_sig = decision == 'LONG'
-            short_sig = decision == 'SHORT'
+        ctx_dec: Dict[str, Any] = {}
+        decision = make_decision(
+            df,
+            self.symbol,
+            self.config,
+            up_prob,
+            atr_ok=atr_ok,
+            body_ok=body_ok,
+            meta=meta,
+            cooldown_active=self._cooldown_active(now_ts),
+            position=self.pos if self.pos.side else None,
+            ctx=ctx_dec,
+        )
+        allow = bool(ctx_dec.get("allow", False))
+        allow_reasons = list(ctx_dec.get("allow_reasons", []))
+        self.last_allow = allow
+        self.last_allow_reasons = allow_reasons
+        long_sig = allow and decision == 'LONG'
+        short_sig = allow and decision == 'SHORT'
 
             # ---- Time-stop ----
             max_hold = int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)))
@@ -1090,12 +1133,10 @@ class CoinTrader:
                         self.pos.entry_time = now_dt
             # --------------------------------------
             used = 0.0
-            # Entry baru
-            if not self.pos.side and not self._cooldown_active(now_ts):
-                if long_sig:
-                    used = self._enter_position('LONG', price, atr, available_balance, now_ts=now_ts)
-                elif short_sig:
-                    used = self._enter_position('SHORT', price, atr, available_balance, now_ts=now_ts)
+            if long_sig:
+                used = self._enter_position('LONG', price, atr, available_balance, now_ts=now_ts)
+            elif short_sig:
+                used = self._enter_position('SHORT', price, atr, available_balance, now_ts=now_ts)
             return used or 0.0
         except ZeroDivisionError as e:
             self._log(f"[{self.symbol}] ZDIV DIAG: price={price} atr={atr} entry={getattr(self.pos,'entry',None)} step={self.config.get('trailing_step')}")
