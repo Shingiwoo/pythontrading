@@ -423,7 +423,7 @@ def make_decision(
     reasons: list[str] = []
     adx_penalty = 0.0
     adx_penalized = False
-    g_filters_ok = bool(atr_ok and body_ok)
+    filters_ok = bool(atr_ok and body_ok)
     long_base = bool(long_base)
     short_base = bool(short_base)
     
@@ -478,16 +478,16 @@ def make_decision(
                 reasons.append("adx_low_penalty")
             else:
                 reasons.append("adx_low")
-                g_filters_ok = False
+                filters_ok = False
     if bypass_filters:
-        g_filters_ok = True
+        filters_ok = True
         atr_ok = body_ok = True
         if adx_penalized:
             score_long += adx_penalty
             score_short += adx_penalty
             adx_penalized = False
 
-    if not g_filters_ok:
+    if not filters_ok:
         long_base = False
         short_base = False
         score_long = 0.0
@@ -638,16 +638,14 @@ def make_decision(
             decision = "SHORT"
     g_ml_ok = bool(ml_pass)
 
-    # === PR6.4: Collapse to single gate by side ===
-    # Inisialisasi dengan nilai default
-    twap15_ok_long = False
-    twap15_ok_short = False
+    # === PR6.4: Collapse ke satu flag TWAP sesuai side ===
     twap15_ok: bool = twap15_ok_long if side == "LONG" else twap15_ok_short
     if not twap15_ok:
         reasons.append("twap15_ok=False")
 
     g_htf_ok = bool(long_htf_ok if side == "LONG" else short_htf_ok)
     g_twap_ok = bool(twap15_ok)
+    g_filters_ok = bool(filters_ok)
     g_cooldown_ok = not bool(cooldown_active)
     g_pos_free = not bool(position)
 

@@ -486,7 +486,7 @@ class CoinTrader:
         self._bar_idx = 0
         self._last_cooldown_log_bar = -1
         self._cd_logged_until_ts = None
-        self._journal: List[dict] = []  # untuk tools_dryrun_summary (rekonstruksi trade)
+        self.journal: List[dict] = []  # untuk tools_dryrun_summary (rekonstruksi trade)
         self._last_atr_pct: float | None = None
         self.invalidated_bars = 0
         self.cooldown_escalated = False
@@ -500,6 +500,9 @@ class CoinTrader:
     def _log(self, msg: str) -> None:
         if getattr(self, 'verbose', False):
             print(f"[{self.instance_id}:{self.symbol}] {pd.Timestamp.utcnow().isoformat()} | {msg}")
+
+    def _journal(self, t: str, **kwargs) -> None:
+        self.journal.append({"t": t, **kwargs})
 
     def _cooldown_active(self, now_ts: Optional[float] = None) -> bool:
         """Cooldown berbasis epoch detik; dukung virtual clock saat backtest."""
@@ -722,12 +725,12 @@ class CoinTrader:
             self.pos.sl = self.pos.entry
             self.pos.be_armed = True
             self.pos.tp1_hit = True
-            self._journal.append({'t': 'exit', 'reason': 'TP1', 'price': price, 'ts': now_ts})
+            self._journal('exit', reason='TP1', price=price, ts=now_ts)
             hit = True
         if (self.pos.side == 'LONG' and price >= tp2) or (self.pos.side == 'SHORT' and price <= tp2):
             self.pos.tp2_hit = True
             self._exit_position(price, reason='TP2', now_ts=now_ts)
-            self._journal.append({'t': 'exit', 'reason': 'TP2', 'price': price, 'ts': now_ts})
+            self._journal('exit', reason='TP2', price=price, ts=now_ts)
             hit = True
         return hit
 
@@ -736,9 +739,9 @@ class CoinTrader:
         self.last_block_reason = "-"
         now_ts = kw.get("now_ts")
         if self.cooldown_until_ts and now_ts is not None and now_ts < self.cooldown_until_ts:
-            self._journal.append({"t": "enter_blocked", "reason": "cooldown_active", "cooldown_until": int(self.cooldown_until_ts)})
+            self._journal("enter_blocked", reason="cooldown_active", cooldown_until=int(self.cooldown_until_ts))
             self.last_block_reason = "cooldown_active"
-            return 0.0
+            return False
         if self.exec and self.account_guard and self.exec.has_position(self.symbol):
             self._log("SKIP entry: posisi masih terbuka di akun")
             self.last_block_reason = "position_exists"
@@ -770,15 +773,15 @@ class CoinTrader:
             step = _to_float(self.config.get('stepSize', 0.0), 0.0)
             qty = floor_to_step(raw_qty, step) if step > 0 else raw_qty
         if qty <= 0.0:
-            self._journal.append({"t": "enter_blocked", "reason": "qty_zero", "price": price, "atr": atr})
+            self._journal("enter_blocked", reason="qty_zero", price=price, atr=atr)
             self.last_block_reason = "qty_zero"
-            return 0.0
+            return False
 
         step_size = self.exec.get_step_size(self.symbol) if self.exec else _to_float(self.config.get('stepSize', 0.0), 0.0)
         if step_size and qty < step_size:
-            self._journal.append({"t": "enter_blocked", "reason": "qty_below_step", "qty": qty, "step": step_size})
+            self._journal("enter_blocked", reason="qty_below_step", qty=qty, step=step_size)
             self.last_block_reason = "qty_below_step"
-            return 0.0
+            return False
 
         need = safe_div((price * qty), lev) * (1.0 + fee_buf)
         try:
@@ -809,9 +812,9 @@ class CoinTrader:
             if self.exec:
                 need_qty = self.exec.round_qty(self.symbol, as_scalar(need_qty))
             if to_scalar(safe_div((need_qty * price), lev) * (1.0 + fee_buf)) > live_avail:
-                self._journal.append({"t": "enter_blocked", "reason": "notional_below_min", "notional": qty * price, "min_notional": min_not})
+                self._journal("enter_blocked", reason="notional_below_min", notional=qty * price, min_notional=min_not)
                 self.last_block_reason = "notional_below_min"
-                return 0.0
+                return False
             qty = need_qty
 
         sl = self._hard_sl_price(price, atr, side)
@@ -1142,13 +1145,7 @@ class CoinTrader:
             self._log(f"[{self.symbol}] ZDIV DIAG: price={price} atr={atr} entry={getattr(self.pos,'entry',None)} step={self.config.get('trailing_step')}")
             raise
         except Exception as e:
-            error_msg = {"type": "err_runtime", "where": "update_loop", "error": str(e)}
-            if hasattr(self, '_journal') and isinstance(self._journal, list):
-                self._journal.append(error_msg)
-            elif hasattr(self, '_journal') and callable(self._journal):
-                self._journal("err_runtime", where="update_loop", error=str(e))
-            else:
-                print(f"[ERROR] update_loop: {e}")
+            self._journal("err_runtime", where="update_loop", error=str(e))
             if getattr(self, "verbose", False):
                 print(f"[ERROR] update_loop: {e}")
 
