@@ -1089,25 +1089,25 @@ class CoinTrader:
                     self._check_bracket_exit(price, atr)
                 return 0.0
 
-        ctx_dec: Dict[str, Any] = {}
-        decision = make_decision(
-            df,
-            self.symbol,
-            self.config,
-            up_prob,
-            atr_ok=atr_ok,
-            body_ok=body_ok,
-            meta=meta,
-            cooldown_active=self._cooldown_active(now_ts),
-            position=self.pos if self.pos.side else None,
-            ctx=ctx_dec,
-        )
-        allow = bool(ctx_dec.get("allow", False))
-        allow_reasons = list(ctx_dec.get("allow_reasons", []))
-        self.last_allow = allow
-        self.last_allow_reasons = allow_reasons
-        long_sig = allow and decision == 'LONG'
-        short_sig = allow and decision == 'SHORT'
+            ctx_dec: Dict[str, Any] = {}
+            decision = make_decision(
+                df,
+                self.symbol,
+                self.config,
+                up_prob,
+                atr_ok=atr_ok,
+                body_ok=body_ok,
+                meta=meta,
+                cooldown_active=self._cooldown_active(now_ts),
+                position=self.pos if self.pos.side else None,
+                ctx=ctx_dec,
+            )
+            allow = bool(ctx_dec.get("allow", False))
+            allow_reasons = list(ctx_dec.get("allow_reasons", []))
+            self.last_allow = allow
+            self.last_allow_reasons = allow_reasons
+            long_sig = allow and decision == 'LONG'
+            short_sig = allow and decision == 'SHORT'
 
             # ---- Time-stop ----
             max_hold = int(self.config.get("max_hold_seconds", DEFAULTS.get("max_hold_seconds", 3600)))
@@ -1141,6 +1141,10 @@ class CoinTrader:
         except ZeroDivisionError as e:
             self._log(f"[{self.symbol}] ZDIV DIAG: price={price} atr={atr} entry={getattr(self.pos,'entry',None)} step={self.config.get('trailing_step')}")
             raise
+        except Exception as e:
+            self._journal("err_runtime", where="update_loop", error=str(e))
+            if getattr(self, "verbose", False):
+                print(f"[ERROR] update_loop: {e}")
 
 
 # ============================

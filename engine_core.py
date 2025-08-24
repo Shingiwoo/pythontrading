@@ -543,28 +543,31 @@ def make_decision(
             price_htf = htf_close.iloc[-1]
             long_bonus_ok = (price_htf >= htwap) and (ema22_htf >= htwap)
             short_bonus_ok = (price_htf <= htwap) and (ema22_htf <= htwap)
-        # >>> PR6.3-fixB: TWAP TREND any_of + CHOP deviasi
-        twap15_ok_long = twap15_ok_short = True
+        # === PR6.4: Bind defaults to satisfy static analyzer & unify checks ===
+        twap15_ok_long: bool = False
+        twap15_ok_short: bool = False
+
+        # guard untuk nilai yang dipakai di semua jalur
+        mode: str = str(coin_cfg.get("twap15_trend_mode", "any_of")).lower()
+        ema22_now: float = float(last.get("ema_22", 0.0)) if "ema_22" in last else float(df["close"].iloc[-1])
+        buf: float = float(buffer_mult) * float(atr)
+
+        # === PR6.4: TWAP logic (TREND any_of / CHOP deviasi) ===
         if regime == "TREND":
-            mode = str(coin_cfg.get("twap15_trend_mode", "any_of")).lower()
-            ema22_now = float(last.get("ema_22", 0.0))
-            cond_long = [(price_now >= twap15 + buf), (ema22_now >= twap15)]
+            cond_long  = [(price_now >= twap15 + buf), (ema22_now >= twap15)]
             cond_short = [(price_now <= twap15 - buf), (ema22_now <= twap15)]
             if mode == "all_of":
-                twap15_ok_long = all(cond_long)
+                twap15_ok_long  = all(cond_long)
                 twap15_ok_short = all(cond_short)
             else:
-                twap15_ok_long = any(cond_long)
+                twap15_ok_long  = any(cond_long)
                 twap15_ok_short = any(cond_short)
             reasons.append(f"twap15_trend_mode={mode}")
             reasons.append(f"ema22_vs_twap={'LONG' if ema22_now >= twap15 else 'SHORT'}")
         else:
-            twap15_ok_long = price_now <= twap15 - k * atr
-            twap15_ok_short = price_now >= twap15 + k * atr
-        if long_base and not twap15_ok_long:
-            reasons.append("twap15_ok=False")
-        if short_base and not twap15_ok_short:
-            reasons.append("twap15_ok=False")
+            twap15_ok_long  = (price_now <= twap15 - k * atr)
+            twap15_ok_short = (price_now >= twap15 + k * atr)
+
         def _confirmed(side: str, n: int) -> bool:
             if n <= 0:
                 return True
@@ -635,8 +638,13 @@ def make_decision(
             decision = "SHORT"
     g_ml_ok = bool(ml_pass)
 
+    # === PR6.4: Collapse to single gate by side ===
+    twap15_ok: bool = twap15_ok_long if side == "LONG" else twap15_ok_short
+    if not twap15_ok:
+        reasons.append("twap15_ok=False")
+
     g_htf_ok = bool(long_htf_ok if side == "LONG" else short_htf_ok)
-    g_twap_ok = bool(twap15_ok_long if side == "LONG" else twap15_ok_short)
+    g_twap_ok = bool(twap15_ok)
     g_cooldown_ok = not bool(cooldown_active)
     g_pos_free = not bool(position)
 
@@ -676,8 +684,8 @@ def make_decision(
 
     reasons.append(f"allow_final={allow}")
     if not allow:
-        reasons.append(f"blocked_by={ '|'.join(allow_reasons) if allow_reasons else '-' }")
-    reasons.append(f"twap15_ok={(twap15_ok_long if side=='LONG' else twap15_ok_short)}")
+        reasons.append(f"blocked_by={'|'.join(allow_reasons) if allow_reasons else '-'}")
+    reasons.append(f"twap15_ok={twap15_ok}")
 
     ema = float(last.get('ema_22', 0.0))
     ma = float(last.get('ma_22', 0.0))
