@@ -351,6 +351,10 @@ def run_dry(
                     row["confirm_bars_used"] = locals().get("confirm_bars", None)
                     row["score_rule_only"] = locals().get("score_rule_only", None)
                     row["ml_thr_used"] = locals().get("ml_thr", None)
+                    allow_val = getattr(trader, "last_allow", False)
+                    row["allow_final"] = allow_val
+                    row["blocked_by"] = "|".join(getattr(trader, "last_allow_reasons", [])) if not allow_val else "-"
+                    row["enter_block_reason"] = getattr(trader, "last_block_reason", "-")
                     reasons_rows.append(row)
         steps += 1
     elapsed = time.time() - t0

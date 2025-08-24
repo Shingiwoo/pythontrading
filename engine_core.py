@@ -399,6 +399,10 @@ def make_decision(
     atr_ok: bool | None = None,
     body_ok: bool | None = None,
     meta: Dict[str, Any] | None = None,
+    *,
+    cooldown_active: bool = False,
+    position: Any | None = None,
+    ctx: Dict[str, Any] | None = None,
 ) -> Optional[str]:
     if USE_BACKTEST_ENTRY_LOGIC:
         long_base, short_base = compute_base_signals_backtest(df, coin_cfg)
@@ -419,11 +423,9 @@ def make_decision(
     reasons: list[str] = []
     adx_penalty = 0.0
     adx_penalized = False
-    if bypass_filters:
-        reasons.append("bypass_filters_applied")
-        atr_ok = body_ok = True
-    long_base = long_base and atr_ok and body_ok
-    short_base = short_base and atr_ok and body_ok
+    g_filters_ok = bool(atr_ok and body_ok)
+    long_base = bool(long_base)
+    short_base = bool(short_base)
     
     # Inisialisasi htf_close dengan None
     htf_close = None    
@@ -449,16 +451,11 @@ def make_decision(
         elif not _htf.get("fallback_pass", True):
             long_htf_ok = short_htf_ok = False
     if bypass_htf:
-        reasons.append("bypass_htf_applied")
         long_htf_ok = short_htf_ok = True
-
-    long_base = long_base and long_htf_ok
-    short_base = short_base and short_htf_ok
 
     score_long = 1.0 if long_base else 0.0
     score_short = 1.0 if short_base else 0.0
     ml_ready = (ml_up_prob is not None)
-    allow = True
     reg_cfg = coin_cfg.get("regime", {})
     th = RegimeThresholds(
         adx_period=int(reg_cfg.get("adx_period", 14)),
@@ -481,16 +478,16 @@ def make_decision(
                 reasons.append("adx_low_penalty")
             else:
                 reasons.append("adx_low")
-                if not bypass_filters:
-                    allow = False
+                g_filters_ok = False
     if bypass_filters:
-        allow = True
+        g_filters_ok = True
+        atr_ok = body_ok = True
         if adx_penalized:
             score_long += adx_penalty
             score_short += adx_penalty
             adx_penalized = False
 
-    if not allow:
+    if not g_filters_ok:
         long_base = False
         short_base = False
         score_long = 0.0
@@ -564,17 +561,10 @@ def make_decision(
         else:
             twap15_ok_long = price_now <= twap15 - k * atr
             twap15_ok_short = price_now >= twap15 + k * atr
-        if bypass_twap:
-            twap15_ok_long = twap15_ok_short = True
-            reasons.append("bypass_twap_applied")
         if long_base and not twap15_ok_long:
             reasons.append("twap15_ok=False")
-            long_base = False
-            score_long = 0.0
         if short_base and not twap15_ok_short:
             reasons.append("twap15_ok=False")
-            short_base = False
-            score_short = 0.0
         def _confirmed(side: str, n: int) -> bool:
             if n <= 0:
                 return True
@@ -583,19 +573,17 @@ def make_decision(
                 return bool((closes >= twap15).all())
             else:
                 return bool((closes <= twap15).all())
-        if long_base and not _confirmed("LONG", confirm_bars):
+        if not _confirmed("LONG", confirm_bars):
+            twap15_ok_long = False
             reasons.append("trend_confirm_fail")
-            long_base = False
-            score_long = 0.0
-        if short_base and not _confirmed("SHORT", confirm_bars):
+        if not _confirmed("SHORT", confirm_bars):
+            twap15_ok_short = False
             reasons.append("trend_confirm_fail")
-            short_base = False
-            score_short = 0.0
         # Jika gagal TWAP tapi HTF mendukung kuat, override ringan
-        if long_base and not twap15_ok_long and regime == "TREND" and long_bonus_ok:
+        if not twap15_ok_long and regime == "TREND" and long_bonus_ok:
             twap15_ok_long = True
             reasons.append("twap15_override_htf_bonus")
-        if short_base and not twap15_ok_short and regime == "TREND" and short_bonus_ok:
+        if not twap15_ok_short and regime == "TREND" and short_bonus_ok:
             twap15_ok_short = True
             reasons.append("twap15_override_htf_bonus")
         if regime != "TREND" and short_base and not allow_ct_short:
@@ -645,11 +633,51 @@ def make_decision(
             decision = "LONG"
         elif side == "SHORT" and short_base and score_short >= ml_thr_used:
             decision = "SHORT"
+    g_ml_ok = bool(ml_pass)
+
+    g_htf_ok = bool(long_htf_ok if side == "LONG" else short_htf_ok)
+    g_twap_ok = bool(twap15_ok_long if side == "LONG" else twap15_ok_short)
+    g_cooldown_ok = not bool(cooldown_active)
+    g_pos_free = not bool(position)
+
+    if bypass_twap:
+        g_twap_ok = True
+        reasons.append("bypass_twap_applied")
+    if bypass_htf:
+        g_htf_ok = True
+        reasons.append("bypass_htf_applied")
+    if bypass_filters:
+        g_filters_ok = True
+        reasons.append("bypass_filters_applied")
+    if bypass_ml:
+        g_ml_ok = True
+        reasons.append("bypass_ml_applied")
+
+    allow_reasons: list[str] = []
+    conds = [
+        ("htf_ok", g_htf_ok),
+        ("twap15_ok", g_twap_ok),
+        ("filters_ok", g_filters_ok),
+        ("ml_ok", g_ml_ok),
+        ("cooldown_ok", g_cooldown_ok),
+        ("position_free", g_pos_free),
+    ]
+    allow = True
+    for name, ok in conds:
+        if not ok:
+            allow = False
+            allow_reasons.append(name)
+
+    if force_base_entry and ((side == "LONG" and base_long) or (side == "SHORT" and base_short)):
+        reasons.append("force_base_entry_applied")
+        decision = side
+        allow = True
+        allow_reasons = []
+
+    reasons.append(f"allow_final={allow}")
+    if not allow:
+        reasons.append(f"blocked_by={ '|'.join(allow_reasons) if allow_reasons else '-' }")
     reasons.append(f"twap15_ok={(twap15_ok_long if side=='LONG' else twap15_ok_short)}")
-    if force_base_entry and decision is None:
-        if (side == "LONG" and base_long) or (side == "SHORT" and base_short):
-            reasons.append("force_base_entry_applied")
-            decision = side
 
     ema = float(last.get('ema_22', 0.0))
     ma = float(last.get('ma_22', 0.0))
@@ -662,6 +690,10 @@ def make_decision(
         f"ml_up_prob={ml_up_prob} score_rule={score_rule_only:.2f} ml_thr={ml_thr_used:.2f} "
         f"score(L={score_long:.2f},S={score_short:.2f}) reasons={reasons} -> {decision}"
     )
+    if ctx is not None:
+        ctx["allow"] = allow
+        ctx["allow_reasons"] = allow_reasons
+        ctx["reasons"] = reasons
     return decision
 
 def _norm_resample_freq(freq: str | None, default: str = "1h") -> str:
