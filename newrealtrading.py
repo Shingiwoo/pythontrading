@@ -936,7 +936,7 @@ class CoinTrader:
         except Exception:
             pass
 
-    def check_trading_signals(self, df_raw: pd.DataFrame, available_balance: float, *, now_ts: Optional[float] = None) -> float:
+    def check_trading_signals(self, df_raw: pd.DataFrame, available_balance: float, *, now_ts: Optional[float] = None) -> float | None:
         self._now_ts = now_ts
         if df_raw is None or df_raw.empty:
             return 0.0
@@ -1142,7 +1142,13 @@ class CoinTrader:
             self._log(f"[{self.symbol}] ZDIV DIAG: price={price} atr={atr} entry={getattr(self.pos,'entry',None)} step={self.config.get('trailing_step')}")
             raise
         except Exception as e:
-            self._journal("err_runtime", where="update_loop", error=str(e))
+            error_msg = {"type": "err_runtime", "where": "update_loop", "error": str(e)}
+            if hasattr(self, '_journal') and isinstance(self._journal, list):
+                self._journal.append(error_msg)
+            elif hasattr(self, '_journal') and callable(self._journal):
+                self._journal("err_runtime", where="update_loop", error=str(e))
+            else:
+                print(f"[ERROR] update_loop: {e}")
             if getattr(self, "verbose", False):
                 print(f"[ERROR] update_loop: {e}")
 

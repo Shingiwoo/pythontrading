@@ -639,6 +639,9 @@ def make_decision(
     g_ml_ok = bool(ml_pass)
 
     # === PR6.4: Collapse to single gate by side ===
+    # Inisialisasi dengan nilai default
+    twap15_ok_long = False
+    twap15_ok_short = False
     twap15_ok: bool = twap15_ok_long if side == "LONG" else twap15_ok_short
     if not twap15_ok:
         reasons.append("twap15_ok=False")
