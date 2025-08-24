@@ -55,14 +55,12 @@ def _enter_wrap(self, side: str, price: float, atr: float, available_balance: fl
     used_margin = _orig_enter(self, side, price, atr, available_balance, **kw)
     try:
         if used_margin and used_margin > 0:
-            self._journal.append(
-                {
-                    "t": "entry",
-                    "side": side,
-                    "price": float(price),
-                    "qty": float(self.pos.qty if self.pos and self.pos.qty else 0.0),
-                    "ts": int((kw.get("now_ts") or time.time())),
-                }
+            self._journal(
+                "entry",
+                side=side,
+                price=float(price),
+                qty=float(self.pos.qty if self.pos and self.pos.qty else 0.0),
+                ts=int((kw.get("now_ts") or time.time())),
             )
     except Exception:
         pass
@@ -80,13 +78,11 @@ def _exit_wrap(self, price: float, reason: str = "Exit", now_ts: int | None = No
     except Exception:
         pass
     try:
-        self._journal.append(
-            {
-                "t": "exit",
-                "reason": str(reason),
-                "price": float(price),
-                "ts": now_ts_i,
-            }
+        self._journal(
+            "exit",
+            reason=str(reason),
+            price=float(price),
+            ts=now_ts_i,
         )
     except Exception:
         pass
@@ -159,7 +155,7 @@ def run_dry(
     merged_cfg = merge_config(symbol, coin_config)
     trader = nrt.CoinTrader(symbol, merged_cfg)
     trader._log = lambda *args, **kwargs: None  # matikan log biar cepat
-    trader._journal = []
+    trader.journal = []
     cfg_by_sym = {symbol: trader.config}
     reasons_rows: list[dict] = [] if debug_reasons else []
 
@@ -360,7 +356,7 @@ def run_dry(
     elapsed = time.time() - t0
 
     # Ringkasan
-    events = getattr(trader, "_journal", [])
+    events = getattr(trader, "journal", [])
     trades: list[dict] = []
     current = None
     for ev in events:
